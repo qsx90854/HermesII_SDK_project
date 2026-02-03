@@ -3328,6 +3328,8 @@ StatusCode FallDetector::Detect(const Image& frame, bool& is_fall) {
                 
                 // Threshold: 50 pixels (Relaxed from 100 for Top-Down/Short slides)
                 if (acc > 50.0f) {
+                     // TRACE slow fall entry
+                     printf("[TRACE] Slow Fall Check: ID %d acc=%.1f, entering floor check...\n", curr.id, acc);
                      // Calculate Bottom Y (max_r)
                      int max_r = 0;
                      int cols = pImpl->config.grid_cols;
@@ -3339,7 +3341,17 @@ StatusCode FallDetector::Detect(const Image& frame, bool& is_fall) {
                      
                      float floor_thresh = H * 0.48f; // Tuned for Dataset 1 Slide vs Sit (Sit lands ~0.46H, Fall > 0.5H)
                      
-                     if (bottom_pixel_y >= floor_thresh) {
+                     // DEBUG: Trace floor threshold check
+                     printf("[TRACE] ID %d bottom_pixel_y=%.1f floor_thresh=%.1f Pass=%d\n", 
+                            curr.id, bottom_pixel_y, floor_thresh, (int)(bottom_pixel_y >= floor_thresh));
+
+                     // High Position Fall Patch: For small objects with high accumulated descent,
+                     // allow detection even if bottom is above floor_thresh (Walking Fall towards camera)
+                     // TUNED: Speed < 4.0 (was 5.5) to exclude fast noise (Data 4 Dy ~6.5)
+                     bool is_small_valid_fall = (curr.blocks.size() >= 5 && std::abs(curr.avgDy) < 4.0f && curr.direction_variance < 0.8f);
+                     bool high_position_fall_ok = (acc > 80.0f && is_small_valid_fall);
+
+                     if (bottom_pixel_y >= floor_thresh || high_position_fall_ok) {
                          // Refined Bed Check: Use BOTTOM of object
                          bool bottom_outside_bed = true; // Default to outside (unsafe)
 
@@ -3364,8 +3376,30 @@ StatusCode FallDetector::Detect(const Image& frame, bool& is_fall) {
                          
                          // Trigger only if Bottom is OUTSIDE bed (or no bed mask)
                          // FINAL TUNE: Add Size Filter to reject Noise (Data 4) and Sits (Data 1)
-                         if (bottom_outside_bed && curr.blocks.size() > 20) {
-                             printf("[DEBUG] Slow Fall Candidate ID %d. BottomY: %.1f, Thresh: %.1f, Size: %zu\n", curr.id, bottom_pixel_y, floor_thresh, curr.blocks.size());
+                         // PATCH: Allow Small Objects (Data 6/7 Walking Fall) IF they are SLOW and CONSISTENT
+                         // Data 4 Noise: Dy ~6.7, DirVar ~0.3-1.2. Data 6/7: Dy ~2-4, DirVar ~0.4.
+                         // PATCH: Allow Small Objects (Data 6/7 Walking Fall, Data 2 Bed Roll) IF they are SLOW and CONSISTENT
+                         // Data 4 Noise: Dy ~6.7, DirVar ~0.3-1.2. Data 2 Bed Roll: Dy ~2.2, DirVar ~0.3-0.8, Size ~8-15.
+                         bool is_huge_obj = (curr.blocks.size() > 20); // Trust large objects
+                         bool is_valid_slow = (curr.blocks.size() > 8 && std::abs(curr.avgDy) < 4.0f && curr.direction_variance < 1.0f);
+                         bool is_large_obj = (is_huge_obj || is_valid_slow);
+
+                         bool is_small_valid_fall = (curr.blocks.size() >= 5 && std::abs(curr.avgDy) < 4.0f && curr.direction_variance < 0.8f);
+
+                         // FIX: Allow Small Valid Falls even INSIDE Bed (Data 6 Walking Fall onto bed)
+                         // But Large Objects must be OUTSIDE bed (Avoid Sits/Sleep)
+                         bool location_ok = (is_large_obj && bottom_outside_bed) || (is_small_valid_fall); // Small valid ignores bed mask
+                         
+                         // TRACE DATA 6
+                         if (curr.id == 1010 || curr.id == 1000) { // Trace typical IDs
+                             printf("[DEBUG CHECK] ID %d Size %zu Dy %.2f DirVar %.2f LocOK %d Outside %d SmallOk %d\n", 
+                                    curr.id, curr.blocks.size(), curr.avgDy, curr.direction_variance, 
+                                    (int)location_ok, (int)bottom_outside_bed, (int)is_small_valid_fall);
+                         }
+
+                         if (location_ok) {
+                             printf("[DEBUG] Slow Fall Candidate ID %d. BottomY: %.1f, Thresh: %.1f, Size: %zu, Dy: %.2f, DirVar: %.2f\n", 
+                                    curr.id, bottom_pixel_y, floor_thresh, curr.blocks.size(), curr.avgDy, curr.direction_variance);
                              // printf("[FallDetector] SLOW Fall Triggered (ID %d, AccDesc=%.1f, BottomY=%.1f)\n", curr.id, acc, bottom_pixel_y);
                              slow_triggered++;
                              detected_id = curr.id;
@@ -3575,9 +3609,10 @@ StatusCode FallDetector::Detect(const Image& frame, bool& is_fall) {
             float up_consistency = (float)up_count / trace_vy.size();
 
             // Print Analysis if minimal motion (to avoid spamming static noise)
-            if (m_avg_high > 5.0f) {
-                 printf("[ANALYSIS] Frame: %lld, ID: %d, HighLand: %d, MomMax: %.2f, MomHigh: %.2f, MomRatio: %.2f, FGHigh: %.0f, FGRatio: %.2f, Size: %zu, CY: %.0f, UpCons: %.2f, Pass: %d\n",
-                        pImpl->absolute_frame_count, curr_obj.id, is_high_landing, trace_mag[0], m_avg_high, m_ratio, f_avg_high, f_ratio, curr_obj.blocks.size(), curr_obj.centerY, up_consistency, (mom_trend && fg_trend));
+            if (m_avg_high > 0.5f) {
+                 printf("[ANALYSIS] Frame: %lld, ID: %d, HighLand: %d, MomMax: %.2f, MomHigh: %.2f, MomRatio: %.2f, FGHigh: %.0f, FGRatio: %.2f, Size: %zu, CY: %.0f, UpCons: %.2f, Pass: %d, Dx: %.2f, Dy: %.2f, Acc: %.2f, DirVar: %.2f, SpdVar: %.2f\n",
+                        pImpl->absolute_frame_count, curr_obj.id, is_high_landing, trace_mag[0], m_avg_high, m_ratio, f_avg_high, f_ratio, curr_obj.blocks.size(), curr_obj.centerY, up_consistency, (mom_trend && fg_trend),
+                        curr_obj.avgDx, curr_obj.avgDy, curr_obj.acceleration, curr_obj.direction_variance, curr_obj.magnitude_variance);
             }
 
             // FINAL TUNE: UpCons Filter for High Landing (Sits)
@@ -3769,20 +3804,36 @@ StatusCode FallDetector::Detect(const Image& frame, bool& is_fall) {
                 }
 
                 // 2. Verification rules
-                bool is_significant = (obj_size >= 3); // Relaxed from 10 to catch small objects
-                bool is_stationary = (recent_strength_avg < 10.0f); // Very permissive
-                
-                if (is_significant && is_stationary) {
-                    // Simplified verification: Trust context filter and basic checks
-                    // The detectFallMomentumTrend already filters based on motion patterns
+                // Tuned for Data 6 (Walking Fall, Size ~18, Ratio ~0.80) vs Data 4 (Noise, Size ~11-21, Ratio > 0.94) vs Data 1 (Sits, Size ~3-6, Ratio ~0.72-0.87)
+                bool is_significant = (obj_size >= 12); 
+                bool is_stationary = (recent_strength_avg < 10.0f); 
+                bool has_drop = (decline_ratio < 0.90f);
+
+                // Calc UpCons from History
+                int up_ops = 0, tot_ops = 0;
+                for(size_t i=1; i<pf.dy_history.size(); ++i) {
+                     float d = pf.dy_history[i] - pf.dy_history[i-1];
+                     if(std::abs(d) > 0.5f) {
+                         tot_ops++;
+                         if(d < -0.5f) up_ops++;
+                     }
+                }
+                float up_cons = (tot_ops > 0) ? (float)up_ops/tot_ops : 0.0f;
+                bool not_upward = (up_cons <= 0.25f); // Data 4 Noise drifts up (>0.3). Data 6 is 0.0.
+
+                if (is_significant && is_stationary && has_drop && not_upward) {
                     confirmed_fall = true;
-                    printf("[FG Verify] CONFIRMED (High Landing): ID %d, ratio=%.2f, size=%d, AR=%.2f\n", pf.object_id, decline_ratio, obj_size, ar);
+                    printf("[FG Verify] CONFIRMED (High Landing): ID %d, ratio=%.2f, size=%d, AR=%.2f, UpCons=%.2f\n", pf.object_id, decline_ratio, obj_size, ar, up_cons);
                 } else {
                     pf.rejected = true;
                     if (!is_significant)
-                        printf("[FG Verify] REJECTED (High Landing - Tiny Noise): ID %d, size=%d\n", pf.object_id, obj_size);
+                        printf("[FG Verify] REJECTED (High Landing - Small): ID %d, size=%d\n", pf.object_id, obj_size);
+                    else if (!has_drop)
+                         printf("[FG Verify] REJECTED (High Landing - No Drop): ID %d, ratio=%.2f\n", pf.object_id, decline_ratio);
                     else if (!is_stationary)
-                        printf("[FG Verify] REJECTED (High Landing - Still Moving): ID %d, str=%.1f\n", pf.object_id, recent_strength_avg);
+                        printf("[FG Verify] REJECTED (High Landing - Moving): ID %d, str=%.1f\n", pf.object_id, recent_strength_avg);
+                    else if (!not_upward)
+                        printf("[FG Verify] REJECTED (High Landing - Upward): ID %d, UpCons=%.2f\n", pf.object_id, up_cons);
                 }
             } else {
                 // NORMAL LANDING (On Floor / Bottom Half)
@@ -3825,6 +3876,13 @@ StatusCode FallDetector::Detect(const Image& frame, bool& is_fall) {
     // Note: is_fall may have been set to true by pending_falls confirmation above
     // Only reset if we're also going to process new triggers
     
+    // MERGE FIX: Add Slow Fall IDs to triggered list
+    for(int sid : slow_fall_ids) {
+        bool exists = false;
+        for(int pid : triggered_objects) if(pid == sid) { exists = true; break; }
+        if(!exists) triggered_objects.push_back(sid);
+    }
+
     if (!triggered_objects.empty()) {
         int bSize = pImpl->config.block_size; 
         for(int pid : triggered_objects) {
@@ -3927,24 +3985,28 @@ StatusCode FallDetector::Detect(const Image& frame, bool& is_fall) {
                           
                           // GENERAL ASPECT RATIO FILTER (Distinguish Sit vs Slide)
                           // 1. Large Objects (>10 blocks): Must be wider than 0.30 (Balanced).
-                          // 2. Small Objects (<=10 blocks): Must be VERY flat (>1.0) to be valid (Noise Filter).
-                          //    EXCEPTION: If Strength is very high (>8.0), likely a fast fall fragment. Allow it.
-                           bool reject_posture = false;
-                           if (pObj->blocks.size() > 10 && asp_ratio < 0.30f) { // Restore 0.30 to allow longitudinal falls
-                                reject_posture = true;
-                           } else if (pObj->blocks.size() <= 10) { 
-                                if (asp_ratio < 0.30f && pObj->strength < 8.0f) { 
-                                    reject_posture = true;
-                                }
-                           }
+                           // 2. Small Objects (<=10 blocks): Must be VERY flat (>1.0) to be valid (Noise Filter).
+                           //    EXCEPTION: If Strength is very high (>8.0), likely a fast fall fragment. Allow it.
+                           //    EXCEPTION 2 (Data 7 Patch): If Direction Variance is Low (<0.5), it's consistent motion (Fall), not noise. Allow it.
+                            bool reject_posture = false;
+                            if (pObj->blocks.size() > 10 && asp_ratio < 0.30f) { // Restore 0.30 to allow longitudinal falls
+                                 reject_posture = true;
+                            } else if (pObj->blocks.size() <= 10) { 
+                                 // Data 7 (AR=0.25) was rejected. 
+                                 // Add DirVar check to rescue valid small falls.
+                                 bool is_consistent = (pObj->direction_variance < 0.5f);
+                                 if (asp_ratio < 0.30f && pObj->strength < 8.0f && !is_consistent) { 
+                                     reject_posture = true;
+                                 }
+                            }
 
-                          if (reject_posture) {
+                          if (reject_posture && !is_slow_trigger) {
                               rejected_context = true;
                               reject_reason = "UprightPosture(Sit)";
                               printf("[FallDetector] Rejection: Upright Posture (Sit) ID %d. AR=%.2f. Size=%zu. Bed=%d\n", 
                                      pObj->id, asp_ratio, pObj->blocks.size(), (int)maskValBottom);
                           }
-                          else if (maskValBottom == 0) { // Bottom Inside Bed -> Reject
+                          else if (maskValBottom == 0 && !is_slow_trigger) { // Bottom Inside Bed -> Reject (Unless Slow Fall)
                               rejected_context = true;
                               reject_reason = "InsideBed(Bottom)";
                               printf("[FallDetector] Rejection: Bottom inside Bed Region ID %d. CyBottom=%d\n", pObj->id, cy_bottom);
