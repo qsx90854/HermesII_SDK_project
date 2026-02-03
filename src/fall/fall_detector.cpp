@@ -3337,7 +3337,7 @@ StatusCode FallDetector::Detect(const Image& frame, bool& is_fall) {
                      }
                      float bottom_pixel_y = (max_r + 1) * bSize;
                      
-                     float floor_thresh = H * 0.35f; // Tuned for Dataset 1 Slide
+                     float floor_thresh = H * 0.48f; // Tuned for Dataset 1 Slide vs Sit (Sit lands ~0.46H, Fall > 0.5H)
                      
                      if (bottom_pixel_y >= floor_thresh) {
                          // Refined Bed Check: Use BOTTOM of object
@@ -3357,14 +3357,15 @@ StatusCode FallDetector::Detect(const Image& frame, bool& is_fall) {
                               if(cx < 0) cx = 0; if(cx >= W) cx = W-1;
                               if(cy_bottom < 0) cy_bottom = 0; if(cy_bottom >= H) cy_bottom = H-1;
                               
-                              // If Bottom Point is INSIDE Bed (0), then still fully on bed -> Safe.
                               if (mData[cy_bottom * W + cx] == 0) {
                                   bottom_outside_bed = false;
                               }
                          }
                          
                          // Trigger only if Bottom is OUTSIDE bed (or no bed mask)
-                         if (bottom_outside_bed) {
+                         // FINAL TUNE: Add Size Filter to reject Noise (Data 4) and Sits (Data 1)
+                         if (bottom_outside_bed && curr.blocks.size() > 20) {
+                             printf("[DEBUG] Slow Fall Candidate ID %d. BottomY: %.1f, Thresh: %.1f, Size: %zu\n", curr.id, bottom_pixel_y, floor_thresh, curr.blocks.size());
                              // printf("[FallDetector] SLOW Fall Triggered (ID %d, AccDesc=%.1f, BottomY=%.1f)\n", curr.id, acc, bottom_pixel_y);
                              slow_triggered++;
                              detected_id = curr.id;
@@ -3415,6 +3416,8 @@ StatusCode FallDetector::Detect(const Image& frame, bool& is_fall) {
         };
 
         for (const auto& curr_obj : pImpl->current_objects) {
+            // Debug: Trace Check
+            // printf("[DEBUG] Checking V2 for ID %d\n", curr_obj.id);
             // Retrieve History
             int hist_len = pImpl->object_history.size();
             int m_trend = 10; // "Recent m frames" - default 10
@@ -3525,16 +3528,16 @@ StatusCode FallDetector::Detect(const Image& frame, bool& is_fall) {
             float fg_drop_ratio;
             
             if (is_high_landing) {
-                // High Landing (e.g. Sits, Bed movements): Require VERY strong signal
-                mom_high_thresh = 15.0f; 
-                mom_drop_ratio = 0.3f; // Sharp drop
+                // High Landing (e.g. Sits, Bed movements): Require Drop
+                mom_high_thresh = 6.0f; // Lowered to catch start-of-fall (Data 2)
+                mom_drop_ratio = 0.85f; // RELAXED (Was 0.4) to catch Walking Fall (Data 6 ~0.84). Sits are filtered by UpCons.
                 fg_drop_ratio = 0.5f; // Significant FG reduction
                 // printf("[LogicV2] Obj %d High Landing (y=%.1f). Using STRICT thresholds.\n", curr_obj.id, curr_obj.centerY);
             } else {
                 // Low Landing (Floor Falls): Relaxed
-                mom_high_thresh = 10.0f; // Was 10.0
-                mom_drop_ratio = 0.4f; // Was 0.5
-                fg_drop_ratio = 0.7f; // Was 0.75
+                mom_high_thresh = 6.0f; // Lowered from 10.0
+                mom_drop_ratio = 0.5f; // Was 0.4
+                fg_drop_ratio = 0.75f; // Was 0.7
             }
 
             // Check Momentum Trend
@@ -3551,10 +3554,39 @@ StatusCode FallDetector::Detect(const Image& frame, bool& is_fall) {
             
             // Sync Check (Implicit: we check same window 'collected')
             
-            if (mom_trend && fg_trend) {
+            // Calculate Stats for Analysis (Always, for tuning)
+            float m_avg_high = 0, m_avg_low = 0;
+            int half = collected / 2;
+            for(int i=0; i<half; ++i) m_avg_high += trace_mag[i];
+            for(int i=half; i<collected; ++i) m_avg_low += trace_mag[i];
+            m_avg_high /= half;
+            m_avg_low /= (collected - half);
+            float m_ratio = (m_avg_high > 0) ? m_avg_low / m_avg_high : 0;
+            
+            float f_avg_high = 0, f_avg_low = 0;
+            for(int i=0; i<half; ++i) f_avg_high += fg_float[i];
+            for(int i=half; i<collected; ++i) f_avg_low += fg_float[i];
+            f_avg_high /= half;
+            f_avg_low /= (collected - half);
+            float f_ratio = (f_avg_high > 0) ? f_avg_low / f_avg_high : 0;
+            
+            int up_count = 0;
+            for(float vy : trace_vy) if(vy < 0) up_count++;
+            float up_consistency = (float)up_count / trace_vy.size();
+
+            // Print Analysis if minimal motion (to avoid spamming static noise)
+            if (m_avg_high > 5.0f) {
+                 printf("[ANALYSIS] Frame: %lld, ID: %d, HighLand: %d, MomMax: %.2f, MomHigh: %.2f, MomRatio: %.2f, FGHigh: %.0f, FGRatio: %.2f, Size: %zu, CY: %.0f, UpCons: %.2f, Pass: %d\n",
+                        pImpl->absolute_frame_count, curr_obj.id, is_high_landing, trace_mag[0], m_avg_high, m_ratio, f_avg_high, f_ratio, curr_obj.blocks.size(), curr_obj.centerY, up_consistency, (mom_trend && fg_trend));
+            }
+
+            // FINAL TUNE: UpCons Filter for High Landing (Sits)
+            if (is_high_landing && up_consistency > 0.30f) {
+                // Reject Sits (UpCons ~0.5)
+                // printf("[LogicV2] Reject High Landing Upward Motion (Sit): UpCons %.2f\n", up_consistency);
+            }
+            else if (mom_trend && fg_trend) {
                 potential_fall = true;
-                // printf("[LogicV2] Candidate ID %d. Up: %d. MomTrend: Yes (Max %.1f). FGTrend: Yes. HighLanding: %d\n", 
-                //       curr_obj.id, is_upward, trace_mag[0], is_high_landing); 
             }
             
             if (potential_fall) {
@@ -3592,6 +3624,7 @@ StatusCode FallDetector::Detect(const Image& frame, bool& is_fall) {
                 }
                 
                 // CONFIRMED FALL
+                // printf("[DEBUG] PUSH BACK V2 for ID %d\n", curr_obj.id);
                 triggered_objects.push_back(curr_obj.id);
                 warningMsg = "Fall Detected (Logic V2)";
                 printf("[LogicV2] *** FALL CONFIRMED *** ID %d\n", curr_obj.id);
@@ -3602,7 +3635,10 @@ StatusCode FallDetector::Detect(const Image& frame, bool& is_fall) {
     if (slow_triggered > 0 && detected_id != -1) {
          bool exists = false;
          for(int tid : triggered_objects) if(tid == detected_id) exists = true;
-         if(!exists) triggered_objects.push_back(detected_id);
+         if(!exists) {
+             // printf("[DEBUG] PUSH BACK SLOW for ID %d\n", detected_id);
+             triggered_objects.push_back(detected_id);
+         }
     }
     
     if (!triggered_objects.empty()) triggered = 1;
@@ -3784,7 +3820,7 @@ StatusCode FallDetector::Detect(const Image& frame, bool& is_fall) {
 
     // (Duplicate Block Removed)
 
-    printf("[Detect] detectFallMomentumTrend Returned. Triggered: %zu\n", triggered_objects.size());
+    // printf("[Detect] Fall Check Complete. Triggered: %zu\n", triggered_objects.size());
 
     // Note: is_fall may have been set to true by pending_falls confirmation above
     // Only reset if we're also going to process new triggers
