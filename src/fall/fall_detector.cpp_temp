@@ -1,0 +1,13 @@
+std::vector<uint8_t> FallDetector::GetChangedBlocks() const {
+    // Return mask of changed blocks
+    // internal: changed_mask (std::vector<bool>)
+    // Convert to uint8_t
+    std::vector<uint8_t> ret;
+    ret.reserve(pImpl->changed_mask.size());
+    for(bool b : pImpl->changed_mask) ret.push_back(b ? 1 : 0);
+    return ret;
+}
+
+std::vector<MotionVector> FallDetector::GetMotionVectors() const {
+    return pImpl->motion_vectors;
+}

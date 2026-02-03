@@ -1,0 +1,22 @@
+{
+    "configurations": [
+        {
+            "name": "Linux",
+            "includePath": [
+                "${workspaceFolder}/**",
+                "${workspaceFolder}/include",
+                "${workspaceFolder}/src",
+                "/home/mark/nn_release/npu_inference/mpp/include",
+                "/home/mark/nn_release/npu_inference/mpp/drv_include"
+            ],
+            "defines": [
+                "NDEBUG"
+            ],
+            "compilerPath": "/home/mark/arm-fhva12c-linux-uclibcgnueabihf-b5.3/arm-fhva12c-linux-uclibcgnueabihf-b5/bin/arm-fhva12c-linux-uclibcgnueabihf-g++",
+            "cStandard": "c17",
+            "cppStandard": "c++14",
+            "intelliSenseMode": "linux-gcc-arm"
+        }
+    ],
+    "version": 4
+}
