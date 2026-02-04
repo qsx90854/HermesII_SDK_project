@@ -1719,6 +1719,9 @@ public:
         std::vector<float> dx_history;
         std::vector<float> dy_history;
         std::vector<float> strength_history;
+        float sf_verified_max_str = 0.0f; // V11/V12 Recall Check: Store Trigger MaxStr to survive verification history resets
+        float sf_verified_up_cons = 0.0f; // V11/V12 Recall Check: Store Trigger UpCons to handle post-fall bounces
+
     };
     std::vector<PendingFall> pending_falls;
     
@@ -3380,20 +3383,51 @@ StatusCode FallDetector::Detect(const Image& frame, bool& is_fall) {
                          // Data 4 Noise: Dy ~6.7, DirVar ~0.3-1.2. Data 6/7: Dy ~2-4, DirVar ~0.4.
                          // PATCH: Allow Small Objects (Data 6/7 Walking Fall, Data 2 Bed Roll) IF they are SLOW and CONSISTENT
                          // Data 4 Noise: Dy ~6.7, DirVar ~0.3-1.2. Data 2 Bed Roll: Dy ~2.2, DirVar ~0.3-0.8, Size ~8-15.
+                                                  // Calc UpCons and MaxStr for Slow Fall (Reject Sits, Allow Walking Falls)
+                          float sf_up_cons = 0.0f;
+                          float sf_max_str = 0.0f;
+                          if (!pImpl->object_history.empty()) {
+                              int u = 0, t = 0;
+                              // Iterate historyframes (Limit lookup to last 30 frames to be safe/fast?)
+                              size_t start_h = (pImpl->object_history.size() > 30) ? (pImpl->object_history.size() - 30) : 0;
+                              for (size_t i = start_h; i < pImpl->object_history.size(); ++i) {
+                                  for (const auto& o : pImpl->object_history[i]) {
+                                      if (o.id == curr.id) {
+                                          if (o.avgDy < -0.5f) u++;
+                                          float s = std::hypot(o.avgDx, o.avgDy);
+                                          if (s > sf_max_str) sf_max_str = s;
+                                          t++;
+                                          break; // Found in this frame
+                                      }
+                                  }
+                              }
+                              if(t > 0) sf_up_cons = (float)u / t;
+                          }
+
                          bool is_huge_obj = (curr.blocks.size() > 20); // Trust large objects
-                         bool is_valid_slow = (curr.blocks.size() > 8 && std::abs(curr.avgDy) < 4.0f && curr.direction_variance < 1.0f);
+                         
+                         // V11 Fix: Enforce UpCons/MaxStr Check on ALL filter paths
+                         // Data 1 (Sits): UpCons ~1.0, MaxStr ~3.0 -> REJECT
+                         // Data 7 (Walking Fall): UpCons ~0.5, MaxStr > 8.0 -> ACCEPT
+                         bool protection_ok = (sf_up_cons <= 0.35f || sf_max_str > 8.0f);
+
+                         bool is_valid_slow = (curr.blocks.size() > 8 && std::abs(curr.avgDy) < 4.0f && curr.direction_variance < 1.0f && protection_ok);
                          bool is_large_obj = (is_huge_obj || is_valid_slow);
 
-                         bool is_small_valid_fall = (curr.blocks.size() >= 5 && std::abs(curr.avgDy) < 4.0f && curr.direction_variance < 0.8f);
+                         bool is_small_valid_fall = (curr.blocks.size() >= 5 && std::abs(curr.avgDy) < 4.0f && curr.direction_variance < 0.8f && protection_ok);
 
                          // FIX: Allow Small Valid Falls even INSIDE Bed (Data 6 Walking Fall onto bed)
                          // But Large Objects must be OUTSIDE bed (Avoid Sits/Sleep)
                          bool location_ok = (is_large_obj && bottom_outside_bed) || (is_small_valid_fall); // Small valid ignores bed mask
                          
-                         // TRACE DATA 6
-                         if (curr.id == 1010 || curr.id == 1000) { // Trace typical IDs
-                             printf("[DEBUG CHECK] ID %d Size %zu Dy %.2f DirVar %.2f LocOK %d Outside %d SmallOk %d\n", 
-                                    curr.id, curr.blocks.size(), curr.avgDy, curr.direction_variance, 
+                         if(location_ok) {
+                             printf("[V11 TRIG] ID=%d Size=%d outside=%d up_cons=%.2f max_str=%.2f huge=%d small=%d\n", 
+                                    curr.id, (int)curr.blocks.size(), bottom_outside_bed, sf_up_cons, sf_max_str, is_huge_obj, is_small_valid_fall);
+                             
+                             // 4. Update Trigger State
+
+                             printf("[DEBUG CHECK] ID %d Size %zu Dy %.2f DirVar %.2f UpCons %.2f LocOK %d Outside %d SmallOk %d\n", 
+                                    curr.id, curr.blocks.size(), curr.avgDy, curr.direction_variance, sf_up_cons,
                                     (int)location_ok, (int)bottom_outside_bed, (int)is_small_valid_fall);
                          }
 
@@ -3565,7 +3599,7 @@ StatusCode FallDetector::Detect(const Image& frame, bool& is_fall) {
                 // High Landing (e.g. Sits, Bed movements): Require Drop
                 mom_high_thresh = 6.0f; // Lowered to catch start-of-fall (Data 2)
                 mom_drop_ratio = 0.85f; // RELAXED (Was 0.4) to catch Walking Fall (Data 6 ~0.84). Sits are filtered by UpCons.
-                fg_drop_ratio = 0.5f; // Significant FG reduction
+                fg_drop_ratio = 0.75f; // RELAXED (Was 0.5) to catch Data 7 (0.74)
                 // printf("[LogicV2] Obj %d High Landing (y=%.1f). Using STRICT thresholds.\n", curr_obj.id, curr_obj.centerY);
             } else {
                 // Low Landing (Floor Falls): Relaxed
@@ -3777,8 +3811,32 @@ StatusCode FallDetector::Detect(const Image& frame, bool& is_fall) {
             // This targets "Falling Away" cases where FG decrease is less dramatic but behavior is fall-like.
             bool composite_confirmed = (decline_ratio < 0.85f && is_upward && is_lying_down);
 
+
             bool confirmed_fall = false;
+
+            // Calc UpCons and MaxStr (Hoisted for V11 Debugging scope)
+            int up_ops = 0, tot_ops = 0;
+            for(size_t i=1; i<pf.dy_history.size(); ++i) {
+                 float d = pf.dy_history[i] - pf.dy_history[i-1];
+                 if(std::abs(d) > 0.5f) {
+                     tot_ops++;
+                     if(d < -0.5f) up_ops++;
+                 }
+            }
+            float up_cons = (tot_ops > 0) ? (float)up_ops/tot_ops : 0.0f;
+
+            // V12 Logic: Trust Clean Trigger
+            float max_str = pf.sf_verified_max_str; // Use Trigger MaxStr
             
+            bool high_mom = (max_str > 8.0f);
+            bool clean_trig = (pf.sf_verified_up_cons <= 0.35f);
+
+            // Upward Check (V12):
+            // Allow high momentum to override UpCons check IF Trigger was Clean OR UpCons is reasonable (<= 0.60)
+            // This allows Data 3 (UpCons ~0.50) while blocking Data 1 (UpCons 0.90+)
+            bool not_upward = (up_cons <= 0.30f) || (high_mom && (up_cons <= 0.60f || clean_trig)); 
+
+
             if (pf.is_high_landing) {
                 // High Landing (Top Half): Strict Verification required to avoid Sits/Walks.
                 // 1. Calculate AR and Size
@@ -3809,41 +3867,39 @@ StatusCode FallDetector::Detect(const Image& frame, bool& is_fall) {
                 bool is_stationary = (recent_strength_avg < 10.0f); 
                 bool has_drop = (decline_ratio < 0.90f);
 
-                // Calc UpCons from History
-                int up_ops = 0, tot_ops = 0;
-                for(size_t i=1; i<pf.dy_history.size(); ++i) {
-                     float d = pf.dy_history[i] - pf.dy_history[i-1];
-                     if(std::abs(d) > 0.5f) {
-                         tot_ops++;
-                         if(d < -0.5f) up_ops++;
-                     }
-                }
-                float up_cons = (tot_ops > 0) ? (float)up_ops/tot_ops : 0.0f;
-                bool not_upward = (up_cons <= 0.25f); // Data 4 Noise drifts up (>0.3). Data 6 is 0.0.
-
                 if (is_significant && is_stationary && has_drop && not_upward) {
                     confirmed_fall = true;
-                    printf("[FG Verify] CONFIRMED (High Landing): ID %d, ratio=%.2f, size=%d, AR=%.2f, UpCons=%.2f\n", pf.object_id, decline_ratio, obj_size, ar, up_cons);
                 } else {
                     pf.rejected = true;
                     if (!is_significant)
                         printf("[FG Verify] REJECTED (High Landing - Small): ID %d, size=%d\n", pf.object_id, obj_size);
                     else if (!has_drop)
-                         printf("[FG Verify] REJECTED (High Landing - No Drop): ID %d, ratio=%.2f\n", pf.object_id, decline_ratio);
+                        printf("[FG Verify] REJECTED (High Landing - No Drop): ID %d, ratio=%.2f\n", pf.object_id, decline_ratio);
                     else if (!is_stationary)
                         printf("[FG Verify] REJECTED (High Landing - Moving): ID %d, str=%.1f\n", pf.object_id, recent_strength_avg);
-                    else if (!not_upward)
-                        printf("[FG Verify] REJECTED (High Landing - Upward): ID %d, UpCons=%.2f\n", pf.object_id, up_cons);
+                    if (pf.rejected) {
+                        if (!is_significant)
+                            printf("[FG Verify] REJECTED (High Landing - Small): ID %d, size=%d\n", pf.object_id, obj_size);
+                        else if (!has_drop)
+                            printf("[FG Verify] REJECTED (High Landing - No Drop): ID %d, ratio=%.2f\n", pf.object_id, decline_ratio);
+                        else if (!is_stationary)
+                            printf("[FG Verify] REJECTED (High Landing - Moving): ID %d, str=%.1f\n", pf.object_id, recent_strength_avg);
+                        
+                        if (!not_upward)
+                             printf("[FG Verify] REJECTED (High Landing - Upward): ID %d, UpCons=%.2f MaxStr=%.2f\n", pf.object_id, up_cons, max_str);
+                    }
                 }
             } else {
                 // NORMAL LANDING (On Floor / Bottom Half)
-                // Relaxed verification
-                if (decline_ratio < 0.80f || composite_confirmed) {
+                // Relaxed verification for Clean Triggers (Data 6)
+                if ((decline_ratio < 0.80f || composite_confirmed || (high_mom && clean_trig && decline_ratio < 1.15f)) && not_upward) {
                     confirmed_fall = true;
-                    printf("[FG Verify] CONFIRMED: ID %d, ratio=%.2f\n", pf.object_id, decline_ratio);
                 } else {
                     pf.rejected = true;
-                    printf("[FG Verify] REJECTED: ID %d, ratio=%.2f\n", pf.object_id, decline_ratio);
+                    if (!not_upward)
+                        printf("[FG Verify] REJECTED (Normal - Upward): ID %d, UpCons=%.2f MaxStr=%.2f\n", pf.object_id, up_cons, max_str);
+                    else
+                        printf("[FG Verify] REJECTED: ID %d, ratio=%.2f\n", pf.object_id, decline_ratio);
                 }
             }
             
@@ -4036,6 +4092,9 @@ StatusCode FallDetector::Detect(const Image& frame, bool& is_fall) {
                                   // This prevents Sits (Data 1) from slipping through as Normal Fall candidates.
                                   
                                   is_high_landing_event = true; 
+                                  // PATCH: Bed Rolls (Slow Fall) are High Landing physically, but logic-wise should be Permissive.
+                                  if (is_slow_trigger) is_high_landing_event = false; 
+
                                   printf("[FallDetector] FLAG: High Landing Detected. ID %d. CenterY=%.1f. Will require Strict Verification.\n", pObj->id, obj_pixel_y);
                               } else {
                                   // Low Landing -> Accepted as Normal
@@ -4066,6 +4125,33 @@ StatusCode FallDetector::Detect(const Image& frame, bool& is_fall) {
                              pf.frames_monitored = 0;
                              pf.confirmed = false;
                              pf.rejected = false;
+
+                             // V12 Recall Fix: Calc MaxStr AND UpCons from Global History
+                             // This ensures we capture the high momentum peak even if verification history is short.
+                             float trig_max_str = 0.0f;
+                             int trig_up_ops = 0, trig_tot_ops = 0;
+                             if (!pImpl->object_history.empty()) {
+                                 size_t start_h = (pImpl->object_history.size() > 30) ? (pImpl->object_history.size() - 30) : 0;
+                                 for (size_t i = start_h; i < pImpl->object_history.size(); ++i) {
+                                     for (const auto& o : pImpl->object_history[i]) {
+                                         if (o.id == pid) {
+                                             float s = std::hypot(o.avgDx, o.avgDy);
+                                             if (s > trig_max_str) trig_max_str = s;
+
+                                             // UpCons logic check
+                                             if (std::abs(o.avgDy) > 0.5f) {
+                                                 trig_tot_ops++;
+                                                 if (o.avgDy < -0.5f) trig_up_ops++;
+                                             }
+                                             break; 
+                                         }
+                                     }
+                                 }
+                             }
+                             pf.sf_verified_max_str = trig_max_str;
+                             pf.sf_verified_up_cons = (trig_tot_ops > 0) ? (float)trig_up_ops / trig_tot_ops : 0.0f;
+
+
                              
                              // Copy lookback FG history (last LOOKBACK_FRAMES frames)
                              int start_idx = std::max(0, (int)pImpl->fg_count_history_buffer.size() - pImpl->LOOKBACK_FRAMES);
