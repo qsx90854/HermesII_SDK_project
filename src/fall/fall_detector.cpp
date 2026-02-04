@@ -10,6 +10,7 @@
 #include <sstream>
 #include <deque>
 #include <map>
+#include <set>
 
 #include <cstdio>
 #include <sys/stat.h>
@@ -1722,15 +1723,28 @@ public:
         float sf_verified_max_str = 0.0f; // V11/V12 Recall Check: Store Trigger MaxStr to survive verification history resets
         float sf_verified_up_cons = 0.0f; // V11/V12 Recall Check: Store Trigger UpCons to handle post-fall bounces
         float sf_verified_dir_var = 999.0f; // V12 Tuning: Store Trigger Direction Variance (Consistency)
+        float pd_trigger_safe_ratio = 0.0f; // V17.1: Store Bed Safe Ratio at trigger
+        float historical_bed_max = 0.0f; // V17.5: Max Safe Ratio in lookback window
 
     };
     std::vector<PendingFall> pending_falls;
     
-    // Global FG history buffer (last 100 frames)
+    // Global FG history buffer (last 120 frames)
     std::deque<int> fg_count_history_buffer;
     
+    // Global Object Y-Pos history (last 120 frames per ID)
+    std::map<int, std::deque<float>> object_y_history_buffer;
+    
+    // V17.5: Safe Ratio History (last 120 frames)
+    std::map<int, std::deque<float>> object_safe_ratio_history_buffer;
+    
+    // NEW: Persistent Object Block Cache for Robust FG Tracking (Object-local stats)
+    
+    // NEW: Persistent Object Block Cache for Robust FG Tracking (Object-local stats)
+    std::map<int, std::vector<int>> persistent_object_blocks;
+    
     // Parameters
-    static constexpr int LOOKBACK_FRAMES = 10;
+    static constexpr int LOOKBACK_FRAMES = 40;
     static constexpr int OBSERVATION_WINDOW = 30;
     static constexpr float DECLINE_THRESHOLD = 0.75f;
     static constexpr int ENTRY_SUPPRESS_FRAMES = 30;
@@ -1918,6 +1932,7 @@ void TrackObjects(std::vector<MotionObject>& current, const std::vector<MotionOb
                   int& global_id_counter,
                   std::map<int, int>& object_first_seen_frame,
                   std::map<int, bool>& object_is_new_entry,
+                  std::map<int, std::vector<int>>& persistent_object_blocks,
                   int frame_idx) 
 {
     printf("[Debug] TrackObjects Start. Current: %zu Previous: %zu\n", current.size(), previous.size());
@@ -2307,6 +2322,7 @@ void TrackObjects(std::vector<MotionObject>& current, const std::vector<MotionOb
             for(int id : tracksToRemove) {
                 kalmanFilters.erase(id);
                 track_ttl.erase(id);
+                persistent_object_blocks.erase(id);
                 
                 // Also remove from the 'current' object list so we don't return duplicates
                 auto it = std::remove_if(current.begin(), current.end(), 
@@ -2369,6 +2385,14 @@ void TrackObjects(std::vector<MotionObject>& current, const std::vector<MotionOb
             }
         }
     }
+    
+    // NEW: Update Persistent Block Cache for all current (matched) objects
+    for (const auto& obj : current) {
+        if (obj.id >= 1000) {
+            persistent_object_blocks[obj.id] = obj.blocks;
+        }
+    }
+
     printf("[Debug] TrackObjects End.\n");
 }
 
@@ -2947,7 +2971,7 @@ StatusCode FallDetector::Detect(const Image& frame, bool& is_fall) {
     // TRACKING
     // TRACKING
     TrackObjects(pImpl->current_objects, pImpl->previous_objects, pImpl->config, pImpl->kalmanFilters, pImpl->track_ttl, pImpl->global_id_counter,
-                 pImpl->object_first_seen_frame, pImpl->object_is_new_entry, pImpl->frame_idx);
+                 pImpl->object_first_seen_frame, pImpl->object_is_new_entry, pImpl->persistent_object_blocks, pImpl->frame_idx);
     
     // 2.1 Update Safe Area Ratio
     if (pImpl->hasBedMask) {
@@ -3109,61 +3133,119 @@ StatusCode FallDetector::Detect(const Image& frame, bool& is_fall) {
 
     if (bgData) 
     {
-        // NEW: Calculate Total Frame Foreground Count
-        
         int grid_cols = pImpl->config.grid_cols;
         int grid_rows = pImpl->config.grid_rows;
         int bw = W / grid_cols;
         int bh = H / grid_rows;
 
-        // Iterate all CHANGED blocks to count FG pixels
-        // This is efficient because we only check motion areas
-        if (!pImpl->changed_mask.empty()) 
-        {
-             for (size_t i = 0; i < pImpl->changed_mask.size(); ++i) 
-             {
-                  if (pImpl->changed_mask[i]) 
-                  {
-                      // Block coords
-                      int r = i / grid_cols;
-                      int c = i % grid_cols;
-                      int startX = c * bw;
-                      int startY = r * bh;
-                      int endX = std::min(W, startX + bw);
-                      int endY = std::min(H, startY + bh);
-                      
-                      for (int y = startY; y < endY; ++y) 
-                      {
-                          for (int x = startX; x < endX; ++x) 
-                          {
-                              int idx = (y * W + x) * 3;
-                              int diff = 0;
-                              if (pImpl->backgroundFrame.getChannels() == 1) 
-                              {
-                                  int bgVal = bgData[y * W + x];
-                                  int grayVal = (currData[idx] + currData[idx+1]*2 + currData[idx+2]) / 4;
-                                  diff = std::abs(grayVal - bgVal);
-                              } 
-                              else 
-                              {
-                                  diff += std::abs((int)currData[idx] - (int)bgData[idx]);
-                                  diff += std::abs((int)currData[idx+1] - (int)bgData[idx+1]);
-                                  diff += std::abs((int)currData[idx+2] - (int)bgData[idx+2]);
-                                  diff /= 3;
-                              }
-                              if (diff > bg_thresh) 
-                              {
-                                  global_fg_count++;
-                              }
-                          }
-                      }
-                  }
-             }
-             // printf("[Detect] Global FG Count: %d\n", global_fg_count);
+        // Efficient Block-Based FG Scoring (Stationary-Aware)
+        std::vector<int> block_fg_scores(grid_rows * grid_cols, 0);
+        std::vector<bool> blocks_to_scan(grid_rows * grid_cols, false);
+
+        // A. Mark motion blocks
+        for (size_t i = 0; i < pImpl->changed_mask.size(); ++i) {
+            if (pImpl->changed_mask[i]) blocks_to_scan[i] = true;
+        }
+
+        // B. Mark persistent object blocks (even if stationary)
+        for (auto const& kv : pImpl->persistent_object_blocks) {
+            for (int blk : kv.second) {
+                if (blk >= 0 && blk < (int)blocks_to_scan.size()) blocks_to_scan[blk] = true;
+            }
+        }
+
+        // C. Perform Pixel Scanning
+        for (int i = 0; i < grid_rows * grid_cols; ++i) {
+            if (!blocks_to_scan[i]) continue;
+
+            int r = i / grid_cols;
+            int c = i % grid_cols;
+            int startX = c * bw;
+            int startY = r * bh;
+            int endX = std::min(W, startX + bw);
+            int endY = std::min(H, startY + bh);
+            
+            int count = 0;
+            for (int y = startY; y < endY; ++y) {
+                for (int x = startX; x < endX; ++x) {
+                    int idx = (y * W + x) * 3;
+                    int diff = 0;
+                    if (pImpl->backgroundFrame.getChannels() == 1) {
+                        int bgVal = bgData[y * W + x];
+                        int grayVal = (currData[idx] + currData[idx+1]*2 + currData[idx+2]) / 4;
+                        diff = std::abs(grayVal - bgVal);
+                    } else {
+                        // BGR diff
+                        diff = (std::abs((int)currData[idx] - (int)bgData[idx]) +
+                                std::abs((int)currData[idx+1] - (int)bgData[idx+1]) +
+                                std::abs((int)currData[idx+2] - (int)bgData[idx+2])) / 3;
+                    }
+
+                    if (diff > bg_thresh) {
+                        count++;
+                    }
+                }
+            }
+            block_fg_scores[i] = count;
+            
+            // Still contribute to global count if it was a motion block
+            if (pImpl->changed_mask[i]) global_fg_count += count;
+        }
+
+        // D. Ghost Object Injection (Maintain stationary objects in current_objects)
+        std::set<int> current_ids;
+        for (const auto& obj : pImpl->current_objects) current_ids.insert(obj.id);
+
+        for (auto const& kv : pImpl->persistent_object_blocks) {
+            int id = kv.first;
+            if (current_ids.find(id) == current_ids.end()) {
+                // This ID is tracked but has NO motion this frame. Inject as ghost.
+                MotionObject ghost;
+                ghost.id = id;
+                ghost.blocks = kv.second;
+                ghost.strength = 0.0f;
+                ghost.acceleration = 0.0f;
+                
+                // Get position from Kalman or last seen?
+                if (pImpl->kalmanFilters.count(id)) {
+                    float kx, ky;
+                    pImpl->kalmanFilters.at(id).GetState(kx, ky);
+                    ghost.centerX = kx; ghost.centerY = ky;
+                } else {
+                    // Fallback to center of blocks
+                    float sumX = 0, sumY = 0;
+                    for (int blk : ghost.blocks) {
+                        sumX += (blk % grid_cols) + 0.5f;
+                        sumY += (blk / grid_cols) + 0.5f;
+                    }
+                    ghost.centerX = sumX / ghost.blocks.size();
+                    ghost.centerY = sumY / ghost.blocks.size();
+                }
+                pImpl->current_objects.push_back(ghost);
+            }
         }
 
         for (auto& obj : pImpl->current_objects) {
             obj.total_frame_pixel_count = global_fg_count; // Assign to object
+            
+            // Calculate local FG count for this object
+            obj.pixel_count = 0;
+            for (int blk : obj.blocks) {
+                if (blk >= 0 && blk < (int)block_fg_scores.size()) {
+                    obj.pixel_count += block_fg_scores[blk];
+                }
+            }
+            
+            // V17.1: Update Global Object trajectory history
+            auto& y_hist = pImpl->object_y_history_buffer[obj.id];
+            y_hist.push_back(obj.centerY);
+            if (y_hist.size() > 120) y_hist.pop_front();
+            
+            // V17.5: Update Global Safe Ratio history
+            auto& sr_hist = pImpl->object_safe_ratio_history_buffer[obj.id];
+            sr_hist.push_back(obj.safe_area_ratio);
+            if (sr_hist.size() > 120) sr_hist.pop_front();
+
             long long sum_brightness = 0;
             int count_pixels = 0;
             
@@ -3733,7 +3815,7 @@ StatusCode FallDetector::Detect(const Image& frame, bool& is_fall) {
 
     // === NEW: FG Count History Buffer for Trend Verification ===
     pImpl->fg_count_history_buffer.push_back(global_fg_count);
-    if (pImpl->fg_count_history_buffer.size() > 100) pImpl->fg_count_history_buffer.pop_front();
+    if (pImpl->fg_count_history_buffer.size() > 120) pImpl->fg_count_history_buffer.pop_front();
 
     // Process existing pending falls (update with new FG data)
     for (auto& pf : pImpl->pending_falls) {
@@ -3826,27 +3908,66 @@ StatusCode FallDetector::Detect(const Image& frame, bool& is_fall) {
             }
             float up_cons = (tot_ops > 0) ? (float)up_ops/tot_ops : 0.0f;
 
-            // V12 Logic: Trust Clean Trigger
+            // Dynamic Thresholds need sf_verified_max_str properly populated.
+            // (Already done in Detect)
             float max_str = pf.sf_verified_max_str; // Use Trigger MaxStr
+
+            // V16.4 Calculation: Robust Vertical Displacement (max - min in trajectory)
+            float min_y = 9999.0f, max_y = -9999.0f;
+            for (float y : pf.dy_history) {
+                if (y < min_y) min_y = y;
+                if (y > max_y) max_y = y;
+            }
+            float abs_y_delta = (max_y > min_y) ? (max_y - min_y) : 0.0f;
+
+            // V17.0 Logic: Precision Balancing & displacement thresholds (Relaxed for V17)
+            bool high_mom = (max_str >= 10.0f);
+            bool clean_trig = (pf.sf_verified_dir_var < 0.40f);
+            bool consistent_dir = (pf.sf_verified_dir_var < 0.60f);
             
-            // Trusted Momentum Logic (V12.1)
-            // Original V12 used MaxStr > 8.0.
-            // FN Analysis (Data 1): Missed falls have MaxStr ~6.7.
-            // Tuning: Lower Threshold to 5.5 to catch these.
-            // Safety: We rely on UpCons/DirVar/Ratio constraints to block Data 4 (Noise).
-            bool high_mom = (max_str > 5.5f);
-            bool clean_trig = (pf.sf_verified_up_cons <= 0.35f);
-            bool consistent_dir = (pf.sf_verified_dir_var < 3.0f);
+            // Tier 3: Require Messiness (DirVar > 0.6)
+            bool chaotic_crash = (max_str > 9.0f && pf.sf_verified_dir_var > 0.6f);
 
-            // Upward Check (V12):
-            // Allow high momentum to override UpCons check IF:
-            // 1. Trigger was Clean (UpCons <= 0.35) -> Classic V12
-            // 2. OR Direction was Consistent (DirVar < 3.0) -> Targets Side Falls (Data 1) vs Noise (Data 4)
-            bool trusted_momentum = (high_mom && (clean_trig || consistent_dir));
+            // V17.4 Directional Leniency for Significant Movement
+            float up_cons_limit = (abs_y_delta > 60.0f) ? 0.90f : ((abs_y_delta > 30.0f) ? 0.80f : 0.65f); 
 
-            // V12.1 Fix: Allow ANY UpCons (up to 1.0) if Trusted Momentum. 
-            // Data 1 Side Fall has UpCons=1.00 (Pure Upward/Away).
-            bool not_upward = (up_cons <= 0.30f) || trusted_momentum; 
+            // V17.4 Context-Aware Displacement Logic (Floor requires Drop, Bed requires Sensitivity)
+            // V17.5: Use Historical Bed Status (Was on bed recently?)
+            bool was_on_bed = (pf.historical_bed_max > 0.4f);
+            float context_min_disp = was_on_bed ? 8.0f : 15.0f;
+
+            // V17.4 Tiered Directional Gates
+            bool tier1_clean_fast = (high_mom && clean_trig && up_cons <= 0.85f && abs_y_delta > context_min_disp); 
+            bool tier2_standard = (consistent_dir && up_cons <= up_cons_limit && abs_y_delta > context_min_disp);
+            bool tier3_crash = (chaotic_crash && up_cons <= 0.75f && abs_y_delta > context_min_disp);
+            
+            // V17.6 Tier 4: Weak Messy Fall (Context-Aware: Bed Falls Only)
+            // Relax DirVar to 0.35 if was_on_bed (Bed falls can be cleaner/softer)
+            bool tier4_weak_messy = (max_str < 9.0f && max_str > 3.0f && abs_y_delta > 9.0f && up_cons < 0.6f && was_on_bed);
+            if (tier4_weak_messy) {
+                 // Context-Dependent DirVar
+                 if (pf.sf_verified_dir_var <= 0.35f) tier4_weak_messy = false;
+            }
+
+            // V17.3 Stationarity Rescue (Tightened lower bound to avoid micro-movement noise)
+            bool collapse_rescue = (abs_y_delta > 6.0f && abs_y_delta < 20.0f && decline_ratio < 0.80f);
+
+            bool direction_verified = (tier1_clean_fast || tier2_standard || tier3_crash || tier4_weak_messy || collapse_rescue);
+            
+            // V17.4 Safety Guards
+            bool noise_guard_reject = (abs_y_delta < 8.0f && decline_ratio > 1.25f); 
+            bool walk_guard_reject = (decline_ratio < 0.8f && pf.sf_verified_dir_var < 0.35f && max_str < 7.0f);
+            
+            // V17.2 Bed Guard: Reject falls that stay ON THE BED (Safe Ratio > 0.6)
+            // Relaxes override to 9.0 to save Data 1/2/3
+            // V17.5: Use current safe ratio for Bed Guard (End state)
+            bool bed_guard_reject = (pf.pd_trigger_safe_ratio > 0.6f && abs_y_delta < 9.0f);
+
+            if (noise_guard_reject || walk_guard_reject || bed_guard_reject) {
+                direction_verified = false; 
+            }
+            
+            bool not_upward = direction_verified; 
 
 
             if (pf.is_high_landing) {
@@ -3880,65 +4001,46 @@ StatusCode FallDetector::Detect(const Image& frame, bool& is_fall) {
                 bool has_drop = (decline_ratio < 0.90f);
 
                 // High Landing Logic (Similar protection for Clean Triggers/Side Falls)
-                // V12.1 Fix 4: Enforce UpCons <= 0.65 if relying on Trusted Momentum
-                if (is_significant && is_stationary && has_drop && not_upward) {
-                     // Check if 'not_upward' was satisfied via Trusted Momentum High UpCons?
-                     // If up_cons > 0.30 (Standard) but accepted via Trusted Momentum, we MUST enforce the 0.65 cap here too.
-                     // And DirVar > 0.2 constraint.
-                     bool up_ok = (up_cons <= 0.30f) || (trusted_momentum && up_cons <= 0.65f && pf.sf_verified_dir_var > 0.2f);
-                     
-                     if (up_ok) {
+                // V14: Uses consolidated direction_verified
+                if (is_significant && is_stationary && has_drop && direction_verified) {
                         confirmed_fall = true;
-                        printf("[FG Verify] ACCEPTED (High Landing): ID %d, Size=%d, Ratio=%.2f, UpCons=%.2f, MaxStr=%.2f, DirVar=%.2f\n", 
-                               pf.object_id, obj_size, decline_ratio, up_cons, max_str, pf.sf_verified_dir_var);
-                     } else {
-                         pf.rejected = true;
-                         // ... logic continues ...
-                     }
+                        printf("[FG Verify] ACCEPTED (High Landing V17.0): ID %d, Size=%d, Ratio=%.2f, UpCons=%.2f, MaxStr=%.2f, DirVar=%.2f, YDelta=%.1f, Rescue=%d\n", 
+                               pf.object_id, obj_size, decline_ratio, up_cons, max_str, pf.sf_verified_dir_var, abs_y_delta, (int)collapse_rescue);
                 } else {
                     pf.rejected = true;
-                    if (!is_significant)
+                    if (noise_guard_reject)
+                        printf("[FG Verify] REJECTED (V17.0 Noise-Guard): ID %d, YDelta=%.1f, Ratio=%.2f\n", pf.object_id, abs_y_delta, decline_ratio);
+                    else if (walk_guard_reject)
+                         printf("[FG Verify] REJECTED (V17.0 Walk-Guard): ID %d, Ratio=%.2f, DirVar=%.2f\n", pf.object_id, decline_ratio, pf.sf_verified_dir_var);
+                    else if (!direction_verified)
+                        printf("[FG Verify] REJECTED (High Landing - Direction/Disp): ID %d, UpCons=%.2f MaxStr=%.2f, YDelta=%.1f\n", pf.object_id, up_cons, max_str, abs_y_delta);
+                    else if (!is_significant)
                         printf("[FG Verify] REJECTED (High Landing - Small): ID %d, size=%d\n", pf.object_id, obj_size);
                     else if (!has_drop)
                         printf("[FG Verify] REJECTED (High Landing - No Drop): ID %d, ratio=%.2f\n", pf.object_id, decline_ratio);
                     else if (!is_stationary)
                         printf("[FG Verify] REJECTED (High Landing - Moving): ID %d, str=%.1f\n", pf.object_id, recent_strength_avg);
-                    if (pf.rejected) {
-                        if (!is_significant)
-                            printf("[FG Verify] REJECTED (High Landing - Small): ID %d, size=%d\n", pf.object_id, obj_size);
-                        else if (!has_drop)
-                            printf("[FG Verify] REJECTED (High Landing - No Drop): ID %d, ratio=%.2f\n", pf.object_id, decline_ratio);
-                        else if (!is_stationary)
-                            printf("[FG Verify] REJECTED (High Landing - Moving): ID %d, str=%.1f\n", pf.object_id, recent_strength_avg);
-                        
-                        if (!not_upward)
-                             printf("[FG Verify] REJECTED (High Landing - Upward): ID %d, UpCons=%.2f MaxStr=%.2f\n", pf.object_id, up_cons, max_str);
-                    }
                 }
             } else {
                 // Normal Landing (On Floor / Bottom Half)
-                // Relaxed verification for Trusted Momentum (Clean Triggers OR Consistent Dir)
-                // V12.1 Fix 2: Data 1 Side Falls show FG Growth (ratio ~1.26). Relax to 1.50 (Growth).
-                // Normal Landing (On Floor / Bottom Half)
-                // Relaxed verification for Trusted Momentum (Clean Triggers OR Consistent Dir)
-                // V12.1 Fix 2: Data 1 Side Falls show FG Growth (ratio ~1.26). Relax to 1.50 (Growth).
-                // V12.1 Fix 3: Sits/Noise have Ratio ~0.92 (Shrink). Exclude them by requiring > 1.0.
-                // Normal Landing (On Floor / Bottom Half)
-                // Relaxed verification for Trusted Momentum (Clean Triggers OR Consistent Dir)
-                // V12.1 Fix 2: Data 1 Side Falls show FG Growth (ratio ~1.26). Relax to 1.50 (Growth).
-                // V12.1 Fix 3: Sits/Noise have Ratio ~0.92 (Shrink). Exclude them by requiring > 1.0.
-                // V12.1 Fix 4: Sits/StandUps have High UpCons (>0.8). Filter with UpCons <= 0.65 (Side Fall TP is 0.45).
-                // V12.1 Fix 5: Pure Sits are Vertical (DirVar~0). Enforce DirVar > 0.2 for Trusted Momentum. (Side Fall TP is 0.71).
-                if ((decline_ratio < 0.80f || composite_confirmed || (trusted_momentum && up_cons <= 0.65f && pf.sf_verified_dir_var > 0.2f && decline_ratio > 1.0f && decline_ratio < 1.50f)) && not_upward) {
+                // V17.6 Optimized Logic (Hard Constraints + Safety Guards)
+                // Trust T4 (Weak Messy) to bypass Ratio gap (0.8-1.0)
+                if (direction_verified && (decline_ratio < 0.80f || composite_confirmed || tier4_weak_messy || (max_str >= 5.5f && pf.sf_verified_dir_var > 0.2f && decline_ratio > 1.0f && decline_ratio < 1.50f))) {
                     confirmed_fall = true;
-                     printf("[FG Verify] ACCEPTED (Normal): ID %d, Ratio=%.2f, UpCons=%.2f, MaxStr=%.2f, DirVar=%.2f, Trusted=%d\n", 
-                           pf.object_id, decline_ratio, up_cons, max_str, pf.sf_verified_dir_var, (int)trusted_momentum);
+                    printf("[FG Verify] ACCEPTED (V17.6): ID %d, Ratio=%.2f, UpCons=%.2f, MaxStr=%.2f, DirVar=%.2f, YDelta=%.1f, BedSafe=%.2f, HistBed=%.2f, Rescue=%d\n", 
+                           pf.object_id, decline_ratio, up_cons, max_str, pf.sf_verified_dir_var, abs_y_delta, pf.pd_trigger_safe_ratio, pf.historical_bed_max, (int)collapse_rescue);
                 } else {
                     pf.rejected = true;
-                    if (!not_upward)
-                        printf("[FG Verify] REJECTED (Normal - Upward): ID %d, UpCons=%.2f MaxStr=%.2f\n", pf.object_id, up_cons, max_str);
+                    if (noise_guard_reject)
+                         printf("[FG Verify] REJECTED (V17.6 Noise-Guard): ID %d, YDelta=%.1f, Ratio=%.2f\n", pf.object_id, abs_y_delta, decline_ratio);
+                    else if (walk_guard_reject)
+                         printf("[FG Verify] REJECTED (V17.6 Walk-Guard): ID %d, Ratio=%.2f, DirVar=%.2f\n", pf.object_id, decline_ratio, pf.sf_verified_dir_var);
+                    else if (bed_guard_reject)
+                         printf("[FG Verify] REJECTED (V17.6 Bed-Guard): ID %d, BedSafe=%.2f, YDelta=%.1f\n", pf.object_id, pf.pd_trigger_safe_ratio, abs_y_delta);
+                    else if (!direction_verified)
+                        printf("[FG Verify] REJECTED (Normal - Direction/Disp): ID %d, UpCons=%.2f MaxStr=%.2f DirVar=%.2f, YDelta=%.1f\n", pf.object_id, up_cons, max_str, pf.sf_verified_dir_var, abs_y_delta);
                     else
-                        printf("[FG Verify] REJECTED: ID %d, ratio=%.2f\n", pf.object_id, decline_ratio);
+                        printf("[FG Verify] REJECTED (Normal - Ratio): ID %d, ratio=%.2f\n", pf.object_id, decline_ratio);
                 }
             }
             
@@ -4199,6 +4301,22 @@ StatusCode FallDetector::Detect(const Image& frame, bool& is_fall) {
                                   trig_dir_var = pObj->direction_variance;
                              }
                              pf.sf_verified_dir_var = trig_dir_var;
+                             
+                             if (pObj) {
+                                 pf.pd_trigger_safe_ratio = pObj->safe_area_ratio;
+                             }
+
+                             // V17.5: Calculate Historical Best Safe Ratio (Was on bed?)
+                             // Use pImpl->object_safe_ratio_history_buffer[pid]
+                             float max_bed_presence = 0.0f;
+                             if (pImpl->object_safe_ratio_history_buffer.count(pid)) {
+                                 const auto& s_hist = pImpl->object_safe_ratio_history_buffer[pid];
+                                 int s_start = std::max(0, (int)s_hist.size() - pImpl->LOOKBACK_FRAMES);
+                                 for (size_t k = s_start; k < s_hist.size(); ++k) {
+                                     if(s_hist[k] > max_bed_presence) max_bed_presence = s_hist[k];
+                                 }
+                             }
+                             pf.historical_bed_max = max_bed_presence;
 
 
                              
@@ -4206,6 +4324,16 @@ StatusCode FallDetector::Detect(const Image& frame, bool& is_fall) {
                              int start_idx = std::max(0, (int)pImpl->fg_count_history_buffer.size() - pImpl->LOOKBACK_FRAMES);
                              for (size_t i = start_idx; i < pImpl->fg_count_history_buffer.size(); i++) {
                                  pf.fg_history.push_back(pImpl->fg_count_history_buffer[i]);
+                             }
+
+                             // V16.1: Copy lookback Y history (trajectory before trigger)
+                             auto it_y = pImpl->object_y_history_buffer.find(pid);
+                             if (it_y != pImpl->object_y_history_buffer.end()) {
+                                 const auto& global_y_hist = it_y->second;
+                                 int y_start_idx = std::max(0, (int)global_y_hist.size() - pImpl->LOOKBACK_FRAMES);
+                                 for (size_t i = y_start_idx; i < (int)global_y_hist.size(); i++) {
+                                     pf.dy_history.push_back(global_y_hist[i]);
+                                 }
                              }
                              
                              pImpl->pending_falls.push_back(pf);

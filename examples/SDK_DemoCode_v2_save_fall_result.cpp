@@ -12,6 +12,7 @@
 #include <cmath>
 #include <deque>
 #include <map>
+#include <sstream>
 
 #define STB_IMAGE_WRITE_IMPLEMENTATION
 #include "stb_image_write.h"
@@ -353,13 +354,15 @@ std::vector<std::pair<int, int>> loadGroundTruth(const std::string& filename) {
 
     std::string line;
     while (std::getline(file, line)) {
-        size_t comma = line.find(',');
-        if (comma != std::string::npos) {
-            try {
-                int start = std::stoi(line.substr(0, comma));
-                int end = std::stoi(line.substr(comma + 1));
-                intervals.push_back({start, end});
-            } catch (...) {}
+        if (line.empty()) continue;
+        // Remove trailing comma if present
+        if (line.back() == ',') line.pop_back(); 
+        
+        std::replace(line.begin(), line.end(), ',', ' ');
+        std::stringstream ss(line);
+        int start, end;
+        if (ss >> start >> end) {
+            intervals.push_back({start, end});
         }
     }
     file.close();
@@ -1382,10 +1385,12 @@ int orgH = 1080;
     int tp = 0;
     int fp = 0;
     int fn = 0;
+    std::vector<std::pair<int, int>> gt_intervals;
+    std::vector<bool> gt_found;
     
     if (!gtFile.empty()) {
-        std::vector<std::pair<int, int>> gt_intervals = loadGroundTruth(gtFile);
-        std::vector<bool> gt_found(gt_intervals.size(), false);
+        gt_intervals = loadGroundTruth(gtFile);
+        gt_found.resize(gt_intervals.size(), false);
         
         // Check Detects vs GT
         int tolerance = 30; // +/- 30 frames (1 sec) tolerance
@@ -1403,15 +1408,16 @@ int orgH = 1080;
                 if (overlap_start <= overlap_end) {
                     matched = true;
                     gt_found[k] = true;
+                    // Note: Do NOT increment TP here to avoid double counting multiple detections for one GT.
                 }
             }
-            if(matched) tp++;
-            else fp++;
+            if(!matched) fp++; // If this detection matched NO GT, it's a False Positive.
         }
         
-        // Count FN
+        // Count TP (Unique GTs found) and FN (GTs missed)
         for(bool f : gt_found) {
-            if(!f) fn++;
+            if(f) tp++;
+            else fn++;
         }
         
     } else {
@@ -1428,12 +1434,22 @@ int orgH = 1080;
 
     // Save Verification Report
     std::string f_ver_name = save_dir + "/verification_report.txt";
-    std::ofstream f_ver(f_ver_name);
-    if(f_ver.is_open()) {
-         f_ver << "TP=" << tp << "\n";
-         f_ver << "FP=" << fp << "\n";
-         f_ver << "FN=" << fn << "\n";
-         f_ver.close();
+    std::ofstream report(f_ver_name);
+    if(report.is_open()) {
+        report << "TP=" << tp << "\n";
+        report << "FP=" << fp << "\n";
+        report << "FN=" << fn << "\n";
+        
+        report << "--- Debug Info ---\n";
+        std::cout << "--- GT Verification Debug ---\n";
+        report << "Loaded " << gt_intervals.size() << " GT Intervals:\n";
+        std::cout << "Loaded " << gt_intervals.size() << " GT Intervals:\n";
+        for(size_t k=0; k<gt_intervals.size(); ++k) {
+            std::string status = (gt_found[k] ? " (FOUND)" : " (MISSED)");
+            report << "  [" << k << "] " << gt_intervals[k].first << "-" << gt_intervals[k].second << status << "\n";
+            std::cout << "  [" << k << "] " << gt_intervals[k].first << "-" << gt_intervals[k].second << status << "\n";
+        }
+        report.close();
     }
     
     // NEW: Save Count File (User Request)
