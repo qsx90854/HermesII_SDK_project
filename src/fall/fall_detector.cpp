@@ -1721,6 +1721,7 @@ public:
         std::vector<float> strength_history;
         float sf_verified_max_str = 0.0f; // V11/V12 Recall Check: Store Trigger MaxStr to survive verification history resets
         float sf_verified_up_cons = 0.0f; // V11/V12 Recall Check: Store Trigger UpCons to handle post-fall bounces
+        float sf_verified_dir_var = 999.0f; // V12 Tuning: Store Trigger Direction Variance (Consistency)
 
     };
     std::vector<PendingFall> pending_falls;
@@ -3828,13 +3829,24 @@ StatusCode FallDetector::Detect(const Image& frame, bool& is_fall) {
             // V12 Logic: Trust Clean Trigger
             float max_str = pf.sf_verified_max_str; // Use Trigger MaxStr
             
-            bool high_mom = (max_str > 8.0f);
+            // Trusted Momentum Logic (V12.1)
+            // Original V12 used MaxStr > 8.0.
+            // FN Analysis (Data 1): Missed falls have MaxStr ~6.7.
+            // Tuning: Lower Threshold to 5.5 to catch these.
+            // Safety: We rely on UpCons/DirVar/Ratio constraints to block Data 4 (Noise).
+            bool high_mom = (max_str > 5.5f);
             bool clean_trig = (pf.sf_verified_up_cons <= 0.35f);
+            bool consistent_dir = (pf.sf_verified_dir_var < 3.0f);
 
             // Upward Check (V12):
-            // Allow high momentum to override UpCons check IF Trigger was Clean OR UpCons is reasonable (<= 0.60)
-            // This allows Data 3 (UpCons ~0.50) while blocking Data 1 (UpCons 0.90+)
-            bool not_upward = (up_cons <= 0.30f) || (high_mom && (up_cons <= 0.60f || clean_trig)); 
+            // Allow high momentum to override UpCons check IF:
+            // 1. Trigger was Clean (UpCons <= 0.35) -> Classic V12
+            // 2. OR Direction was Consistent (DirVar < 3.0) -> Targets Side Falls (Data 1) vs Noise (Data 4)
+            bool trusted_momentum = (high_mom && (clean_trig || consistent_dir));
+
+            // V12.1 Fix: Allow ANY UpCons (up to 1.0) if Trusted Momentum. 
+            // Data 1 Side Fall has UpCons=1.00 (Pure Upward/Away).
+            bool not_upward = (up_cons <= 0.30f) || trusted_momentum; 
 
 
             if (pf.is_high_landing) {
@@ -3867,8 +3879,22 @@ StatusCode FallDetector::Detect(const Image& frame, bool& is_fall) {
                 bool is_stationary = (recent_strength_avg < 10.0f); 
                 bool has_drop = (decline_ratio < 0.90f);
 
+                // High Landing Logic (Similar protection for Clean Triggers/Side Falls)
+                // V12.1 Fix 4: Enforce UpCons <= 0.65 if relying on Trusted Momentum
                 if (is_significant && is_stationary && has_drop && not_upward) {
-                    confirmed_fall = true;
+                     // Check if 'not_upward' was satisfied via Trusted Momentum High UpCons?
+                     // If up_cons > 0.30 (Standard) but accepted via Trusted Momentum, we MUST enforce the 0.65 cap here too.
+                     // And DirVar > 0.2 constraint.
+                     bool up_ok = (up_cons <= 0.30f) || (trusted_momentum && up_cons <= 0.65f && pf.sf_verified_dir_var > 0.2f);
+                     
+                     if (up_ok) {
+                        confirmed_fall = true;
+                        printf("[FG Verify] ACCEPTED (High Landing): ID %d, Size=%d, Ratio=%.2f, UpCons=%.2f, MaxStr=%.2f, DirVar=%.2f\n", 
+                               pf.object_id, obj_size, decline_ratio, up_cons, max_str, pf.sf_verified_dir_var);
+                     } else {
+                         pf.rejected = true;
+                         // ... logic continues ...
+                     }
                 } else {
                     pf.rejected = true;
                     if (!is_significant)
@@ -3890,10 +3916,23 @@ StatusCode FallDetector::Detect(const Image& frame, bool& is_fall) {
                     }
                 }
             } else {
-                // NORMAL LANDING (On Floor / Bottom Half)
-                // Relaxed verification for Clean Triggers (Data 6)
-                if ((decline_ratio < 0.80f || composite_confirmed || (high_mom && clean_trig && decline_ratio < 1.15f)) && not_upward) {
+                // Normal Landing (On Floor / Bottom Half)
+                // Relaxed verification for Trusted Momentum (Clean Triggers OR Consistent Dir)
+                // V12.1 Fix 2: Data 1 Side Falls show FG Growth (ratio ~1.26). Relax to 1.50 (Growth).
+                // Normal Landing (On Floor / Bottom Half)
+                // Relaxed verification for Trusted Momentum (Clean Triggers OR Consistent Dir)
+                // V12.1 Fix 2: Data 1 Side Falls show FG Growth (ratio ~1.26). Relax to 1.50 (Growth).
+                // V12.1 Fix 3: Sits/Noise have Ratio ~0.92 (Shrink). Exclude them by requiring > 1.0.
+                // Normal Landing (On Floor / Bottom Half)
+                // Relaxed verification for Trusted Momentum (Clean Triggers OR Consistent Dir)
+                // V12.1 Fix 2: Data 1 Side Falls show FG Growth (ratio ~1.26). Relax to 1.50 (Growth).
+                // V12.1 Fix 3: Sits/Noise have Ratio ~0.92 (Shrink). Exclude them by requiring > 1.0.
+                // V12.1 Fix 4: Sits/StandUps have High UpCons (>0.8). Filter with UpCons <= 0.65 (Side Fall TP is 0.45).
+                // V12.1 Fix 5: Pure Sits are Vertical (DirVar~0). Enforce DirVar > 0.2 for Trusted Momentum. (Side Fall TP is 0.71).
+                if ((decline_ratio < 0.80f || composite_confirmed || (trusted_momentum && up_cons <= 0.65f && pf.sf_verified_dir_var > 0.2f && decline_ratio > 1.0f && decline_ratio < 1.50f)) && not_upward) {
                     confirmed_fall = true;
+                     printf("[FG Verify] ACCEPTED (Normal): ID %d, Ratio=%.2f, UpCons=%.2f, MaxStr=%.2f, DirVar=%.2f, Trusted=%d\n", 
+                           pf.object_id, decline_ratio, up_cons, max_str, pf.sf_verified_dir_var, (int)trusted_momentum);
                 } else {
                     pf.rejected = true;
                     if (!not_upward)
@@ -4150,6 +4189,16 @@ StatusCode FallDetector::Detect(const Image& frame, bool& is_fall) {
                              }
                              pf.sf_verified_max_str = trig_max_str;
                              pf.sf_verified_up_cons = (trig_tot_ops > 0) ? (float)trig_up_ops / trig_tot_ops : 0.0f;
+                             
+                             // Capture Direction Variance from Current Object
+                             float trig_dir_var = 999.0f;
+                             // We have 'pObj' from line 3964/3967 in scope effectively? 
+                             // Wait, Detect loop finds pObj per 'triggered_objects'.
+                             // Yes, 'pObj' pointer is valid here.
+                             if (pObj) {
+                                  trig_dir_var = pObj->direction_variance;
+                             }
+                             pf.sf_verified_dir_var = trig_dir_var;
 
 
                              
