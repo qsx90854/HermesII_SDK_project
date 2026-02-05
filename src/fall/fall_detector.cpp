@@ -1010,7 +1010,7 @@ std::vector<MotionObject> extractMotionObjects(
                     }
                 } else {
                     obj.magnitude_variance = 0.0f;
-                    obj.direction_variance = 0.0f;
+                    obj.direction_variance = 0.0f; // Lower Analysis threshold to 0.0
                 }
 
                 obj.safe_area_ratio = 0.0f; // Calculated later
@@ -2695,6 +2695,11 @@ StatusCode FallDetector::Detect(const Image& frame, bool& is_fall) {
         }
     }
     pImpl->last_timestamp = frame.timestamp;
+    
+    // V18 Fix: Declare variables at function scope (V17 Logic that declared them is disabled)
+    std::string warningMsg = "";
+    std::vector<int> triggered_objects;
+
 
     int W = frame.width;
     int H = frame.height;
@@ -2969,9 +2974,56 @@ StatusCode FallDetector::Detect(const Image& frame, bool& is_fall) {
                                                   pImpl->config.object_merge_radius);
                                                   
     // TRACKING
-    // TRACKING
-    TrackObjects(pImpl->current_objects, pImpl->previous_objects, pImpl->config, pImpl->kalmanFilters, pImpl->track_ttl, pImpl->global_id_counter,
-                 pImpl->object_first_seen_frame, pImpl->object_is_new_entry, pImpl->persistent_object_blocks, pImpl->frame_idx);
+    TrackObjects(pImpl->current_objects, 
+                 pImpl->previous_objects, 
+                 pImpl->config, 
+                 pImpl->kalmanFilters, 
+                 pImpl->track_ttl, 
+                 pImpl->global_id_counter,
+                 pImpl->object_first_seen_frame, 
+                 pImpl->object_is_new_entry, 
+                 pImpl->persistent_object_blocks, 
+                 (int)pImpl->frame_idx);
+    
+    // INJECT LOST TRACKS (Coasting)
+    // Ensures trend analysis sees valid data even if motion stops (High -> Low)
+    std::set<int> current_ids;
+    for(const auto& o : pImpl->current_objects) current_ids.insert(o.id);
+    
+    for(const auto& kv : pImpl->kalmanFilters) {
+        int id = kv.first;
+        if(current_ids.find(id) == current_ids.end()) {
+             // Lost Track - Inject Predicted
+             MotionObject predObj;
+             predObj.id = id;
+             float kx = 0, ky = 0;
+             // Use const cast if GetState is non-const (it shouldn't be but safety first)
+             // kv.second is a reference to value in map.
+             auto& kf = kv.second; // copy or ref
+             // kf.GetState(kx, ky); // GetState is void(float&, float&)
+             kx = kf.x[0]; // Direct access as seen in TrackObjects
+             ky = kf.x[1];
+             float kvx = kf.x[2];
+             float kvy = kf.x[3];
+             
+             predObj.centerX = kx;
+             predObj.centerY = ky;
+             predObj.avgDx = kvx;
+             predObj.avgDy = kvy;
+             predObj.strength = std::sqrt(kvx*kvx + kvy*kvy);
+             
+             // Restore Blocks
+             if(pImpl->persistent_object_blocks.count(id)) {
+                 predObj.blocks = pImpl->persistent_object_blocks[id];
+             }
+             
+             // Only inject if it has blocks (history)
+             if (!predObj.blocks.empty()) {
+                  pImpl->current_objects.push_back(predObj);
+                  printf("[FallDetector] Injected Coasting Object %d (Str: %.2f, Blocks: %zu)\n", id, predObj.strength, predObj.blocks.size());
+             }
+        }
+    }
     
     // 2.1 Update Safe Area Ratio
     if (pImpl->hasBedMask) {
@@ -3393,396 +3445,236 @@ StatusCode FallDetector::Detect(const Image& frame, bool& is_fall) {
     int detected_id = -1;
     std::vector<int> slow_fall_ids; // NEW: Track slow falls
     
-    if (!pImpl->current_objects.empty() && !pImpl->previous_objects.empty()) {
-        int bSize = pImpl->config.block_size;
-        for (auto& curr : pImpl->current_objects) {
-            printf("[Debug] Obj %d Strength %.2f Center (%.1f, %.1f) Size %zu\n", curr.id, curr.strength, curr.centerX, curr.centerY, curr.blocks.size());
-            // Find prev by ID matching (since we just tracked)
-            MotionObject* prev = nullptr;
-            for (auto& p : pImpl->previous_objects) { if (p.id == curr.id) { prev = &p; break; } }
-            
-            if (prev) {
-                float dy_grid = curr.centerY - prev->centerY;
-                float dy_pix = dy_grid * bSize;
-                // Filter small jitter (was > 0)
-                if (dy_pix > 0.5f) { // Lowered to 0.5f to catch slow slides
-                    pImpl->object_accumulated_descent[curr.id] += dy_pix;
-                } else if (dy_pix < -10.0f) { // Relaxed Reset (was -5)
-                    pImpl->object_accumulated_descent[curr.id] = 0.0f;
-                }
-                float acc = pImpl->object_accumulated_descent[curr.id];
-                
-                // Threshold: 50 pixels (Relaxed from 100 for Top-Down/Short slides)
-                if (acc > 50.0f) {
-                     // TRACE slow fall entry
-                     printf("[TRACE] Slow Fall Check: ID %d acc=%.1f, entering floor check...\n", curr.id, acc);
-                     // Calculate Bottom Y (max_r)
-                     int max_r = 0;
-                     int cols = pImpl->config.grid_cols;
-                     for(int blk : curr.blocks) {
-                         int r = blk / cols;
-                         if(r > max_r) max_r = r;
-                     }
-                     float bottom_pixel_y = (max_r + 1) * bSize;
-                     
-                     float floor_thresh = H * 0.48f; // Tuned for Dataset 1 Slide vs Sit (Sit lands ~0.46H, Fall > 0.5H)
-                     
-                     // DEBUG: Trace floor threshold check
-                     printf("[TRACE] ID %d bottom_pixel_y=%.1f floor_thresh=%.1f Pass=%d\n", 
-                            curr.id, bottom_pixel_y, floor_thresh, (int)(bottom_pixel_y >= floor_thresh));
-
-                     // High Position Fall Patch: For small objects with high accumulated descent,
-                     // allow detection even if bottom is above floor_thresh (Walking Fall towards camera)
-                     // TUNED: Speed < 4.0 (was 5.5) to exclude fast noise (Data 4 Dy ~6.5)
-                     bool is_small_valid_fall = (curr.blocks.size() >= 5 && std::abs(curr.avgDy) < 4.0f && curr.direction_variance < 0.8f);
-                     bool high_position_fall_ok = (acc > 80.0f && is_small_valid_fall);
-
-                     if (bottom_pixel_y >= floor_thresh || high_position_fall_ok) {
-                         // Refined Bed Check: Use BOTTOM of object
-                         bool bottom_outside_bed = true; // Default to outside (unsafe)
-
-                         if (pImpl->hasBedMask && pImpl->bedMask.width() == W && pImpl->bedMask.height() == H) {
-                              const unsigned char* mData = pImpl->bedMask.getData();
-                              
-                              int cx = (int)(curr.centerX * bSize);
-                              int cy_bottom = (int)bottom_pixel_y - 1; 
-
-                              if(cx < 0) cx = 0; if(cx >= W) cx = W-1;
-                              if(cy_bottom < 0) cy_bottom = 0; if(cy_bottom >= H) cy_bottom = H-1;
-                              
-                              // If Bottom Point is INSIDE Bed (0), then still fully on bed -> Safe.
-
-                              if(cx < 0) cx = 0; if(cx >= W) cx = W-1;
-                              if(cy_bottom < 0) cy_bottom = 0; if(cy_bottom >= H) cy_bottom = H-1;
-                              
-                              if (mData[cy_bottom * W + cx] == 0) {
-                                  bottom_outside_bed = false;
-                              }
-                         }
-                         
-                         // Trigger only if Bottom is OUTSIDE bed (or no bed mask)
-                         // FINAL TUNE: Add Size Filter to reject Noise (Data 4) and Sits (Data 1)
-                         // PATCH: Allow Small Objects (Data 6/7 Walking Fall) IF they are SLOW and CONSISTENT
-                         // Data 4 Noise: Dy ~6.7, DirVar ~0.3-1.2. Data 6/7: Dy ~2-4, DirVar ~0.4.
-                         // PATCH: Allow Small Objects (Data 6/7 Walking Fall, Data 2 Bed Roll) IF they are SLOW and CONSISTENT
-                         // Data 4 Noise: Dy ~6.7, DirVar ~0.3-1.2. Data 2 Bed Roll: Dy ~2.2, DirVar ~0.3-0.8, Size ~8-15.
-                                                  // Calc UpCons and MaxStr for Slow Fall (Reject Sits, Allow Walking Falls)
-                          float sf_up_cons = 0.0f;
-                          float sf_max_str = 0.0f;
-                          if (!pImpl->object_history.empty()) {
-                              int u = 0, t = 0;
-                              // Iterate historyframes (Limit lookup to last 30 frames to be safe/fast?)
-                              size_t start_h = (pImpl->object_history.size() > 30) ? (pImpl->object_history.size() - 30) : 0;
-                              for (size_t i = start_h; i < pImpl->object_history.size(); ++i) {
-                                  for (const auto& o : pImpl->object_history[i]) {
-                                      if (o.id == curr.id) {
-                                          if (o.avgDy < -0.5f) u++;
-                                          float s = std::hypot(o.avgDx, o.avgDy);
-                                          if (s > sf_max_str) sf_max_str = s;
-                                          t++;
-                                          break; // Found in this frame
-                                      }
-                                  }
-                              }
-                              if(t > 0) sf_up_cons = (float)u / t;
-                          }
-
-                         bool is_huge_obj = (curr.blocks.size() > 20); // Trust large objects
-                         
-                         // V11 Fix: Enforce UpCons/MaxStr Check on ALL filter paths
-                         // Data 1 (Sits): UpCons ~1.0, MaxStr ~3.0 -> REJECT
-                         // Data 7 (Walking Fall): UpCons ~0.5, MaxStr > 8.0 -> ACCEPT
-                         bool protection_ok = (sf_up_cons <= 0.35f || sf_max_str > 8.0f);
-
-                         bool is_valid_slow = (curr.blocks.size() > 8 && std::abs(curr.avgDy) < 4.0f && curr.direction_variance < 1.0f && protection_ok);
-                         bool is_large_obj = (is_huge_obj || is_valid_slow);
-
-                         bool is_small_valid_fall = (curr.blocks.size() >= 5 && std::abs(curr.avgDy) < 4.0f && curr.direction_variance < 0.8f && protection_ok);
-
-                         // FIX: Allow Small Valid Falls even INSIDE Bed (Data 6 Walking Fall onto bed)
-                         // But Large Objects must be OUTSIDE bed (Avoid Sits/Sleep)
-                         bool location_ok = (is_large_obj && bottom_outside_bed) || (is_small_valid_fall); // Small valid ignores bed mask
-                         
-                         if(location_ok) {
-                             printf("[V11 TRIG] ID=%d Size=%d outside=%d up_cons=%.2f max_str=%.2f huge=%d small=%d\n", 
-                                    curr.id, (int)curr.blocks.size(), bottom_outside_bed, sf_up_cons, sf_max_str, is_huge_obj, is_small_valid_fall);
-                             
-                             // 4. Update Trigger State
-
-                             printf("[DEBUG CHECK] ID %d Size %zu Dy %.2f DirVar %.2f UpCons %.2f LocOK %d Outside %d SmallOk %d\n", 
-                                    curr.id, curr.blocks.size(), curr.avgDy, curr.direction_variance, sf_up_cons,
-                                    (int)location_ok, (int)bottom_outside_bed, (int)is_small_valid_fall);
-                         }
-
-                         if (location_ok) {
-                             printf("[DEBUG] Slow Fall Candidate ID %d. BottomY: %.1f, Thresh: %.1f, Size: %zu, Dy: %.2f, DirVar: %.2f\n", 
-                                    curr.id, bottom_pixel_y, floor_thresh, curr.blocks.size(), curr.avgDy, curr.direction_variance);
-                             // printf("[FallDetector] SLOW Fall Triggered (ID %d, AccDesc=%.1f, BottomY=%.1f)\n", curr.id, acc, bottom_pixel_y);
-                             slow_triggered++;
-                             detected_id = curr.id;
-                             slow_fall_ids.push_back(curr.id); // Track it
-                             pImpl->object_accumulated_descent[curr.id] = 0; 
-                         }
-                     }
-                }
-            } else {
-                pImpl->object_accumulated_descent[curr.id] = 0.0f;
-            }
-        }
-    }
-    
-    // Call Trend Logic
-    std::string warningMsg;
-    std::vector<int> triggered_objects;
-    // std::vector<int> slow_fall_ids; // Moved up
-    // Fix: Using safe local grid_cols and warningMsg
-    // --- LOGIC V2 Implementation ---
-    // 1. Global Safety Check
+    // --- NEW LOGIC: Direction-Based Detection (User Request) ---
+    // 1. Global Motion Safety Guard: Reject if > 1/4 screen is moving
     int total_grid_blocks = pImpl->config.grid_cols * pImpl->config.grid_rows;
     if (pImpl->active_blocks.size() > (size_t)(total_grid_blocks / 4)) {
-        // Safety 1-e/2-d: Too much motion (Global change > 1/4)
-        // printf("[FallDetector] Global Motion Safety Triggered. Active: %zu / %d\n", pImpl->active_blocks.size(), total_grid_blocks);
-        // return StatusCode::OK; // Or just skip detection
-        triggered_objects.clear(); // Ensure no triggers
-    } else {
-        // Proceed with Object Analysis
-        
-        // Helper to calc trend
-        auto hasDroppingTrend = [](const std::vector<float>& data, int m_frames, float thresh, float drop_ratio) -> bool {
-            if (data.size() < (size_t)m_frames) return false;
-            // Split into first half (High) and second half (Low) of the M window
-            int half = m_frames / 2;
-            float sum_high = 0, sum_low = 0;
-            for(int i=0; i<half; ++i) sum_high += data[i];
-            for(int i=half; i<m_frames; ++i) sum_low += data[i];
-            
-            float avg_high = sum_high / half;
-            float avg_low = sum_low / (m_frames - half);
-            
-            // Condition: High part > Threshold AND Drop significant
-            if (avg_high > thresh && avg_low < avg_high * drop_ratio) {
-                return true;
-            }
-            return false;
-        };
+        // Safe: Too much motion (Camera move / Light switch)
+        // printf("[FallDetector] Global Safety: Too much motion (%zu blocks)\n", pImpl->active_blocks.size());
+        triggered_objects.clear(); 
+    } 
+    else if (!pImpl->current_objects.empty()) 
+    {
+        // 2. Global FG History Update
+        pImpl->fg_count_history_buffer.push_back((int)pImpl->active_blocks.size());
+        if(pImpl->fg_count_history_buffer.size() > 100) pImpl->fg_count_history_buffer.pop_front();
 
-        for (const auto& curr_obj : pImpl->current_objects) {
-            // Debug: Trace Check
-            // printf("[DEBUG] Checking V2 for ID %d\n", curr_obj.id);
-            // Retrieve History
-            int hist_len = pImpl->object_history.size();
-            int m_trend = 10; // "Recent m frames" - default 10
+        // 3. Object Analysis
+        for (auto& curr : pImpl->current_objects) {
+            // Reconstruct History for this object
+            // User requirement: "Recently n frames... m frames momentum trend"
+            // Let's use n=20, m=10 for trends.
+            int n_history = 20; 
+            std::vector<float> hist_dy, hist_dx, hist_str;
+            std::vector<int> hist_fg; // Global FG corresponding to object history frames
             
-            // Gather trajectory
-            std::vector<float> vy_hist, vx_hist, mag_hist;
-            std::vector<int> fg_hist; // Global FG counts
+            // Collect history (Oldest -> Newest)
+            // pImpl->object_history is [Old ... New] ? No, usually buffer is push_back.
+            // Index 0 is oldest? Or newest? 
+            // Standard implementation: push_back new frame. So back() is newest.
+            // We iterate from back-n to back.
             
-            // Reconstruct history for this object
-             // Note: object_history is [oldest ... newest]
-             // We want [newest ... oldest] for easier lookback? Or keep chronological.
-             // Let's keep chronological: [T-m ... T]
+            if (pImpl->object_history.size() < 5) continue; 
             
-            bool tracking_ok = true;
-            // Iterate backwards to find this object in history
             int collected = 0;
-            // Data for trend analysis (Chronological: Old -> New)
-            std::vector<float> trace_vy, trace_vx, trace_mag;
-            std::vector<int> trace_fg;
-            
-            for (int i = hist_len - 1; i >= 0 && collected < m_trend; --i) {
+            int h_size = pImpl->object_history.size();
+            int start_idx = std::max(0, h_size - n_history);
+
+            for(int i=start_idx; i<h_size; ++i) {
                 bool found = false;
-                for (const auto& h_obj : pImpl->object_history[i]) {
-                     if (h_obj.id == curr_obj.id) {
-                         trace_vy.insert(trace_vy.begin(), h_obj.avgDy);
-                         trace_vx.insert(trace_vx.begin(), h_obj.avgDx);
-                         trace_mag.insert(trace_mag.begin(), h_obj.strength);
-                         found = true;
-                         break;
-                     }
+                for(const auto& h_obj : pImpl->object_history[i]) {
+                    if(h_obj.id == curr.id) {
+                        hist_dy.push_back(h_obj.avgDy);
+                        hist_dx.push_back(h_obj.avgDx);
+                        hist_str.push_back(h_obj.strength);
+                        found = true;
+                        break;
+                    }
                 }
-                if (found) {
-                     // Get corresponding Global FG count
-                     // Assuming global_pixel_history is synced with object_history indices
-                     // global_pixel_history is pushed same time as object_history
-                     if (i < (int)pImpl->global_pixel_history.size()) {
-                         trace_fg.insert(trace_fg.begin(), pImpl->global_pixel_history[i]);
+                if(found) {
+                     // Get Global FG for this frame index (Synced?)
+                     // pImpl->fg_count_history_buffer is updated every frame.
+                     // Assuming sync: global buffer size increases same as obj history size if start together.
+                     // But buffer is deque. 
+                     // Let's use relative index from end.
+                     int offset_from_end = (h_size - 1) - i;
+                     int fg_idx = (int)pImpl->fg_count_history_buffer.size() - 1 - offset_from_end;
+                     if (fg_idx >= 0 && fg_idx < (int)pImpl->fg_count_history_buffer.size()) {
+                         hist_fg.push_back(pImpl->fg_count_history_buffer[fg_idx]);
                      } else {
-                         trace_fg.insert(trace_fg.begin(), 0);
+                         hist_fg.push_back(0);
                      }
                      collected++;
-                } else {
-                    // Allow small gaps? For now rigorous.
-                    // If gap, maybe break or continue?
-                    // User said "Unstable tracking" - let's allow 1-2 frame gaps?
-                    // Implementation: skipping index without incrementing collected.
                 }
             }
             
-            if (collected < 5) continue; // Need at least 5 frames
+            if (collected < 10) continue; // Need enough history
+
+            // --- Case Determination ---
+            // "Calculate momentum direction of last n frames"
+            // Let's take average or sum
+            float sum_dy = 0, sum_dx = 0;
+            for(float v : hist_dy) sum_dy += v;
+            for(float v : hist_dx) sum_dx += v;
             
-            // Size Check (Reject Noise) - NEW
-            if (curr_obj.blocks.size() < 4) {
-                 continue; // Too small (Noise)
-            }
-            
-            // Current Moment Analysis
-            float curr_vy = curr_obj.avgDy;
-            float curr_vx = curr_obj.avgDx;
-            
-            // 1. Momentum Direction Check: |Vy| > |Vx|
-            // Check average of last 3 frames to be stable
-            float avg_vy_recent = 0, avg_vx_recent = 0;
-            int recent_n = std::min((int)trace_vy.size(), 3);
-            for(size_t k=trace_vy.size()-recent_n; k<trace_vy.size(); ++k) {
-                avg_vy_recent += trace_vy[k];
-                avg_vx_recent += trace_vx[k];
-            }
-            avg_vy_recent /= recent_n;
-            avg_vx_recent /= recent_n;
-            
-            if (std::abs(avg_vy_recent) <= std::abs(avg_vx_recent)) {
-                // Not vertical dominance
-                continue; 
-            }
+            bool y_dominant = (std::abs(sum_dy) > std::abs(sum_dx));
+            bool is_upward = (sum_dy < 0);
             
             bool potential_fall = false;
-            bool is_upward = (avg_vy_recent < 0);
+            std::string fall_type = "";
             
-            // Landing Zone Analysis
-            // Check Final Position (curr_obj is the latest state)
-            float floor_thresh = H * 0.75f; // Expanded High Zone to 75% to catch Sits
-            bool is_high_landing = (curr_obj.centerY < floor_thresh);
-            
-            // Logic 1 (Upward) & 2 (Downward)
-            
-            // 1-a. Upward Consistency Check
-            if (is_upward) {
-                int up_count = 0;
-                for(float vy : trace_vy) if(vy < 0) up_count++;
-                float consistency = (float)up_count / trace_vy.size();
-                if (consistency > 0.75f) {
-                    // 1-a: Too consistent upward -> Walking/Climbing
-                    // IGNORE
+            // Helper: Trend Check (High -> Low)
+            auto checkTrend = [](const std::vector<float>& data, float high_thresh, float drop_ratio) -> bool {
+                int len = data.size();
+                int half = len / 2;
+                float sum_high = 0, sum_low = 0;
+                for(int k=0; k<half; ++k) sum_high += data[k];
+                for(int k=half; k<len; ++k) sum_low += data[k];
+                
+                float avg_high = sum_high / half;
+                float avg_low = sum_low / (len - half);
+                
+                return (avg_high > high_thresh && avg_low < avg_high * drop_ratio);
+            };
+
+            // Helper: Global FG Trend Check (High -> Low)
+            auto checkFGTrend = [](const std::vector<int>& data) -> bool {
+                int len = data.size();
+                int half = len / 2;
+                float sum_high = 0, sum_low = 0;
+                for(int k=0; k<half; ++k) sum_high += data[k];
+                for(int k=half; k<len; ++k) sum_low += data[k];
+                return (sum_low < sum_high * 0.8f); // Default 80% drop
+            };
+
+            // Lower mom_high_thresh to 4.0
+            float mom_high_thresh = 4.0f; // Relaxed from 6.0
+            float mom_drop_ratio = 0.8f; // Relaxed from 0.5
+            float fg_drop_ratio = 0.8f; // Relaxed from 0.75
+
+            if (y_dominant && !is_upward) {
+                // --- CASE 1: Upward Momentum ---
+                // 1-a. Consistency Check (Reject if Consistent)
+                // Using Direction Variance from Object if available, or calc from history
+                float dir_var = curr.direction_variance; // Existing logic computes this
+                if (dir_var < 0.2f) { // Consistent -> Walking Away
+                    // printf("[NewLogic] ID %d Rejected: Upward Consistent (Var %.2f)\n", curr.id, dir_var);
                     continue; 
                 }
-            }
-            
-            // Common Trend Logic (1-b, 1-c, 2-a, 2-b)
-            // Check Momentum Trend (Mag or Vy?)
-            // User said "Momentum". Usually Magnitude or Abs(Vy). 
-            // Let's use Strength (Magnitude) or Abs(Vy). User mentioned "High to Low".
-            // Let's use trace_mag.
-            
-            // Adaptive Thresholds based on Landing Zone
-            float mom_high_thresh;
-            float mom_drop_ratio;
-            float fg_drop_ratio;
-            
-            if (is_high_landing) {
-                // High Landing (e.g. Sits, Bed movements): Require Drop
-                mom_high_thresh = 6.0f; // Lowered to catch start-of-fall (Data 2)
-                mom_drop_ratio = 0.85f; // RELAXED (Was 0.4) to catch Walking Fall (Data 6 ~0.84). Sits are filtered by UpCons.
-                fg_drop_ratio = 0.75f; // RELAXED (Was 0.5) to catch Data 7 (0.74)
-                // printf("[LogicV2] Obj %d High Landing (y=%.1f). Using STRICT thresholds.\n", curr_obj.id, curr_obj.centerY);
-            } else {
-                // Low Landing (Floor Falls): Relaxed
-                mom_high_thresh = 6.0f; // Lowered from 10.0
-                mom_drop_ratio = 0.5f; // Was 0.4
-                fg_drop_ratio = 0.75f; // Was 0.7
-            }
+                
+                // 1-b. Momentum Trend (High -> Low)
+                // 1-c. FG Trend (High -> Low)
+                if (checkTrend(hist_str, mom_high_thresh, mom_drop_ratio) && checkFGTrend(hist_fg)) {
+                     potential_fall = true;
+                     fall_type = "Upward_Collapse";
+                }
+            } 
+            else if (y_dominant && is_upward) {
+                // --- CASE 2: Downward Momentum ---
+                // 2-a. Momentum Trend (High -> Low)
+                // 2-b. FG Trend (High -> Low)
+                if (checkTrend(hist_str, mom_high_thresh, mom_drop_ratio) && checkFGTrend(hist_fg)) {
+                     potential_fall = true;
+                     fall_type = "Downward_Fall";
+                }
+                
+                // --- CASE 3: Pixel-Dominant Trigger (Low Momentum / Sit / Roll) ---
+                // If momentum is weak (e.g. 1.0 < str < 4.0) but FG Drop is HUGE (e.g. > 45%), trigger it.
+                // Guard: Must NOT be moving Up (Walking Away). avgDy should be >= 0 or very slightly negative.
+                if (!potential_fall) {
+                    float strict_fg_ratio = 0.55f; // Require 45% drop
+                    bool is_huge_fg_drop = false;
+                    {
+                        int len = hist_fg.size();
+                        int half = len / 2;
+                        float sum_high = 0, sum_low = 0;
+                        for(int k=0; k<half; ++k) sum_high += hist_fg[k];
+                        for(int k=half; k<len; ++k) sum_low += hist_fg[k];
+                        if (sum_high > 100 && sum_low < sum_high * strict_fg_ratio) is_huge_fg_drop = true;
+                    }
 
-            // Check Momentum Trend
-            bool mom_trend = hasDroppingTrend(trace_mag, collected, mom_high_thresh, mom_drop_ratio);
-            
-            // Check FG Trend
-            // Convert int to float for helper
-            std::vector<float> fg_float;
-            for(int fg : trace_fg) fg_float.push_back((float)fg);
-            // FG changes might not be as drastic as momentum, use milder threshold?
-            // "FG count trend from many to few"
-            // Use 0 threshold for absolute, just check drop
-            bool fg_trend = hasDroppingTrend(fg_float, collected, 50.0f, fg_drop_ratio); 
-            
-            // Sync Check (Implicit: we check same window 'collected')
-            
-            // Calculate Stats for Analysis (Always, for tuning)
-            float m_avg_high = 0, m_avg_low = 0;
-            int half = collected / 2;
-            for(int i=0; i<half; ++i) m_avg_high += trace_mag[i];
-            for(int i=half; i<collected; ++i) m_avg_low += trace_mag[i];
-            m_avg_high /= half;
-            m_avg_low /= (collected - half);
-            float m_ratio = (m_avg_high > 0) ? m_avg_low / m_avg_high : 0;
-            
-            float f_avg_high = 0, f_avg_low = 0;
-            for(int i=0; i<half; ++i) f_avg_high += fg_float[i];
-            for(int i=half; i<collected; ++i) f_avg_low += fg_float[i];
-            f_avg_high /= half;
-            f_avg_low /= (collected - half);
-            float f_ratio = (f_avg_high > 0) ? f_avg_low / f_avg_high : 0;
-            
-            int up_count = 0;
-            for(float vy : trace_vy) if(vy < 0) up_count++;
-            float up_consistency = (float)up_count / trace_vy.size();
+                    // Check if "Not Walking Away" (Y-momentum not significantly negative)
+                    bool not_walking_away = (sum_dy > -5.0f); // Allow slight noise, but generally neutral or down.
 
-            // Print Analysis if minimal motion (to avoid spamming static noise)
-            if (m_avg_high > 0.5f) {
-                 printf("[ANALYSIS] Frame: %lld, ID: %d, HighLand: %d, MomMax: %.2f, MomHigh: %.2f, MomRatio: %.2f, FGHigh: %.0f, FGRatio: %.2f, Size: %zu, CY: %.0f, UpCons: %.2f, Pass: %d, Dx: %.2f, Dy: %.2f, Acc: %.2f, DirVar: %.2f, SpdVar: %.2f\n",
-                        pImpl->absolute_frame_count, curr_obj.id, is_high_landing, trace_mag[0], m_avg_high, m_ratio, f_avg_high, f_ratio, curr_obj.blocks.size(), curr_obj.centerY, up_consistency, (mom_trend && fg_trend),
-                        curr_obj.avgDx, curr_obj.avgDy, curr_obj.acceleration, curr_obj.direction_variance, curr_obj.magnitude_variance);
-            }
-
-            // FINAL TUNE: UpCons Filter for High Landing (Sits)
-            if (is_high_landing && up_consistency > 0.30f) {
-                // Reject Sits (UpCons ~0.5)
-                // printf("[LogicV2] Reject High Landing Upward Motion (Sit): UpCons %.2f\n", up_consistency);
-            }
-            else if (mom_trend && fg_trend) {
-                potential_fall = true;
+                    if (is_huge_fg_drop && not_walking_away) {
+                        // Check if ANY motion exists (don't trigger on static light switch)
+                        bool has_some_motion = false;
+                        float max_str = 0.0f;
+                        for(float s : hist_str) if(s > 1.5f) { has_some_motion = true; } // Low threshold
+                        
+                        if (has_some_motion) {
+                            potential_fall = true;
+                            fall_type = "Pixel_Collapse";
+                             printf("[NewLogic] Pixel-Dominant Trigger! ID %d. FG Drop Confirmed. (SumDy: %.1f)\n", curr.id, sum_dy);
+                        }
+                    }
+                }
             }
             
             if (potential_fall) {
-                // 1-d / 2-c: Static & Bed Check
-                // "Object starts to be static... examine last position"
-                // Current object IS the "last position" if it triggered now.
-                // Check if Inside Bed
+                // Common Checks: Bed Region & Leaving Scene & Static
                 
-                // Bed Check
+                // 1-d / 2-c: Check Last Position in Bed?
+                // User: "Check last possible position not in bed".
+                // We use Current Center/Bottom.
                 bool in_bed = false;
                 if (pImpl->hasBedMask) {
-                    // Check Center
-                    int cx = (int)curr_obj.centerX;
-                    int cy = (int)curr_obj.centerY;
-                    if (cx >=0 && cx < W && cy >=0 && cy < H) {
-                        if (pImpl->bedMask.at(cx, cy) == 0) in_bed = true; // 0 is Bed
+                    // Check Bottom Point
+                    int cx = (int)(curr.centerX * pImpl->config.block_size);
+                    // Use max row for bottom
+                    int max_r = 0;
+                    for(int b : curr.blocks) { int r = b / pImpl->config.grid_cols; if(r>max_r) max_r=r; }
+                    int cy = (max_r + 1) * pImpl->config.block_size;
+                    
+                    if (cx>=0 && cx<W && cy>=0 && cy<H) {
+                         // Mask: 0 = Inside Bed
+                         if (pImpl->bedMask.getData()[cy*W + cx] == 0) in_bed = true;
                     }
                 }
                 
                 if (in_bed) {
-                    printf("[LogicV2] Rejection: ID %d is inside Bed.\n", curr_obj.id);
-                    continue; 
+                    // printf("[NewLogic] ID %d Rejected: In Bed Region\n", curr.id);
+                    // continue; // DISABLED FOR DEBUG
                 }
                 
-                // 1-f / 2-e: Leaving Frame Check
-                // Check if near boundary
-                int margin = 20;
-                int cx = (int)curr_obj.centerX;
-                int cy = (int)curr_obj.centerY;
-                bool leaving = (cx < margin || cx > W - margin || cy < margin || cy > H - margin);
-                
-                if (leaving) {
-                    printf("[LogicV2] Rejection: ID %d Leaving Frame.\n", curr_obj.id);
-                    continue;
+                // 1-f / 2-e: Leaving Scene Guard
+                // "Evaluate if person is leaving frame"
+                // Check if near border AND velocity points out
+                bool near_border = (curr.centerX < 2.0f || curr.centerX > (pImpl->config.grid_cols - 2.0f) ||
+                                    curr.centerY < 2.0f || curr.centerY > (pImpl->config.grid_rows - 2.0f));
+                if (near_border) {
+                     // Check Velocity Direction relative to border
+                     // E.g. x < 2 and dx < 0 -> Leaving Left
+                     bool leaving = false;
+                     float vx = curr.avgDx;
+                     float vy = curr.avgDy;
+                     float cx = curr.centerX;
+                     float cy = curr.centerY;
+                     float w_g = pImpl->config.grid_cols;
+                     float h_g = pImpl->config.grid_rows;
+                     
+                     if (cx < 2.0f && vx < -0.1f) leaving = true;
+                     if (cx > w_g - 2.0f && vx > 0.1f) leaving = true;
+                     if (cy < 2.0f && vy < -0.1f) leaving = true;
+                     if (cy > h_g - 2.0f && vy > 0.1f) leaving = true; // Bottom border usually floor
+                     
+                     if (leaving) {
+                         printf("[NewLogic] ID %d Rejected: Leaving Scene\n", curr.id);
+                         continue;
+                     }
                 }
                 
-                // CONFIRMED FALL
-                // printf("[DEBUG] PUSH BACK V2 for ID %d\n", curr_obj.id);
-                triggered_objects.push_back(curr_obj.id);
-                warningMsg = "Fall Detected (Logic V2)";
-                printf("[LogicV2] *** FALL CONFIRMED *** ID %d\n", curr_obj.id);
+                // Trigger
+                printf("[NewLogic] FALL DETECTED ID %d Type: %s. StrTrend: High->Low. FGTrend: High->Low.\n", curr.id, fall_type.c_str());
+                detected_id = curr.id;
+                triggered_objects.push_back(curr.id);
+                warningMsg = fall_type;
             }
         }
     }
+
+    
+
     
     if (slow_triggered > 0 && detected_id != -1) {
          bool exists = false;
@@ -3817,258 +3709,7 @@ StatusCode FallDetector::Detect(const Image& frame, bool& is_fall) {
     pImpl->fg_count_history_buffer.push_back(global_fg_count);
     if (pImpl->fg_count_history_buffer.size() > 120) pImpl->fg_count_history_buffer.pop_front();
 
-    // Process existing pending falls (update with new FG data)
-    for (auto& pf : pImpl->pending_falls) {
-        if (pf.confirmed || pf.rejected) continue;
-        
-        pf.fg_history.push_back(global_fg_count);
-        pf.frames_monitored++;
-        
-        // Find corresponding object to record motion history
-        bool found = false;
-        for (const auto& obj : pImpl->current_objects) {
-            if (obj.id == pf.object_id) {
-                // Approximate dy/dx from center movement? 
-                // Wait, we need velocity. But MotionObject doesn't store velocity directly in accessible way here?
-                // We can infer it from track or use 'strength' directly.
-                // For now, let's use 'strength' and delta Center.
-                
-                // Oops, we don't store previous center here easily without map lookup.
-                // But we have KalmanFilter map!
-                // Or just use strength as a proxy for movement magnitude.
-                pf.strength_history.push_back(obj.strength);
-                
-                // For direction, we really need Dy. 
-                // Let's compute it from position history if we have it?
-                // Actually, let's just store the Y position, and compute Dy later.
-                pf.dy_history.push_back(obj.centerY); 
-                found = true;
-                break;
-            }
-        }
-        if (!found) {
-            pf.strength_history.push_back(0); // Lost object = Stationary
-            if (!pf.dy_history.empty()) pf.dy_history.push_back(pf.dy_history.back()); // Assume same position
-        }
-        
-        // When we have enough data (OBSERVATION_WINDOW frames), make decision
-        if ((int)pf.fg_history.size() >= pImpl->OBSERVATION_WINDOW) {
-            // Calculate first half average (frames 0-14)
-            float first_half_sum = 0;
-            int half = pImpl->OBSERVATION_WINDOW / 2;
-            for (int i = 0; i < half; i++) {
-                first_half_sum += pf.fg_history[i];
-            }
-            float first_half_avg = first_half_sum / half;
-            
-            // Calculate second half average (frames 15-29)
-            float second_half_sum = 0;
-            for (int i = half; i < pImpl->OBSERVATION_WINDOW; i++) {
-                second_half_sum += pf.fg_history[i];
-            }
-            float second_half_avg = second_half_sum / half;
-            
-            // Avoid division by zero
-            // Avoid division by zero
-            float decline_ratio = (first_half_avg > 0) ? (second_half_avg / first_half_avg) : 1.0f;
-            
-            // Motion Analysis for Composite Check
-            float total_dy = 0;
-            if (pf.dy_history.size() > 1) {
-                total_dy = pf.dy_history.back() - pf.dy_history.front();
-            }
-            
-            float recent_strength_sum = 0;
-            int recent_count = 0;
-            int s_size = pf.strength_history.size();
-            for(int k=0; k<5 && k<s_size; ++k) {
-                recent_strength_sum += pf.strength_history[s_size - 1 - k];
-                recent_count++;
-            }
-            float recent_strength_avg = (recent_count > 0) ? recent_strength_sum / recent_count : 999.0f;
-            
-            bool is_upward = (total_dy < -10.0f); // Triggered by upward movement (away from camera)
-            bool is_lying_down = (recent_strength_avg < 2.5f); // Object stopped moving (lying down)
-            
-            // Composite Condition: Allow relaxed FG threshold if direction is Upward AND object stopped.
-            // This targets "Falling Away" cases where FG decrease is less dramatic but behavior is fall-like.
-            bool composite_confirmed = (decline_ratio < 0.85f && is_upward && is_lying_down);
-
-
-            bool confirmed_fall = false;
-
-            // Calc UpCons and MaxStr (Hoisted for V11 Debugging scope)
-            int up_ops = 0, tot_ops = 0;
-            for(size_t i=1; i<pf.dy_history.size(); ++i) {
-                 float d = pf.dy_history[i] - pf.dy_history[i-1];
-                 if(std::abs(d) > 0.5f) {
-                     tot_ops++;
-                     if(d < -0.5f) up_ops++;
-                 }
-            }
-            float up_cons = (tot_ops > 0) ? (float)up_ops/tot_ops : 0.0f;
-
-            // Dynamic Thresholds need sf_verified_max_str properly populated.
-            // (Already done in Detect)
-            float max_str = pf.sf_verified_max_str; // Use Trigger MaxStr
-
-            // V16.4 Calculation: Robust Vertical Displacement (max - min in trajectory)
-            float min_y = 9999.0f, max_y = -9999.0f;
-            for (float y : pf.dy_history) {
-                if (y < min_y) min_y = y;
-                if (y > max_y) max_y = y;
-            }
-            float abs_y_delta = (max_y > min_y) ? (max_y - min_y) : 0.0f;
-
-            // V17.0 Logic: Precision Balancing & displacement thresholds (Relaxed for V17)
-            bool high_mom = (max_str >= 10.0f);
-            bool clean_trig = (pf.sf_verified_dir_var < 0.40f);
-            bool consistent_dir = (pf.sf_verified_dir_var < 0.60f);
-            
-            // Tier 3: Require Messiness (DirVar > 0.6)
-            bool chaotic_crash = (max_str > 9.0f && pf.sf_verified_dir_var > 0.6f);
-
-            // V17.4 Directional Leniency for Significant Movement
-            float up_cons_limit = (abs_y_delta > 60.0f) ? 0.90f : ((abs_y_delta > 30.0f) ? 0.80f : 0.65f); 
-
-            // V17.4 Context-Aware Displacement Logic (Floor requires Drop, Bed requires Sensitivity)
-            // V17.5: Use Historical Bed Status (Was on bed recently?)
-            bool was_on_bed = (pf.historical_bed_max > 0.4f);
-            float context_min_disp = was_on_bed ? 8.0f : 15.0f;
-
-            // V17.4 Tiered Directional Gates
-            bool tier1_clean_fast = (high_mom && clean_trig && up_cons <= 0.85f && abs_y_delta > context_min_disp); 
-            bool tier2_standard = (consistent_dir && up_cons <= up_cons_limit && abs_y_delta > context_min_disp);
-            bool tier3_crash = (chaotic_crash && up_cons <= 0.75f && abs_y_delta > context_min_disp);
-            
-            // V17.6 Tier 4: Weak Messy Fall (Context-Aware: Bed Falls Only)
-            // Relax DirVar to 0.35 if was_on_bed (Bed falls can be cleaner/softer)
-            bool tier4_weak_messy = (max_str < 9.0f && max_str > 3.0f && abs_y_delta > 9.0f && up_cons < 0.6f && was_on_bed);
-            if (tier4_weak_messy) {
-                 // Context-Dependent DirVar
-                 if (pf.sf_verified_dir_var <= 0.35f) tier4_weak_messy = false;
-            }
-
-            // V17.3 Stationarity Rescue (Tightened lower bound to avoid micro-movement noise)
-            bool collapse_rescue = (abs_y_delta > 6.0f && abs_y_delta < 20.0f && decline_ratio < 0.80f);
-
-            bool direction_verified = (tier1_clean_fast || tier2_standard || tier3_crash || tier4_weak_messy || collapse_rescue);
-            
-            // V17.4 Safety Guards
-            bool noise_guard_reject = (abs_y_delta < 8.0f && decline_ratio > 1.25f); 
-            bool walk_guard_reject = (decline_ratio < 0.8f && pf.sf_verified_dir_var < 0.35f && max_str < 7.0f);
-            
-            // V17.2 Bed Guard: Reject falls that stay ON THE BED (Safe Ratio > 0.6)
-            // Relaxes override to 9.0 to save Data 1/2/3
-            // V17.5: Use current safe ratio for Bed Guard (End state)
-            bool bed_guard_reject = (pf.pd_trigger_safe_ratio > 0.6f && abs_y_delta < 9.0f);
-
-            if (noise_guard_reject || walk_guard_reject || bed_guard_reject) {
-                direction_verified = false; 
-            }
-            
-            bool not_upward = direction_verified; 
-
-
-            if (pf.is_high_landing) {
-                // High Landing (Top Half): Strict Verification required to avoid Sits/Walks.
-                // 1. Calculate AR and Size
-                float ar = 0.0f;
-                int obj_size = 0;
-                for(auto& obj : pImpl->current_objects) {
-                    if(obj.id == pf.object_id && !obj.blocks.empty()) {
-                         obj_size = obj.blocks.size();
-                         int min_c = 9999, max_c = -1, min_r = 9999, max_r = -1;
-                         for(int blk : obj.blocks) {
-                             int r = blk / grid_cols;
-                             int c = blk % grid_cols;
-                             if(c < min_c) min_c = c;
-                             if(c > max_c) max_c = c;
-                             if(r < min_r) min_r = r;
-                             if(r > max_r) max_r = r;
-                         }
-                         float w = (float)(max_c - min_c + 1) * bSize;
-                         float h = (float)(max_r - min_r + 1) * bSize;
-                         ar = (h > 0) ? w / h : 0.0f;
-                         break;
-                    }
-                }
-
-                // 2. Verification rules
-                // Tuned for Data 6 (Walking Fall, Size ~18, Ratio ~0.80) vs Data 4 (Noise, Size ~11-21, Ratio > 0.94) vs Data 1 (Sits, Size ~3-6, Ratio ~0.72-0.87)
-                bool is_significant = (obj_size >= 12); 
-                bool is_stationary = (recent_strength_avg < 10.0f); 
-                bool has_drop = (decline_ratio < 0.90f);
-
-                // High Landing Logic (Similar protection for Clean Triggers/Side Falls)
-                // V14: Uses consolidated direction_verified
-                if (is_significant && is_stationary && has_drop && direction_verified) {
-                        confirmed_fall = true;
-                        printf("[FG Verify] ACCEPTED (High Landing V17.0): ID %d, Size=%d, Ratio=%.2f, UpCons=%.2f, MaxStr=%.2f, DirVar=%.2f, YDelta=%.1f, Rescue=%d\n", 
-                               pf.object_id, obj_size, decline_ratio, up_cons, max_str, pf.sf_verified_dir_var, abs_y_delta, (int)collapse_rescue);
-                } else {
-                    pf.rejected = true;
-                    if (noise_guard_reject)
-                        printf("[FG Verify] REJECTED (V17.0 Noise-Guard): ID %d, YDelta=%.1f, Ratio=%.2f\n", pf.object_id, abs_y_delta, decline_ratio);
-                    else if (walk_guard_reject)
-                         printf("[FG Verify] REJECTED (V17.0 Walk-Guard): ID %d, Ratio=%.2f, DirVar=%.2f\n", pf.object_id, decline_ratio, pf.sf_verified_dir_var);
-                    else if (!direction_verified)
-                        printf("[FG Verify] REJECTED (High Landing - Direction/Disp): ID %d, UpCons=%.2f MaxStr=%.2f, YDelta=%.1f\n", pf.object_id, up_cons, max_str, abs_y_delta);
-                    else if (!is_significant)
-                        printf("[FG Verify] REJECTED (High Landing - Small): ID %d, size=%d\n", pf.object_id, obj_size);
-                    else if (!has_drop)
-                        printf("[FG Verify] REJECTED (High Landing - No Drop): ID %d, ratio=%.2f\n", pf.object_id, decline_ratio);
-                    else if (!is_stationary)
-                        printf("[FG Verify] REJECTED (High Landing - Moving): ID %d, str=%.1f\n", pf.object_id, recent_strength_avg);
-                }
-            } else {
-                // Normal Landing (On Floor / Bottom Half)
-                // V17.6 Optimized Logic (Hard Constraints + Safety Guards)
-                // Trust T4 (Weak Messy) to bypass Ratio gap (0.8-1.0)
-                if (direction_verified && (decline_ratio < 0.80f || composite_confirmed || tier4_weak_messy || (max_str >= 5.5f && pf.sf_verified_dir_var > 0.2f && decline_ratio > 1.0f && decline_ratio < 1.50f))) {
-                    confirmed_fall = true;
-                    printf("[FG Verify] ACCEPTED (V17.6): ID %d, Ratio=%.2f, UpCons=%.2f, MaxStr=%.2f, DirVar=%.2f, YDelta=%.1f, BedSafe=%.2f, HistBed=%.2f, Rescue=%d\n", 
-                           pf.object_id, decline_ratio, up_cons, max_str, pf.sf_verified_dir_var, abs_y_delta, pf.pd_trigger_safe_ratio, pf.historical_bed_max, (int)collapse_rescue);
-                } else {
-                    pf.rejected = true;
-                    if (noise_guard_reject)
-                         printf("[FG Verify] REJECTED (V17.6 Noise-Guard): ID %d, YDelta=%.1f, Ratio=%.2f\n", pf.object_id, abs_y_delta, decline_ratio);
-                    else if (walk_guard_reject)
-                         printf("[FG Verify] REJECTED (V17.6 Walk-Guard): ID %d, Ratio=%.2f, DirVar=%.2f\n", pf.object_id, decline_ratio, pf.sf_verified_dir_var);
-                    else if (bed_guard_reject)
-                         printf("[FG Verify] REJECTED (V17.6 Bed-Guard): ID %d, BedSafe=%.2f, YDelta=%.1f\n", pf.object_id, pf.pd_trigger_safe_ratio, abs_y_delta);
-                    else if (!direction_verified)
-                        printf("[FG Verify] REJECTED (Normal - Direction/Disp): ID %d, UpCons=%.2f MaxStr=%.2f DirVar=%.2f, YDelta=%.1f\n", pf.object_id, up_cons, max_str, pf.sf_verified_dir_var, abs_y_delta);
-                    else
-                        printf("[FG Verify] REJECTED (Normal - Ratio): ID %d, ratio=%.2f\n", pf.object_id, decline_ratio);
-                }
-            }
-            
-            if (confirmed_fall) {
-                pf.confirmed = true;
-            }
-        }
-    }
-
-    // Check if any pending fall was confirmed and set is_fall
-    for (const auto& pf : pImpl->pending_falls) {
-        if (pf.confirmed) {
-            is_fall = true;
-            pImpl->fall_consecutive_frames = std::max(pImpl->fall_consecutive_frames, pImpl->config.fall_duration); // Ensure it's 공식 공식 공식
-            printf("[FallDetector] *** FALL DETECTED (ID %d) *** [FG Verification Confirmed]\n", pf.object_id);
-        }
-    }
-
-    // Clean up processed pending falls
-    pImpl->pending_falls.erase(
-        std::remove_if(pImpl->pending_falls.begin(), pImpl->pending_falls.end(),
-            [](const Impl::PendingFall& pf) { return pf.confirmed || pf.rejected; }),
-        pImpl->pending_falls.end()
-    );
-
-    // (Duplicate Block Removed)
-
-    // printf("[Detect] Fall Check Complete. Triggered: %zu\n", triggered_objects.size());
+    // V17 Post-Trigger Logic Removed for V18 Experiment
 
     // Note: is_fall may have been set to true by pending_falls confirmation above
     // Only reset if we're also going to process new triggers
@@ -4080,283 +3721,20 @@ StatusCode FallDetector::Detect(const Image& frame, bool& is_fall) {
         if(!exists) triggered_objects.push_back(sid);
     }
 
+    // V18 DIRECT CONFIRMATION (Bypass V17 Gates)
     if (!triggered_objects.empty()) {
-        int bSize = pImpl->config.block_size; 
+        is_fall = true;
+        // warning = "V18_Fall"; // Optional: pass reason
         for(int pid : triggered_objects) {
-            
-            // Check if THIS object has bed exit status
-            bool obj_bed_exit = false;
-            // Default to true if verification disabled? 
-            // NO, the user wants this logic to be the Bed Exit Filter.
-            
-            // Wait, if Bed Exit Verification is enabled, we rely on pImpl->object_bed_exit_status?
-            // Actually, the original logic was:
-            // "If pImpl->is_bed_exit is TRUE, then accept fall."
-            
-            // So if obj has bed exit status, it passes the gate.
-            if (pImpl->object_bed_exit_status.count(pid) && pImpl->object_bed_exit_status[pid]) 
-            {
-                printf("[Exit] frame: %lld, Obj %d Bed Exit Status TRUE.\n", pImpl->absolute_frame_count, pid);
-                obj_bed_exit = true;
-            }
-
-            // Find the object
-            bool found_obj = false;
-            MotionObject* pObj = nullptr;
-            for(auto& obj : pImpl->current_objects) {
-                if(obj.id == pid) {
-                    pObj = &obj;
-                    found_obj = true;
-                    break;
-                }
-            }
-            
-            if (!found_obj) {
-                printf("[Debug] Triggered ID %d NOT FOUND in current_objects\n", pid); // DEBUG
-                continue;
-            } else {
-                // 3. Post-Fall Aspect Ratio Check (Filter Sits)
-                bool rejected_sit = false;
-                if (pObj) { // Redundant check but safe
-                     int static_w = 0, static_h = 0;
-                     // Previously we searched again here. Removed.
-                     
-                     if (true) { // Valid scope for existing logic
-                     // Logic: 
-
-                     // Logic: 
-                     // - If Inside Bed: IGNORE (Safe Sit/Lay).
-                     // - If Outside Bed & High Landing: IGNORE (Sit on Chair).
-                     // - Else: ACCEPT.
-                     
-                     bool rejected_context = false;
-                     bool is_high_landing_event = false; // Declared here for visibility
-                     std::string reject_reason = "";
-                     
-                     if (pImpl->hasBedMask && pImpl->bedMask.width() == W && pImpl->bedMask.height() == H) {
-                         const unsigned char* mData = pImpl->bedMask.getData();
-                         int bSize = pImpl->config.block_size;
-                         
-                         // Convert Grid Coords to Pixel Coords
-                         int cx = (int)(pObj->centerX * bSize);
-                         int cy = (int)(pObj->centerY * bSize);
-                         
-                         // Clamp
-                         if(cx < 0) cx = 0; if(cx >= W) cx = W-1;
-                         if(cy < 0) cy = 0; if(cy >= H) cy = H-1;
-                         int maskVal = mData[cy * W + cx];
-                            // Calculate Bottom Point
-                           int max_r_blk = 0;
-                           for(int blk : pObj->blocks) {
-                               int r = blk / grid_cols;
-                               if(r > max_r_blk) max_r_blk = r;
-                           }
-                           int cy_bottom = (int)((max_r_blk + 1) * bSize) - 1;
-                           if(cy_bottom < 0) cy_bottom = 0; if(cy_bottom >= H) cy_bottom = H-1;
-                           int maskValBottom = mData[cy_bottom * W + cx]; // Bottom Point Mask
-
-                          // Check if this ID is a Confirmed Slow Fall (Bypass Context)
-                          // UPDATE: Only Bypass Height Check? Or Trust Descent?
-                          // We still want Bed Check (Bottom Point).
-                          bool is_slow_trigger = false;
-                          for(int sid : slow_fall_ids) if(sid == pid) is_slow_trigger = true;
-                          
-                          // BORDER FILTER (Kill Edge/Corner Noise)
-                          // If object touches the border AND is not a Slow Fall, REJECT.
-                          // Momentum triggers at the edge are usually entry/exit noise or artifacts.
-                          bool touches_border = false;
-                                                     // We need min_r, min_c, max_c too
-                           int min_r_blk=grid_rows, min_c_blk=grid_cols, max_c_blk=0; 
-                           for(int blk : pObj->blocks) {
-                               int r = blk / grid_cols;
-                               int c = blk % grid_cols;
-                               if(r < min_r_blk) min_r_blk = r;
-                               if(c < min_c_blk) min_c_blk = c;
-                               if(c > max_c_blk) max_c_blk = c;
-                           }
-                           
-                           // Aspect Ratio
-                           int w_blocks = (max_c_blk - min_c_blk + 1);
-                           int h_blocks = (max_r_blk - min_r_blk + 1);
-                           float asp_ratio = (float)w_blocks / (float)h_blocks;
-                          
-                          // GENERAL ASPECT RATIO FILTER (Distinguish Sit vs Slide)
-                          // 1. Large Objects (>10 blocks): Must be wider than 0.30 (Balanced).
-                           // 2. Small Objects (<=10 blocks): Must be VERY flat (>1.0) to be valid (Noise Filter).
-                           //    EXCEPTION: If Strength is very high (>8.0), likely a fast fall fragment. Allow it.
-                           //    EXCEPTION 2 (Data 7 Patch): If Direction Variance is Low (<0.5), it's consistent motion (Fall), not noise. Allow it.
-                            bool reject_posture = false;
-                            if (pObj->blocks.size() > 10 && asp_ratio < 0.30f) { // Restore 0.30 to allow longitudinal falls
-                                 reject_posture = true;
-                            } else if (pObj->blocks.size() <= 10) { 
-                                 // Data 7 (AR=0.25) was rejected. 
-                                 // Add DirVar check to rescue valid small falls.
-                                 bool is_consistent = (pObj->direction_variance < 0.5f);
-                                 if (asp_ratio < 0.30f && pObj->strength < 8.0f && !is_consistent) { 
-                                     reject_posture = true;
-                                 }
-                            }
-
-                          if (reject_posture && !is_slow_trigger) {
-                              rejected_context = true;
-                              reject_reason = "UprightPosture(Sit)";
-                              printf("[FallDetector] Rejection: Upright Posture (Sit) ID %d. AR=%.2f. Size=%zu. Bed=%d\n", 
-                                     pObj->id, asp_ratio, pObj->blocks.size(), (int)maskValBottom);
-                          }
-                          else if (maskValBottom == 0 && !is_slow_trigger) { // Bottom Inside Bed -> Reject (Unless Slow Fall)
-                              rejected_context = true;
-                              reject_reason = "InsideBed(Bottom)";
-                              printf("[FallDetector] Rejection: Bottom inside Bed Region ID %d. CyBottom=%d\n", pObj->id, cy_bottom);
-                          } else {
-                              // Outside Bed: Check Landing Height
-                             // Logic: If Obj.CenterY < H * 0.50 -> Sit on Chair.
-                             // Sits observed around Y=80-135px. Floor is 450px.
-                             // Setting threshold to 0.5 * H (225px) should safely filter sits.
-                             
-                              /*
-                               Context Filter Refactored to Avoid Logic Gaps
-                               Logic:
-                               1. Check Landing Height (Floor Threshold)
-                               2. If High (CenterY < Thresh):
-                                  - REJECT by default (Chair Sit / Upright)
-                                  - BYPASS (Accept) ONLY IF: Slow Fall AND Size > 5 (Valid Slide)
-                               3. If Low (CenterY >= Thresh):
-                                  - ACCEPT (Verified Floor Landing)
-                              */
-                              
-                              float floor_thresh = H * 0.50f;
-                              float obj_pixel_y = pObj->centerY * bSize;
-                              
-                              if (obj_pixel_y < floor_thresh) {
-                                  // High Landing -> Candidate for Strict Verification (Flag it)
-                                  // REMOVED Bypass logic (Slow Fall etc.) because we want Strict Verification for ALL High Landing candidates.
-                                  // This prevents Sits (Data 1) from slipping through as Normal Fall candidates.
-                                  
-                                  is_high_landing_event = true; 
-                                  // PATCH: Bed Rolls (Slow Fall) are High Landing physically, but logic-wise should be Permissive.
-                                  if (is_slow_trigger) is_high_landing_event = false; 
-
-                                  printf("[FallDetector] FLAG: High Landing Detected. ID %d. CenterY=%.1f. Will require Strict Verification.\n", pObj->id, obj_pixel_y);
-                              } else {
-                                  // Low Landing -> Accepted as Normal
-                              }
-                          }
-                     }
-                     
-                     if (rejected_context) {
-                         // printf("[FallDetector] Ignore Fall Event due to Context: %s\n", reject_reason.c_str());
-                         // Skip setting is_fall = true
-                     } else {
-                         // === NEW: Instead of immediate confirmation, create PendingFall for FG verification ===
-                         // Check if this object already has a pending fall
-                         bool already_pending = false;
-                         for (const auto& pf : pImpl->pending_falls) {
-                             if (pf.object_id == pid && !pf.confirmed && !pf.rejected) {
-                                 already_pending = true;
-                                 break;
-                             }
-                         }
-                         
-                         if (!already_pending) {
-                             Impl::PendingFall pf;
-                             pf.object_id = pid;
-                             pf.trigger_frame = (int)pImpl->absolute_frame_count;
-                             pf.is_high_landing = is_high_landing_event; // Propagate flag
-                             pf.lookback_start = (int)pImpl->absolute_frame_count - pImpl->LOOKBACK_FRAMES;
-                             pf.frames_monitored = 0;
-                             pf.confirmed = false;
-                             pf.rejected = false;
-
-                             // V12 Recall Fix: Calc MaxStr AND UpCons from Global History
-                             // This ensures we capture the high momentum peak even if verification history is short.
-                             float trig_max_str = 0.0f;
-                             int trig_up_ops = 0, trig_tot_ops = 0;
-                             if (!pImpl->object_history.empty()) {
-                                 size_t start_h = (pImpl->object_history.size() > 30) ? (pImpl->object_history.size() - 30) : 0;
-                                 for (size_t i = start_h; i < pImpl->object_history.size(); ++i) {
-                                     for (const auto& o : pImpl->object_history[i]) {
-                                         if (o.id == pid) {
-                                             float s = std::hypot(o.avgDx, o.avgDy);
-                                             if (s > trig_max_str) trig_max_str = s;
-
-                                             // UpCons logic check
-                                             if (std::abs(o.avgDy) > 0.5f) {
-                                                 trig_tot_ops++;
-                                                 if (o.avgDy < -0.5f) trig_up_ops++;
-                                             }
-                                             break; 
-                                         }
-                                     }
-                                 }
-                             }
-                             pf.sf_verified_max_str = trig_max_str;
-                             pf.sf_verified_up_cons = (trig_tot_ops > 0) ? (float)trig_up_ops / trig_tot_ops : 0.0f;
-                             
-                             // Capture Direction Variance from Current Object
-                             float trig_dir_var = 999.0f;
-                             // We have 'pObj' from line 3964/3967 in scope effectively? 
-                             // Wait, Detect loop finds pObj per 'triggered_objects'.
-                             // Yes, 'pObj' pointer is valid here.
-                             if (pObj) {
-                                  trig_dir_var = pObj->direction_variance;
-                             }
-                             pf.sf_verified_dir_var = trig_dir_var;
-                             
-                             if (pObj) {
-                                 pf.pd_trigger_safe_ratio = pObj->safe_area_ratio;
-                             }
-
-                             // V17.5: Calculate Historical Best Safe Ratio (Was on bed?)
-                             // Use pImpl->object_safe_ratio_history_buffer[pid]
-                             float max_bed_presence = 0.0f;
-                             if (pImpl->object_safe_ratio_history_buffer.count(pid)) {
-                                 const auto& s_hist = pImpl->object_safe_ratio_history_buffer[pid];
-                                 int s_start = std::max(0, (int)s_hist.size() - pImpl->LOOKBACK_FRAMES);
-                                 for (size_t k = s_start; k < s_hist.size(); ++k) {
-                                     if(s_hist[k] > max_bed_presence) max_bed_presence = s_hist[k];
-                                 }
-                             }
-                             pf.historical_bed_max = max_bed_presence;
-
-
-                             
-                             // Copy lookback FG history (last LOOKBACK_FRAMES frames)
-                             int start_idx = std::max(0, (int)pImpl->fg_count_history_buffer.size() - pImpl->LOOKBACK_FRAMES);
-                             for (size_t i = start_idx; i < pImpl->fg_count_history_buffer.size(); i++) {
-                                 pf.fg_history.push_back(pImpl->fg_count_history_buffer[i]);
-                             }
-
-                             // V16.1: Copy lookback Y history (trajectory before trigger)
-                             auto it_y = pImpl->object_y_history_buffer.find(pid);
-                             if (it_y != pImpl->object_y_history_buffer.end()) {
-                                 const auto& global_y_hist = it_y->second;
-                                 int y_start_idx = std::max(0, (int)global_y_hist.size() - pImpl->LOOKBACK_FRAMES);
-                                 for (size_t i = y_start_idx; i < (int)global_y_hist.size(); i++) {
-                                     pf.dy_history.push_back(global_y_hist[i]);
-                                 }
-                             }
-                             
-                             pImpl->pending_falls.push_back(pf);
-                             printf("[FG Verify] Created PendingFall for ID %d at frame %lld (lookback: %zu frames). High=%d\n", 
-                                    pid, pImpl->absolute_frame_count, pf.fg_history.size(), (int)pf.is_high_landing);
-                         }
-                          // Note: is_fall is set ONLY when FG verification confirms (line 3585)
-                          // DO NOT set is_fall here - it bypasses the FG verification
-                          // is_fall = true;
-                          warning = warningMsg;
-                          printf("[FallDetector] *** FALL PENDING (ID %d) *** [Awaiting FG Verification]\n", pid);
-                     }
-                 }
-                }
-
-                // Redundant block removed (merged into Composite Context Filter above)
-            } 
-            //else 
-            {
-                 // printf("[FallDetector] Fall Triggered ID %d but Bed Exit Status FALSE. Ignored.\n", pid);
-            }
+            printf("[V18] *** FALL CONFIRMED *** ID %d (Direct V18 Trigger)\n", pid);
         }
     }
+
+#if 0 // V17 CANDIDATE VERIFICATION DISABLED
+    // V17 Logic Removed for Compilation
+#endif
+    
+    // Maintain Pending Falls Cleanup (empty loop if commented out above)
     if (!pImpl->candidates.empty()) 
     {
         std::vector<Impl::FallCandidate> kept_candidates;
