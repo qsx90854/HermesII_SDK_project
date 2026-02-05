@@ -16,7 +16,7 @@
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <cstring>
-
+#include <climits>
 #define ENABLE_PERF_PROFILING 1
 
 using namespace std;
@@ -290,6 +290,49 @@ static bool getStaticBoundingBoxRaw(const unsigned char* currData, int currW, in
     char buf[16];
     sprintf(buf, "%.1f", v);
     drawStringRGB(img, w, h, x, y, buf, r, g, b, scale);
+}
+
+// Calculate bounding box size (in pixels) from object's block list
+// Returns the width and height of the bounding box enclosing all blocks
+// block_width and block_height are the size of each block in pixels
+static void getObjectBoundingBoxPixels(const MotionObject& obj, int grid_cols, int grid_rows, 
+                                       int frame_width, int frame_height,
+                                       int& out_bbox_width, int& out_bbox_height, 
+                                       int& out_min_x, int& out_min_y,
+                                       int& out_max_x, int& out_max_y) {
+    // Calculate block dimensions
+    int block_width = frame_width / grid_cols;
+    int block_height = frame_height / grid_rows;
+    
+    // Find min/max block indices
+    int min_block_x = INT_MAX; int max_block_x = INT_MIN;
+    int min_block_y = INT_MAX; int max_block_y = INT_MIN;
+    
+    for (int block_idx : obj.blocks) {
+        int block_row = block_idx / grid_cols;
+        int block_col = block_idx % grid_cols;
+        
+        min_block_x = std::min(min_block_x, block_col);
+        max_block_x = std::max(max_block_x, block_col);
+        min_block_y = std::min(min_block_y, block_row);
+        max_block_y = std::max(max_block_y, block_row);
+    }
+    
+    if (obj.blocks.empty()) {
+        out_bbox_width = 0;
+        out_bbox_height = 0;
+        out_min_x = out_min_y = out_max_x = out_max_y = 0;
+        return;
+    }
+    
+    // Convert to pixel coordinates
+    out_min_x = min_block_x * block_width;
+    out_min_y = min_block_y * block_height;
+    out_max_x = (max_block_x + 1) * block_width;  // +1 to get right edge of block
+    out_max_y = (max_block_y + 1) * block_height; // +1 to get bottom edge of block
+    
+    out_bbox_width = out_max_x - out_min_x;
+    out_bbox_height = out_max_y - out_min_y;
 }
 
 } // anonymous namespace
@@ -3445,6 +3488,10 @@ StatusCode FallDetector::Detect(const Image& frame, bool& is_fall) {
     int detected_id = -1;
     std::vector<int> slow_fall_ids; // NEW: Track slow falls
     
+    std::string fall_type = "";
+    int case_num = 0;
+
+
     // --- NEW LOGIC: Direction-Based Detection (User Request) ---
     // 1. Global Motion Safety Guard: Reject if > 1/4 screen is moving
     int total_grid_blocks = pImpl->config.grid_cols * pImpl->config.grid_rows;
@@ -3521,7 +3568,7 @@ StatusCode FallDetector::Detect(const Image& frame, bool& is_fall) {
             bool is_upward = (sum_dy < 0);
             
             bool potential_fall = false;
-            std::string fall_type = "";
+            
             
             // Helper: Trend Check (High -> Low)
             auto checkTrend = [](const std::vector<float>& data, float high_thresh, float drop_ratio) -> bool {
@@ -3551,7 +3598,7 @@ StatusCode FallDetector::Detect(const Image& frame, bool& is_fall) {
             float mom_high_thresh = 4.0f; // Relaxed from 6.0
             float mom_drop_ratio = 0.8f; // Relaxed from 0.5
             float fg_drop_ratio = 0.8f; // Relaxed from 0.75
-
+            
             if (y_dominant && !is_upward) {
                 // --- CASE 1: Upward Momentum ---
                 // 1-a. Consistency Check (Reject if Consistent)
@@ -3565,8 +3612,20 @@ StatusCode FallDetector::Detect(const Image& frame, bool& is_fall) {
                 // 1-b. Momentum Trend (High -> Low)
                 // 1-c. FG Trend (High -> Low)
                 if (checkTrend(hist_str, mom_high_thresh, mom_drop_ratio) && checkFGTrend(hist_fg)) {
-                     potential_fall = true;
-                     fall_type = "Upward_Collapse";
+                     
+                     
+                     // Get bounding box size for this object
+                     int bbox_w, bbox_h, min_x, min_y, max_x, max_y;
+                     getObjectBoundingBoxPixels(curr, pImpl->config.grid_cols, pImpl->config.grid_rows, 
+                                                W, H, bbox_w, bbox_h, min_x, min_y, max_x, max_y);
+                     printf("[Case1 BBox] ID %d: %dx%d pixels (min=%d,%d max=%d,%d)\n", 
+                            curr.id, bbox_w, bbox_h, min_x, min_y, max_x, max_y);
+
+                    if (bbox_w < 240 && bbox_h < 240) {
+                        potential_fall = true;
+                        fall_type = "Upward_Collapse";
+                        case_num = 1;
+                    }
                 }
             } 
             else if (y_dominant && is_upward) {
@@ -3576,6 +3635,7 @@ StatusCode FallDetector::Detect(const Image& frame, bool& is_fall) {
                 if (checkTrend(hist_str, mom_high_thresh, mom_drop_ratio) && checkFGTrend(hist_fg)) {
                      potential_fall = true;
                      fall_type = "Downward_Fall";
+                     case_num = 2;
                 }
                 
                 // --- CASE 3: Pixel-Dominant Trigger (Low Momentum / Sit / Roll) ---
@@ -3605,6 +3665,7 @@ StatusCode FallDetector::Detect(const Image& frame, bool& is_fall) {
                         if (has_some_motion) {
                             potential_fall = true;
                             fall_type = "Pixel_Collapse";
+                            case_num = 3;
                              printf("[NewLogic] Pixel-Dominant Trigger! ID %d. FG Drop Confirmed. (SumDy: %.1f)\n", curr.id, sum_dy);
                         }
                     }
@@ -3835,7 +3896,19 @@ StatusCode FallDetector::Detect(const Image& frame, bool& is_fall) {
     }
     */
 
-    if(is_fall) {
+    if(is_fall) 
+    {
+        printf("[FallDetector] frame %d detect True Fall!!, Case %d, type=%s\n", pImpl->frame_idx, case_num, fall_type.c_str());
+        
+        // Print bounding box info for all detected objects
+        for(const auto& obj : pImpl->current_objects) {
+            int bbox_w, bbox_h, min_x, min_y, max_x, max_y;
+            getObjectBoundingBoxPixels(obj, pImpl->config.grid_cols, pImpl->config.grid_rows,
+                                       W, H, bbox_w, bbox_h, min_x, min_y, max_x, max_y);
+            printf("[FallConfirm BBox] ID %d: %dx%d pixels (min=%d,%d max=%d,%d)\n",
+                   obj.id, bbox_w, bbox_h, min_x, min_y, max_x, max_y);
+        }
+        
         std::cout << "[FallDetector] " << warning << std::endl;
     }
 
