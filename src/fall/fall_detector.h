@@ -115,6 +115,9 @@ public:
     // Get current motion objects
     const std::vector<MotionObject>& GetMotionObjects() const;
     
+    // Get full-frame foreground objects
+    std::vector<ObjectFeatures> GetFullFrameObjects() const;
+
     // Internal Getters
     std::vector<uint8_t> GetChangedBlocks() const;
     std::vector<MotionVector> GetMotionVectors() const;

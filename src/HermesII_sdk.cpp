@@ -282,3 +282,7 @@ std::vector<uint8_t> VisionSDK::VisionSDK::GetChangedBlocks() {
 std::vector<MotionVector> VisionSDK::VisionSDK::GetMotionVectors() {
     return pImpl->fall_detector.GetMotionVectors();
 }
+
+std::vector<ObjectFeatures> VisionSDK::VisionSDK::GetFullFrameObjects() {
+    return pImpl->fall_detector.GetFullFrameObjects();
+}

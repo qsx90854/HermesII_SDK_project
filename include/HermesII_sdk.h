@@ -163,6 +163,15 @@ struct MotionVector {
     MotionVector(int _dx, int _dy) : dx(_dx), dy(_dy) {}
 };
 
+struct ObjectFeatures {
+    int id = -1;
+    int area;          // 面積 (pixel count)
+    float cx, cy;      // 重心
+    float angle;       // 角度
+    float major, minor;// 長短軸
+    std::vector<int> pixels; // 像素索引
+};
+
 struct MotionObject {
     int id = -1;
     float centerX = 0.0f, centerY = 0.0f;
@@ -300,6 +309,9 @@ public:
     std::vector<MotionObject> GetMotionObjects();
     std::vector<uint8_t> GetChangedBlocks(); // Returns mask data same size as grid (cols*rows)
     std::vector<MotionVector> GetMotionVectors(); // Returns vector map same size as grid
+
+    // Get full-frame foreground objects
+    std::vector<ObjectFeatures> GetFullFrameObjects();
 
 
 

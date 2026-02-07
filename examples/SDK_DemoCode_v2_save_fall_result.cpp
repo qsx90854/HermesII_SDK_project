@@ -848,6 +848,73 @@ int main() {
              //drawRectRGB(current_frame_rgb, W, H, 0, 0, W, H, 255, 0, 0, 3);
              fall_red_box_countdown--;
         }
+
+        // ------------------------------------------
+        // NEW: Full Frame Group Visualization
+        // ------------------------------------------
+        std::vector<ObjectFeatures> ff_objs = sdk.GetFullFrameObjects();
+        std::vector<uint8_t> ff_viz_img(W * H * 3, 0); // Start with black
+        
+        static uint8_t colors[][3] = {
+            {255, 0, 0}, {0, 255, 0}, {0, 0, 255},
+            {255, 255, 0}, {255, 0, 255}, {0, 255, 255},
+            {255, 128, 0}, {255, 0, 128}, {128, 255, 0}
+        };
+        int num_colors = 9;
+
+        for (const auto& f_obj : ff_objs) {
+            if (f_obj.area > 1000) {
+                int c_idx = f_obj.id % num_colors;
+                uint8_t r = colors[c_idx][0];
+                uint8_t g = colors[c_idx][1];
+                uint8_t b = colors[c_idx][2];
+                
+                for (int pix_idx : f_obj.pixels) {
+                    if (pix_idx >= 0 && pix_idx < W * H) {
+                        ff_viz_img[pix_idx * 3] = r;
+                        ff_viz_img[pix_idx * 3 + 1] = g;
+                        ff_viz_img[pix_idx * 3 + 2] = b;
+                    }
+                }
+                // Draw Major/Minor Axes
+                float major = f_obj.major;
+                float minor = f_obj.minor;
+                float angle = f_obj.angle;
+                float cx = f_obj.cx;
+                float cy = f_obj.cy;
+
+                // Major Axis (Red)
+                float cos_a = std::cos(angle);
+                float sin_a = std::sin(angle);
+                int maj_x1 = (int)(cx - (major/2.0f) * cos_a);
+                int maj_y1 = (int)(cy - (major/2.0f) * sin_a);
+                int maj_x2 = (int)(cx + (major/2.0f) * cos_a);
+                int maj_y2 = (int)(cy + (major/2.0f) * sin_a);
+                drawArrow(ff_viz_img, W, H, maj_x1, maj_y1, maj_x2, maj_y2, 255, 50, 50, 3);
+
+                // Minor Axis (Blue)
+                float cos_min = std::cos(angle + 1.570796f); // +90 deg
+                float sin_min = std::sin(angle + 1.570796f);
+                int min_x1 = (int)(cx - (minor/2.0f) * cos_min);
+                int min_y1 = (int)(cy - (minor/2.0f) * sin_min);
+                int min_x2 = (int)(cx + (minor/2.0f) * cos_min);
+                int min_y2 = (int)(cy + (minor/2.0f) * sin_min);
+                drawArrow(ff_viz_img, W, H, min_x1, min_y1, min_x2, min_y2, 50, 50, 255, 2);
+            } else {
+                // Dim white for small groups
+                for (int pix_idx : f_obj.pixels) {
+                    if (pix_idx >= 0 && pix_idx < W * H) {
+                        ff_viz_img[pix_idx * 3] = 100;
+                        ff_viz_img[pix_idx * 3 + 1] = 100;
+                        ff_viz_img[pix_idx * 3 + 2] = 100;
+                    }
+                }
+            }
+        }
+        
+        char fg_groups_filename[256];
+        snprintf(fg_groups_filename, sizeof(fg_groups_filename), "%s/fg_groups_frame_%05d.jpg", save_dir.c_str(), i);
+        stbi_write_jpg(fg_groups_filename, W, H, 3, ff_viz_img.data(), 90);
         
         
         // 3. Draw Changed Blocks (Green)

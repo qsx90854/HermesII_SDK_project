@@ -11,6 +11,7 @@
 #include <deque>
 #include <map>
 #include <set>
+#include <queue>
 
 #include <cstdio>
 #include <sys/stat.h>
@@ -149,6 +150,165 @@ void drawArrowRGB(std::vector<uint8_t>& img, int w, int h, int x, int y, int dx,
         drawLineRGB(img, w, h, x2, y2, x4, y4, r, g, b, thickness);
     }
 }
+
+
+#if 0
+struct ObjectFeatures {
+    int area;          // 面積 (pixel count)
+    float cx, cy;      // 重心
+    float angle;       // 角度
+    float major, minor;// 長短軸
+};
+#endif
+// 假設 mask 已經是上面 NEON 算出來的 0/255 陣列
+// width, height: 影像尺寸
+// minArea: 過濾噪點用
+std::vector<::VisionSDK::ObjectFeatures> find_objects_optimized(const uint8_t* mask, int width, int height, int minArea) {
+    std::vector<::VisionSDK::ObjectFeatures> results;
+    
+    static std::vector<uint8_t> visited;
+    if (visited.size() != (size_t)(width * height)) {
+        visited.assign(width * height, 0);
+    } else {
+        std::fill(visited.begin(), visited.end(), 0);
+    }
+    
+    int dx[] = {1, -1, 0, 0};
+    int dy[] = {0, 0, 1, -1};
+
+    struct BlobData {
+        long long sum_x, sum_y, sum_xx, sum_yy, sum_xy;
+        int count;
+        int min_x, max_x, min_y, max_y;
+        std::vector<int> pixels;
+        bool merged;
+        int parent;
+    };
+    std::vector<BlobData> blobs;
+
+    // 1. Initial Blob Extraction (Flood Fill)
+    for (int y = 0; y < height; ++y) {
+        for (int x = 0; x < width; ++x) {
+            int idx = y * width + x;
+            if (mask[idx] == 255 && visited[idx] == 0) {
+                BlobData blob;
+                blob.sum_x = blob.sum_y = blob.sum_xx = blob.sum_yy = blob.sum_xy = 0;
+                blob.count = 0;
+                blob.min_x = x; blob.max_x = x;
+                blob.min_y = y; blob.max_y = y;
+                blob.merged = false;
+                blob.parent = (int)blobs.size();
+
+                std::queue<int> q;
+                q.push(idx);
+                visited[idx] = 1;
+
+                while (!q.empty()) {
+                    int curr = q.front();
+                    q.pop();
+
+                    int cy_curr = curr / width;
+                    int cx_curr = curr % width;
+
+                    blob.sum_x += cx_curr;
+                    blob.sum_y += cy_curr;
+                    blob.sum_xx += (long long)cx_curr * cx_curr;
+                    blob.sum_yy += (long long)cy_curr * cy_curr;
+                    blob.sum_xy += (long long)cx_curr * cy_curr;
+                    blob.count++;
+                    blob.pixels.push_back(curr);
+
+                    if (cx_curr < blob.min_x) blob.min_x = cx_curr;
+                    if (cx_curr > blob.max_x) blob.max_x = cx_curr;
+                    if (cy_curr < blob.min_y) blob.min_y = cy_curr;
+                    if (cy_curr > blob.max_y) blob.max_y = cy_curr;
+
+                    for (int i = 0; i < 4; ++i) {
+                        int nx = cx_curr + dx[i];
+                        int ny = cy_curr + dy[i];
+                        if (nx >= 0 && nx < width && ny >= 0 && ny < height) {
+                            int nidx = ny * width + nx;
+                            if (mask[nidx] == 255 && visited[nidx] == 0) {
+                                visited[nidx] = 1;
+                                q.push(nidx);
+                            }
+                        }
+                    }
+                }
+                blobs.push_back(std::move(blob));
+            }
+        }
+    }
+
+    // 2. BBox Expansion Merging (DSU-like logic)
+    int expansion = 10;
+    bool changed = true;
+    while (changed) {
+        changed = false;
+        for (int i = 0; i < (int)blobs.size(); ++i) {
+            if (blobs[i].merged) continue;
+            for (int j = i + 1; j < (int)blobs.size(); ++j) {
+                if (blobs[j].merged) continue;
+
+                // Intersection of expanded BBoxes
+                bool overlap = !(blobs[i].max_x + expansion < blobs[j].min_x - expansion ||
+                                blobs[i].min_x - expansion > blobs[j].max_x + expansion ||
+                                blobs[i].max_y + expansion < blobs[j].min_y - expansion ||
+                                blobs[i].min_y - expansion > blobs[j].max_y + expansion);
+
+                if (overlap) {
+                    // Merge j into i
+                    blobs[i].sum_x += blobs[j].sum_x;
+                    blobs[i].sum_y += blobs[j].sum_y;
+                    blobs[i].sum_xx += blobs[j].sum_xx;
+                    blobs[i].sum_yy += blobs[j].sum_yy;
+                    blobs[i].sum_xy += blobs[j].sum_xy;
+                    blobs[i].count += blobs[j].count;
+                    blobs[i].pixels.insert(blobs[i].pixels.end(), blobs[j].pixels.begin(), blobs[j].pixels.end());
+                    
+                    if (blobs[j].min_x < blobs[i].min_x) blobs[i].min_x = blobs[j].min_x;
+                    if (blobs[j].max_x > blobs[i].max_x) blobs[i].max_x = blobs[j].max_x;
+                    if (blobs[j].min_y < blobs[i].min_y) blobs[i].min_y = blobs[j].min_y;
+                    if (blobs[j].max_y > blobs[i].max_y) blobs[i].max_y = blobs[j].max_y;
+
+                    blobs[j].merged = true;
+                    changed = true;
+                }
+            }
+        }
+    }
+
+    // 3. Re-calculating Features for final objects
+    for (auto& blob : blobs) {
+        if (!blob.merged && blob.count > minArea) {
+            float mean_x = (float)blob.sum_x / blob.count;
+            float mean_y = (float)blob.sum_y / blob.count;
+
+            float u20 = (float)blob.sum_xx / blob.count - mean_x * mean_x;
+            float u02 = (float)blob.sum_yy / blob.count - mean_y * mean_y;
+            float u11 = (float)blob.sum_xy / blob.count - mean_x * mean_y;
+
+            float delta = std::sqrt(4 * u11 * u11 + (u20 - u02) * (u20 - u02));
+            float lambda1 = (u20 + u02 + delta) / 2;
+            float lambda2 = (u20 + u02 - delta) / 2;
+
+            ::VisionSDK::ObjectFeatures obj;
+            obj.id = (int)results.size();
+            obj.area = blob.count;
+            obj.cx = mean_x;
+            obj.cy = mean_y;
+            obj.major = 4.0f * std::sqrt(std::max(0.0f, lambda1));
+            obj.minor = 4.0f * std::sqrt(std::max(0.0f, lambda2));
+            obj.angle = 0.5f * std::atan2(2 * u11, u20 - u02);
+            obj.pixels = std::move(blob.pixels);
+            
+            results.push_back(obj);
+        }
+    }
+
+    return results;
+}
+
 
 // Minimal 5x7 bitmap font
 const uint8_t font5x7[] = {
@@ -290,6 +450,7 @@ static bool getStaticBoundingBoxRaw(const unsigned char* currData, int currW, in
     char buf[16];
     sprintf(buf, "%.1f", v);
     drawStringRGB(img, w, h, x, y, buf, r, g, b, scale);
+    return true;
 }
 
 // Calculate bounding box size (in pixels) from object's block list
@@ -1660,12 +1821,14 @@ void detectFallPixelStats(
 }
 
 
+
 class FallDetector::Impl {
 public:
     std::unique_ptr<OptimizedBlockMotionEstimator> estimator;
     std::vector<MotionObject> current_objects;
     std::vector<std::vector<MotionObject>> object_history;
     InternalConfig config; // Use unified Config
+    std::vector<::VisionSDK::ObjectFeatures> full_frame_objects;
     
     // New fields
     // Bed Region
@@ -2809,64 +2972,36 @@ StatusCode FallDetector::Detect(const Image& frame, bool& is_fall) {
     }
     
     // Generate and Save BG Mask
-    //if (pImpl->config.enable_save_bg_mask)
     int global_fg_count = 0;
-    if (true)
+    if (pImpl->backgroundFrame.width() > 0) 
     {
-        // Only if BG is ready
-        if (pImpl->backgroundFrame.width() > 0) 
-        {
-            // Create Binary Mask
-            int w = wrapper.width();
-            int h = wrapper.height();
-            // Assuming wrapper is Grayscale? Yes, convertToGrayscale called earlier.
-            // But backgroundFrame might be 3 channel if initialized from RGB? 
-            // Previous code initialized `backgroundFrame` from `wrapper` (which is Gray).
-            // So logic holds.
-            
-            std::vector<unsigned char> maskData(w * h);
-            const unsigned char* curr = wrapper.getData();
-            const unsigned char* bg = pImpl->backgroundFrame.empty() ? nullptr : pImpl->backgroundFrame.getData();
-            int diff_thr = pImpl->config.bg_diff_threshold;
-            
-            for(int i=0; i<w*h; ++i) {
-                // If in Bed -> 128 (Need Bed Mask)
-                // Bed Mask Logic: pImpl->bedMask or implementation specific?
-                // pImpl->bedMask exists? No, logic depends on bed_region vector.
-                // We should reconstruct bed mask if needed, but for now we iterate points?
-                // `SetBedRegion` only stores points.
-                // Let's assume bedMask check is manual
-                
-                // Bed Mask Logic: 
-                // Based on existing logic (line 1800), 255 = Outside, 0 = Inside.
-                // User wants Bed Region (Inside) to be 128.
-                // So if mask == 0, set 128.
-                int val = 0;
-                unsigned char pix_diff = (unsigned char)std::abs((int)curr[i] - (int)bg[i]);
-                
-                if (pix_diff > diff_thr) 
-                {
-                    global_fg_count++;
-                }
-
-
-                if (pImpl->hasBedMask && pImpl->bedMask.getData()[i] == 0) 
-                {
-                     // Inside Bed
-                     val = 128; // User requested Bed Area = 128 (Fixed, no diff check?)
-                     // User said "Bed area not judged, fixed to 128" -> "床的區域不判斷 固定為128"
-                } 
-                else 
-                {
-                    // Outside Bed
-                    if (pix_diff > diff_thr) 
-                    {
-                        val = 255;
-                    }
-                    else val = 0;
-                }
-                maskData[i] = (unsigned char)val;
+        // Create Binary Mask
+        int w = wrapper.width();
+        int h = wrapper.height();
+        
+        std::vector<unsigned char> maskData(w * h);
+        const uint8_t* curr = wrapper.getData();
+        const uint8_t* bg = pImpl->backgroundFrame.getData();
+        int diff_thr = pImpl->config.bg_diff_threshold;
+        
+        for(int i = 0; i < w * h; ++i) {
+            int diff = std::abs((int)curr[i] - (int)bg[i]);
+            if (diff > diff_thr) {
+                maskData[i] = 255;
+                global_fg_count++;
+            } else {
+                maskData[i] = 0;
             }
+        }
+
+        // Identify and store full-frame foreground objects
+        pImpl->full_frame_objects = find_objects_optimized(maskData.data(), w, h, 20); // Min area 20 pixels
+        
+        // Optional: Save BG Mask if configured
+        if (pImpl->config.enable_save_bg_mask) {
+             // (Logic for saving here if needed)
+        }
+    }
             
             // Save
             // char filename[256];
@@ -2920,8 +3055,7 @@ StatusCode FallDetector::Detect(const Image& frame, bool& is_fall) {
             //     }
             //     fclose(f);
             // }
-        }
-    } 
+
     #if ENABLE_PERF_PROFILING
     long long t1 = pImpl->get_now_us(); // Wrapper Init (Part of Motion Est prep)
     #endif
@@ -3567,6 +3701,32 @@ StatusCode FallDetector::Detect(const Image& frame, bool& is_fall) {
             bool y_dominant = (std::abs(sum_dy) > std::abs(sum_dx));
             bool is_upward = (sum_dy < 0);
             
+            // --- Baseline Stats for Debugging Missed Falls ---
+            float avg_h_str = 0, avg_l_str = 0;
+            {
+                int len = hist_str.size();
+                int half = len / 2;
+                float s_h = 0, s_l = 0;
+                for(int k=0; k<half; ++k) s_h += hist_str[k];
+                for(int k=half; k<len; ++k) s_l += hist_str[k];
+                avg_h_str = s_h / std::max(1, half);
+                avg_l_str = s_l / std::max(1, len-half);
+            }
+            float s_h_fg = 0, s_l_fg = 0;
+            {
+                int len = hist_fg.size();
+                int half = len / 2;
+                for(int k=0; k<half; ++k) s_h_fg += hist_fg[k];
+                for(int k=half; k<len; ++k) s_l_fg += hist_fg[k];
+            }
+            int box_w = 0, box_h = 0, m1, m2, m3, m4;
+            getObjectBoundingBoxPixels(curr, pImpl->config.grid_cols, pImpl->config.grid_rows, W, H, box_w, box_h, m1, m2, m3, m4);
+
+            printf("[DET_LOG] F:%lld ID:%d YDom:%d Up:%d Dy:%.1f StrH:%.2f StrL:%.2f (R:%.2f) FGH:%.0f FGL:%.0f (R:%.2f) Box:%dx%d\n",
+                   pImpl->frame_idx, curr.id, (int)y_dominant, (int)is_upward, sum_dy, 
+                   avg_h_str, avg_l_str, (avg_h_str > 0 ? avg_l_str/avg_h_str : 0.0f),
+                   s_h_fg, s_l_fg, (s_h_fg > 0 ? s_l_fg/s_h_fg : 0.0f), box_w, box_h);
+
             bool potential_fall = false;
             
             
@@ -3973,6 +4133,10 @@ StatusCode FallDetector::Detect(const Image& frame, bool& is_fall) {
 
 const std::vector<MotionObject>& FallDetector::GetMotionObjects() const {
     return pImpl->current_objects;
+}
+
+std::vector<::VisionSDK::ObjectFeatures> FallDetector::GetFullFrameObjects() const {
+    return pImpl->full_frame_objects;
 }
 
 std::vector<std::pair<int, int>> FallDetector::GetBedRegion() const {
