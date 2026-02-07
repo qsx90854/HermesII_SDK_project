@@ -98,6 +98,11 @@ struct FallDetection_v3 {
     int post_fall_check_frames = 5;
     bool enable_bed_exit_verification = true; // NEW
     bool enable_block_shrink_verification = true; // NEW
+
+    // Optical Flow Params
+    int opt_flow_frame_distance = 3;
+    int perspective_point_x = 416;
+    int perspective_point_y = 474;
 };
 
 struct BedExitDetection_v1 {
@@ -170,6 +175,11 @@ struct ObjectFeatures {
     float angle;       // 角度
     float major, minor;// 長短軸
     std::vector<int> pixels; // 像素索引
+    
+    // NEW for Optical Flow
+    std::vector<float> pixel_dx;
+    std::vector<float> pixel_dy;
+    std::vector<float> pixel_dir;
 };
 
 struct MotionObject {

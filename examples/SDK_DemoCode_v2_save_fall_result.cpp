@@ -389,14 +389,27 @@ struct FrameContext {
 std::deque<FrameContext> frame_buffer;
 const int DELAY_FRAMES = 30;
 
-int main() {
+// Custom Fall Logic History
+struct ObjStatsHistory {
+    std::deque<int> area_hist;
+    std::deque<int> red_hist;
+    int inconsistent_count = 0;
+    bool red_down_trend_triggered = false;
+    int frames_since_red_trigger = 0;
+};
+std::map<int, ObjStatsHistory> obj_histories;
+
+int main(int argc, char** argv) {
     std::cout << "Starting Fall Callback Demo v2 SAVE (30FPS Sim)..." << std::endl;
     std::cout << "SDK Version: " << VisionSDK::VisionSDK::GetVersion() << std::endl;
     // 1. Load Configs
     ConfigLoader cfg;
     ConfigLoader appCfg;
     
-    appCfg.load("app_config.ini");
+    std::string app_config_path = "app_config.ini";
+    if (argc > 1) app_config_path = argv[1];
+    std::cout << "Loading app config from: " << app_config_path << std::endl;
+    appCfg.load(app_config_path);
     
     // Load App Params First (Dimensions, Files)
     int W = appCfg.getInt("Demo.Demo_Width", 800);
@@ -490,6 +503,12 @@ int main() {
     fallCfg.bg_diff_threshold = cfg.getInt("FallDetect.BG_Diff_Threshold", 30);
     fallCfg.bg_update_interval_frames = cfg.getInt("FallDetect.BG_Update_Interval", 10);
     fallCfg.bg_update_alpha = cfg.getFloat("FallDetect.BG_Update_Alpha", 0.01f);
+    
+    // Optical Flow Params
+    fallCfg.opt_flow_frame_distance = cfg.getInt("OpticalFlow.CompareFrameDistance", 3);
+    fallCfg.perspective_point_x = cfg.getInt("OpticalFlow.PerspectivePointX", 416);
+    fallCfg.perspective_point_y = cfg.getInt("OpticalFlow.PerspectivePointY", 474);
+    float opt_flow_vel_threshold = cfg.getFloat("OpticalFlow.VelocityThreshold", 1.0f);
 
     sdk.SetConfig(&fallCfg);
 
@@ -689,33 +708,14 @@ int main() {
 
         auto t1 = std::chrono::steady_clock::now();
         sdk.SetInputMemory(file_buffer.data(), W, H, 3);
+        is_fall_in_current_frame = false; // Reset for custom logic
         sdk.ProcessNextFrame();
-        // Interval Tracking Logic
-        if (is_fall_in_current_frame) {
-            if (!is_currently_falling) {
-                is_currently_falling = true;
-                fall_start_frame = i;
-            }
-        } else {
-            if (is_currently_falling) {
-                is_currently_falling = false;
-                if (f_interval.is_open()) {
-                     f_interval << fall_start_frame << "," << (i - 1) << "\n";
-                     f_interval.flush(); // Ensure written
-                     detected_intervals_vec.push_back({fall_start_frame, i - 1});
-                     total_fall_events++;
-                }
-            }
-        }
 
         auto t2 = std::chrono::steady_clock::now();
         double ms = std::chrono::duration<double, std::milli>(t2 - t1).count();
         if (i % 50 == 0) {
             std::cout << "Frame " << i << " Total Process Time: " << ms << " ms (" << (1000.0/ms) << " FPS)" << std::endl;
         }
-
-        // ==========================================
-        std::cout << "Frame " << i << " Total Process Time: " << ms << " ms (" << (1000.0/ms) << " FPS)" << std::endl;
         
 
         // 1. Get Objects (Deep Copy)
@@ -855,59 +855,149 @@ int main() {
         std::vector<ObjectFeatures> ff_objs = sdk.GetFullFrameObjects();
         std::vector<uint8_t> ff_viz_img(W * H * 3, 0); // Start with black
         
-        static uint8_t colors[][3] = {
-            {255, 0, 0}, {0, 255, 0}, {0, 0, 255},
-            {255, 255, 0}, {255, 0, 255}, {0, 255, 255},
-            {255, 128, 0}, {255, 0, 128}, {128, 255, 0}
-        };
-        int num_colors = 9;
+        // Sort to get top 2
+        std::sort(ff_objs.begin(), ff_objs.end(), [](const ObjectFeatures& a, const ObjectFeatures& b) {
+            return a.area > b.area;
+        });
 
-        for (const auto& f_obj : ff_objs) {
-            if (f_obj.area > 1000) {
-                int c_idx = f_obj.id % num_colors;
-                uint8_t r = colors[c_idx][0];
-                uint8_t g = colors[c_idx][1];
-                uint8_t b = colors[c_idx][2];
-                
-                for (int pix_idx : f_obj.pixels) {
-                    if (pix_idx >= 0 && pix_idx < W * H) {
-                        ff_viz_img[pix_idx * 3] = r;
-                        ff_viz_img[pix_idx * 3 + 1] = g;
-                        ff_viz_img[pix_idx * 3 + 2] = b;
+        bool custom_fall_signal = false;
+        int perspective_x = fallCfg.perspective_point_x;
+        int perspective_y = fallCfg.perspective_point_y;
+        
+        int largest_obj_pixel_count = 0;
+        int largest_obj_red_count = 0;
+
+        // Process top 3 objects for custom logic
+        for (int i_obj = 0; i_obj < std::min(3, (int)ff_objs.size()); ++i_obj) {
+            const auto& f_obj = ff_objs[i_obj];
+            int red_count = 0;
+            
+            for (size_t i_pix = 0; i_pix < f_obj.pixels.size(); ++i_pix) {
+                int pix_idx = f_obj.pixels[i_pix];
+                if (pix_idx >= 0 && pix_idx < W * H) {
+                    int py = pix_idx / W;
+                    int px = pix_idx % W;
+
+                    uint8_t r = 120, g = 120, b = 120; // Default Gray
+
+                    if (i_pix < f_obj.pixel_dx.size()) {
+                        float dx = f_obj.pixel_dx[i_pix];
+                        float dy = f_obj.pixel_dy[i_pix];
+                        float angle = f_obj.pixel_dir[i_pix]; // Radians
+                        float speed = std::sqrt(dx*dx + dy*dy);
+
+                        // Downward is PI/2 (90 deg). PI/2 +/- 40 deg => [50 deg, 130 deg]
+                        // 50 deg = 0.8726 rad, 130 deg = 2.2689 rad
+                        if (speed > opt_flow_vel_threshold && angle >= 0.8726f && angle <= 2.2689f) {
+                            r = 255; g = 0; b = 0; // Red
+                            red_count++;
+                        }
                     }
+
+                    ff_viz_img[pix_idx * 3] = r;
+                    ff_viz_img[pix_idx * 3 + 1] = g;
+                    ff_viz_img[pix_idx * 3 + 2] = b;
                 }
-                // Draw Major/Minor Axes
-                float major = f_obj.major;
-                float minor = f_obj.minor;
-                float angle = f_obj.angle;
-                float cx = f_obj.cx;
-                float cy = f_obj.cy;
+            }
+            if (i_obj == 0) {
+                largest_obj_pixel_count = f_obj.area;
+                largest_obj_red_count = red_count;
+            }
 
-                // Major Axis (Red)
-                float cos_a = std::cos(angle);
-                float sin_a = std::sin(angle);
-                int maj_x1 = (int)(cx - (major/2.0f) * cos_a);
-                int maj_y1 = (int)(cy - (major/2.0f) * sin_a);
-                int maj_x2 = (int)(cx + (major/2.0f) * cos_a);
-                int maj_y2 = (int)(cy + (major/2.0f) * sin_a);
-                drawArrow(ff_viz_img, W, H, maj_x1, maj_y1, maj_x2, maj_y2, 255, 50, 50, 3);
+            // --- Custom Fall Logic Tracking ---
+            int obj_id = f_obj.id;
+            auto& hist = obj_histories[obj_id];
+            hist.area_hist.push_back(f_obj.area);
+            hist.red_hist.push_back(red_count);
+            if (hist.area_hist.size() > 30) hist.area_hist.pop_front();
+            if (hist.red_hist.size() > 30) hist.red_hist.pop_front();
 
-                // Minor Axis (Blue)
-                float cos_min = std::cos(angle + 1.570796f); // +90 deg
-                float sin_min = std::sin(angle + 1.570796f);
-                int min_x1 = (int)(cx - (minor/2.0f) * cos_min);
-                int min_y1 = (int)(cy - (minor/2.0f) * sin_min);
-                int min_x2 = (int)(cx + (minor/2.0f) * cos_min);
-                int min_y2 = (int)(cy + (minor/2.0f) * sin_min);
-                drawArrow(ff_viz_img, W, H, min_x1, min_y1, min_x2, min_y2, 50, 50, 255, 2);
-            } else {
-                // Dim white for small groups
-                for (int pix_idx : f_obj.pixels) {
-                    if (pix_idx >= 0 && pix_idx < W * H) {
-                        ff_viz_img[pix_idx * 3] = 100;
-                        ff_viz_img[pix_idx * 3 + 1] = 100;
-                        ff_viz_img[pix_idx * 3 + 2] = 100;
-                    }
+            bool red_trend_down = false;
+            bool area_trend_down = false;
+            if (hist.red_hist.size() == 30) {
+                float first_10_red = 0, last_10_red = 0;
+                float first_10_area = 0, last_10_area = 0;
+                for(int j=0; j<10; ++j) {
+                    first_10_red += hist.red_hist[j];
+                    last_10_red += hist.red_hist[20+j];
+                    first_10_area += hist.area_hist[j];
+                    last_10_area += hist.area_hist[20+j];
+                }
+                if (first_10_red > 10 && last_10_red < first_10_red * 0.8f) red_trend_down = true;
+                if (first_10_area > 100 && last_10_area < first_10_area * 0.9f) area_trend_down = true;
+            }
+
+            // Condition 1: Red trend down in 30 frames
+            if (red_trend_down) {
+                hist.red_down_trend_triggered = true;
+                hist.frames_since_red_trigger = 0;
+            }
+
+            // Axial Inconsistency Check
+            float dx_p = f_obj.cx - (float)perspective_x;
+            float dy_p = f_obj.cy - (float)perspective_y;
+            float p_angle = std::atan2(dy_p, dx_p);
+            float diff = std::abs(f_obj.angle - p_angle);
+            while (diff > M_PI/2.0f) diff = std::abs(diff - (float)M_PI);
+            bool inconsistent = (diff > 0.785f); // > 45 deg
+
+            if (hist.red_down_trend_triggered) {
+                hist.frames_since_red_trigger++;
+                if (inconsistent) hist.inconsistent_count++;
+                else hist.inconsistent_count = 0;
+
+                // Stop tracking after some time if logic never fully triggers
+                if (hist.frames_since_red_trigger > 120) {
+                    hist.red_down_trend_triggered = false;
+                    hist.inconsistent_count = 0;
+                }
+            }
+
+            // Final Custom Signal Decision
+            if (hist.red_down_trend_triggered) {
+                if (area_trend_down || hist.inconsistent_count > 60) {
+                    custom_fall_signal = true;
+                    std::cout << "[CUSTOM_FALL] ID:" << obj_id << " RedTrend:" << red_trend_down 
+                              << " AreaTrend:" << area_trend_down << " InconCount:" << hist.inconsistent_count << std::endl;
+                }
+            }
+
+            // Draw Major Axis for top 2
+            float major = f_obj.major;
+            float angle_pca = f_obj.angle;
+            float cx = f_obj.cx;
+            float cy = f_obj.cy;
+            float cos_a = std::cos(angle_pca);
+            float sin_a = std::sin(angle_pca);
+            int maj_x1 = (int)(cx - (major/2.0f) * cos_a);
+            int maj_y1 = (int)(cy - (major/2.0f) * sin_a);
+            int maj_x2 = (int)(cx + (major/2.0f) * cos_a);
+            int maj_y2 = (int)(cy + (major/2.0f) * sin_a);
+            drawArrow(ff_viz_img, W, H, maj_x1, maj_y1, maj_x2, maj_y2, 255, 255, 0, 2);
+        }
+
+        // Override SDK fall signal
+        static int custom_hold_frames = 0;
+        if (custom_fall_signal) custom_hold_frames = 30; // Hold for 1 second at 30fps
+        
+        // Reset original flag and use custom one
+        is_fall_in_current_frame = (custom_hold_frames > 0);
+        if (custom_hold_frames > 0) custom_hold_frames--;
+
+        // Interval Tracking Logic (Moved here)
+        if (is_fall_in_current_frame) {
+            if (!is_currently_falling) {
+                is_currently_falling = true;
+                fall_start_frame = i;
+            }
+        } else {
+            if (is_currently_falling) {
+                is_currently_falling = false;
+                if (f_interval.is_open()) {
+                     f_interval << fall_start_frame << "," << (i - 1) << "\n";
+                     f_interval.flush(); // Ensure written
+                     detected_intervals_vec.push_back({fall_start_frame, i - 1});
+                     total_fall_events++;
                 }
             }
         }
@@ -1095,13 +1185,13 @@ int main() {
             // The `objects` here come from `sdk.GetMotionObjects()`.
             // Does `detectFallPixelStats` update the SAME list? Yes, `pImpl->current_objects`.
             // So pixel_count should be valid if `detectFallPixelStats` runs.
-            if (f_log_fg.is_open()) f_log_fg << i << " " << obj.id << " " << obj.total_frame_pixel_count << "\n";
+            // f_log_fg moved out of loop to show ONLY largest object count
             
             // NEW METRICS
             if (f_log_accel.is_open()) f_log_accel << i << " " << obj.id << " " << obj.acceleration << "\n";
             // Format: Frame ObjID avgDx avgDy Strength
             if (f_log_speed.is_open()) f_log_speed << i << " " << obj.id << " " << obj.avgDx << " " << obj.avgDy << " " << obj.strength << "\n";
-            if (f_log_bri.is_open())   f_log_bri << i << " " << obj.id << " " << obj.avg_brightness << "\n";
+            // f_log_bri moved out of loop to show ONLY largest object red count
             // ---------------------------------------------------------
             //printf("[Debug] Inside Obj Loop. ID=%d Blocks=%zu MVs=%zu. &obj=%p\n", obj.id, obj.blocks.size(), obj.block_motion_vectors.size(), &obj);
             bool is_fall_obj = (is_fall_in_current_frame && obj.id == max_strength_id);
@@ -1170,26 +1260,6 @@ int main() {
             //printf("[Debug] End Block Loop\n");
             
             // -------------------------------------------------------------
-            // NEW: Filter bg_mask_img using Convex Hull (Match SDK Logic)
-            // -----------------------------------------------------------------------------------------
-// Global Config for Verification
-// -----------------------------------------------------------------------------------------
-// std::string pattern = "0130test_016_02/frame_%05d.rgb";
-// std::string save_dir = "0130test_016_02_bgtest";
-// std::string bedFile = "bed_region_0130test_016_02.txt";
-
-// Regression Test: Data 1 (Side Fall from Bed)
-std::string pattern = "TestData/images_20260116_1_800x450_rgb/frame_%05d.raw";
-std::string save_dir = "0130test_016_01_bgtest";
-std::string bedFile = "TestData/bed_position/20260116_1.txt"; 
-
-int start_frame = 0;
-int num_images = 1922; // Data 1 has 1922 frames
-int W = 800;
-int H = 450;
-int orgW = 1920; 
-int orgH = 1080;
-// -----------------------------------------------------------------------------------------
             /*
             // -------------------------------------------------------------
             // NEW: Axis Calculation (PCA) using Background Reference
@@ -1312,7 +1382,11 @@ int orgH = 1080;
                     std::cout << "[FALL STATS] Frame " << i << " ObjID " << obj.id << " Acc: " << obj.acceleration << " Str: " << obj.strength << std::endl;
                 } 
             }
-        }
+        } // End of objects loop
+
+        // Log Largest Object Stats (ID 0)
+        if (f_log_fg.is_open())  f_log_fg  << i << " 0 " << largest_obj_pixel_count << "\n";
+        if (f_log_bri.is_open()) f_log_bri << i << " 0 " << largest_obj_red_count << "\n";
         
         // 5. Draw All Vectors (Optional, user asked for "each object vector")
         // "各個物件...還有各物件的向量" -> Handled above.

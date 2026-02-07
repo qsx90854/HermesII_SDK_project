@@ -81,6 +81,11 @@ struct InternalConfig {
     float bed_exit_min_outside_ratio = 0.6f;
     bool enable_bed_exit_verification = true; // NEW
     bool enable_block_shrink_verification = true; // NEW
+
+    // Optical Flow
+    int opt_flow_frame_distance = 3;
+    int perspective_point_x = 416;
+    int perspective_point_y = 474;
 };
 
 class FallDetector {

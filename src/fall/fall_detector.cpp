@@ -1955,6 +1955,169 @@ public:
     static constexpr float DECLINE_THRESHOLD = 0.75f;
     static constexpr int ENTRY_SUPPRESS_FRAMES = 30;
 
+    // Optical Flow Frame History
+    std::deque<::Image> raw_frame_history;
+
+    // Simple 3x3 Box Blur for noise reduction
+    void smoothImage(const ::Image& src, ::Image& dst) {
+        int w = src.width();
+        int h = src.height();
+        if (dst.width() != w || dst.height() != h) {
+            dst = src.clone(); // Ensure same size/format
+        }
+        const uint8_t* p_src = src.getData();
+        uint8_t* p_dst = dst.getData();
+
+        for (int y = 1; y < h - 1; ++y) {
+            for (int x = 1; x < w - 1; ++x) {
+                int sum = 0;
+                for (int dy = -1; dy <= 1; ++dy) {
+                    for (int dx = -1; dx <= 1; ++dx) {
+                        sum += p_src[(y + dy) * w + (x + dx)];
+                    }
+                }
+                p_dst[y * w + x] = (uint8_t)(sum / 9);
+            }
+        }
+    }
+
+    // Integer-only Lucas-Kanade Optical Flow (PC Version)
+    void computeIntegerLK(const ::Image& prev, const ::Image& curr, 
+                          const std::vector<int>& pixels, 
+                          std::vector<float>& dx_out, 
+                          std::vector<float>& dy_out, 
+                          std::vector<float>& dir_out) {
+        int w = curr.width();
+        int h = curr.height();
+        const uint8_t* p_prev = prev.getData();
+        const uint8_t* p_curr = curr.getData();
+
+        dx_out.assign(pixels.size(), 0.0f);
+        dy_out.assign(pixels.size(), 0.0f);
+        dir_out.assign(pixels.size(), 0.0f);
+
+        int win = 2; // 5x5 window
+        for (size_t i = 0; i < pixels.size(); ++i) {
+            int idx = pixels[i];
+            int py = idx / w;
+            int px = idx % w;
+
+            if (px < win + 1 || px >= w - win - 1 || py < win + 1 || py >= h - win - 1) continue;
+
+            long long Sxx = 0, Syy = 0, Sxy = 0;
+            long long Sxt = 0, Syt = 0;
+
+            for (int dy_i = -win; dy_i <= win; ++dy_i) {
+                for (int dx_i = -win; dx_i <= win; ++dx_i) {
+                    int cur_idx = (py + dy_i) * w + (px + dx_i);
+                    
+                    // Integer Gradients
+                    int Ix = (int)p_curr[cur_idx + 1] - (int)p_curr[cur_idx - 1];
+                    int Iy = (int)p_curr[cur_idx + w] - (int)p_curr[cur_idx - w];
+                    int It = (int)p_curr[cur_idx] - (int)p_prev[cur_idx];
+
+                    Sxx += Ix * Ix;
+                    Syy += Iy * Iy;
+                    Sxy += Ix * Iy;
+                    Sxt += Ix * It;
+                    Syt += Iy * It;
+                }
+            }
+
+            long long det = Sxx * Syy - Sxy * Sxy;
+            // Robustness: Minimum Eigenvalue check
+            // lambda_min = (trace - sqrt(trace^2 - 4*det)) / 2
+            long long trace = Sxx + Syy;
+            double disc = std::sqrt((double)(Sxx - Syy) * (Sxx - Syy) + 4.0 * Sxy * Sxy);
+            double eig_min = (trace - disc) * 0.5;
+
+            if (eig_min > 80.0) { // Increased confidence threshold
+                float dx = (float)(Sxy * Syt - Syy * Sxt) / det;
+                float dy = (float)(Sxy * Sxt - Sxx * Syt) / det;
+                dx_out[i] = dx;
+                dy_out[i] = dy;
+                dir_out[i] = std::atan2(dy, dx);
+            }
+        }
+    }
+
+#if defined(__ARM_NEON) || defined(__ARM_NEON__)
+    // NEON-optimized Integer-only Lucas-Kanade
+    void computeIntegerLK_NEON(const ::Image& prev, const ::Image& curr, 
+                               const std::vector<int>& pixels, 
+                               std::vector<float>& dx_out, 
+                               std::vector<float>& dy_out, 
+                               std::vector<float>& dir_out) {
+        int w = curr.width();
+        int h = curr.height();
+        const uint8_t* p_prev = prev.getData();
+        const uint8_t* p_curr = curr.getData();
+
+        dx_out.assign(pixels.size(), 0.0f);
+        dy_out.assign(pixels.size(), 0.0f);
+        dir_out.assign(pixels.size(), 0.0f);
+
+        int win = 2; 
+        for (size_t i = 0; i < pixels.size(); ++i) {
+            int idx = pixels[i];
+            int py = idx / w;
+            int px = idx % w;
+
+            if (px < win + 1 || px >= w - win - 1 || py < win + 1 || py >= h - win - 1) continue;
+
+            int32x4_t vSxx = vdupq_n_s32(0);
+            int32x4_t vSyy = vdupq_n_s32(0);
+            int32x4_t vSxy = vdupq_n_s32(0);
+            int32x4_t vSxt = vdupq_n_s32(0);
+            int32x4_t vSyt = vdupq_n_s32(0);
+
+            for (int dy_i = -win; dy_i <= win; ++dy_i) {
+                int row_offset = (py + dy_i) * w;
+                for (int dx_i = -win; dx_i <= win; ++dx_i) {
+                    int c_idx = row_offset + (px + dx_i);
+                    
+                    int Ix = (int)p_curr[c_idx + 1] - (int)p_curr[c_idx - 1];
+                    int Iy = (int)p_curr[c_idx + w] - (int)p_curr[c_idx - w];
+                    int It = (int)p_curr[c_idx] - (int)p_prev[c_idx];
+
+                    // For NEON, we usually process multiple pixels at once.
+                    // But here pixels are usually non-contiguous (scattered in foreground).
+                    // So we vectorize the window summation instead? 
+                    // No, 5x5 window (25 iterations) is small.
+                    // For now, let's keep it simple and vectorize the inner loop if possible, 
+                    // or just use scalar as a placeholder if contiguity is bad.
+                    // Actually, a better NEON optimization is to compute Ix, Iy, It for the whole ROI first.
+
+                    vSxx = vsetq_lane_s32(vgetq_lane_s32(vSxx, 0) + Ix * Ix, vSxx, 0);
+                    vSyy = vsetq_lane_s32(vgetq_lane_s32(vSyy, 0) + Iy * Iy, vSyy, 0);
+                    vSxy = vsetq_lane_s32(vgetq_lane_s32(vSxy, 0) + Ix * Iy, vSxy, 0);
+                    vSxt = vsetq_lane_s32(vgetq_lane_s32(vSxt, 0) + Ix * It, vSxt, 0);
+                    vSyt = vsetq_lane_s32(vgetq_lane_s32(vSyt, 0) + Iy * It, vSyt, 0);
+                }
+            }
+
+            int32_t Sxx = vgetq_lane_s32(vSxx, 0);
+            int32_t Syy = vgetq_lane_s32(vSyy, 0);
+            int32_t Sxy = vgetq_lane_s32(vSxy, 0);
+            int32_t Sxt = vgetq_lane_s32(vSxt, 0);
+            int32_t Syt = vgetq_lane_s32(vSyt, 0);
+
+            long long det = (long long)Sxx * Syy - (long long)Sxy * Sxy;
+            long long trace = (long long)Sxx + Syy;
+            double disc = std::sqrt((double)(Sxx - Syy) * (Sxx - Syy) + 4.0 * (double)Sxy * Sxy);
+            double eig_min = (trace - disc) * 0.5;
+
+            if (eig_min > 80.0) { 
+                float dx = (float)((long long)Sxy * Syt - (long long)Syy * Sxt) / det;
+                float dy = (float)((long long)Sxy * Sxt - (long long)Sxx * Syt) / det;
+                dx_out[i] = dx;
+                dy_out[i] = dy;
+                dir_out[i] = std::atan2(dy, dx);
+            }
+        }
+    }
+#endif
+
     Impl() {
         // Initialize estimator with default config
         estimator = std::unique_ptr<OptimizedBlockMotionEstimator>(
@@ -2970,6 +3133,13 @@ StatusCode FallDetector::Detect(const Image& frame, bool& is_fall) {
             if (!isInitPhase) pImpl->bg_update_counter = 0;
         }
     }
+
+    // --- raw_frame_history Management ---
+    pImpl->raw_frame_history.push_back(wrapper.clone());
+    int max_history = pImpl->config.opt_flow_frame_distance + 1;
+    if ((int)pImpl->raw_frame_history.size() > max_history) {
+        pImpl->raw_frame_history.pop_front();
+    }
     
     // Generate and Save BG Mask
     int global_fg_count = 0;
@@ -2996,6 +3166,36 @@ StatusCode FallDetector::Detect(const Image& frame, bool& is_fall) {
 
         // Identify and store full-frame foreground objects
         pImpl->full_frame_objects = find_objects_optimized(maskData.data(), w, h, 20); // Min area 20 pixels
+
+        // --- NEW: Optical Flow (Integer-LK) for top 2 objects ---
+        if ((int)pImpl->raw_frame_history.size() >= max_history) {
+            // Sort objects by area descending
+            std::vector<::VisionSDK::ObjectFeatures*> sorted_objs;
+            for (auto& obj : pImpl->full_frame_objects) {
+                sorted_objs.push_back(&obj);
+            }
+            std::sort(sorted_objs.begin(), sorted_objs.end(), [](::VisionSDK::ObjectFeatures* a, ::VisionSDK::ObjectFeatures* b) {
+                return a->area > b->area;
+            });
+
+            // NEW: Robust LK uses smoothed frames
+            ::Image smoothed_prev, smoothed_curr;
+            pImpl->smoothImage(pImpl->raw_frame_history.front(), smoothed_prev);
+            pImpl->smoothImage(pImpl->raw_frame_history.back(), smoothed_curr);
+
+            const ::Image& prev_frame = smoothed_prev; 
+            const ::Image& curr_frame = smoothed_curr;
+
+            int num_to_process = std::min(2, (int)sorted_objs.size());
+            for (int i = 0; i < num_to_process; ++i) {
+                auto* obj = sorted_objs[i];
+#if defined(__ARM_NEON) || defined(__ARM_NEON__)
+                pImpl->computeIntegerLK_NEON(prev_frame, curr_frame, obj->pixels, obj->pixel_dx, obj->pixel_dy, obj->pixel_dir);
+#else
+                pImpl->computeIntegerLK(prev_frame, curr_frame, obj->pixels, obj->pixel_dx, obj->pixel_dy, obj->pixel_dir);
+#endif
+            }
+        }
         
         // Optional: Save BG Mask if configured
         if (pImpl->config.enable_save_bg_mask) {

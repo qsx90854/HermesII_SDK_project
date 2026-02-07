@@ -131,6 +131,9 @@ StatusCode VisionSDK::VisionSDK::SetConfig(const void* config) {
             pImpl->config.post_fall_check_frames = c->post_fall_check_frames;
             pImpl->config.enable_bed_exit_verification = c->enable_bed_exit_verification; // NEW
             pImpl->config.enable_block_shrink_verification = c->enable_block_shrink_verification; // NEW
+            pImpl->config.opt_flow_frame_distance = c->opt_flow_frame_distance;
+            pImpl->config.perspective_point_x = c->perspective_point_x;
+            pImpl->config.perspective_point_y = c->perspective_point_y;
             break;
         }
         case ConfigType::BedExitDetection_v1: {
