@@ -393,9 +393,15 @@ const int DELAY_FRAMES = 30;
 struct ObjStatsHistory {
     std::deque<int> area_hist;
     std::deque<int> red_hist;
+    std::deque<float> lk_strength_hist; 
+    std::deque<float> sad_strength_hist; // for sliding peak
+    std::deque<float> sad_accel_hist;    // for sliding peak
     int inconsistent_count = 0;
     bool red_down_trend_triggered = false;
     int frames_since_red_trigger = 0;
+    float current_lk_strength = 0.0f;
+    float current_lk_accel = 0.0f;
+    int last_update_frame = -1; // Prevent duplicate updates
 };
 std::map<int, ObjStatsHistory> obj_histories;
 
@@ -872,6 +878,9 @@ int main(int argc, char** argv) {
             const auto& f_obj = ff_objs[i_obj];
             int red_count = 0;
             
+            float lk_sum_speed = 0.0f;
+            int lk_pix_count = 0;
+            
             for (size_t i_pix = 0; i_pix < f_obj.pixels.size(); ++i_pix) {
                 int pix_idx = f_obj.pixels[i_pix];
                 if (pix_idx >= 0 && pix_idx < W * H) {
@@ -885,6 +894,9 @@ int main(int argc, char** argv) {
                         float dy = f_obj.pixel_dy[i_pix];
                         float angle = f_obj.pixel_dir[i_pix]; // Radians
                         float speed = std::sqrt(dx*dx + dy*dy);
+                        
+                        lk_sum_speed += speed;
+                        lk_pix_count++;
 
                         // Downward is PI/2 (90 deg). PI/2 +/- 40 deg => [50 deg, 130 deg]
                         // 50 deg = 0.8726 rad, 130 deg = 2.2689 rad
@@ -905,12 +917,54 @@ int main(int argc, char** argv) {
             }
 
             // --- Custom Fall Logic Tracking ---
-            int obj_id = f_obj.id;
+            // Match Foreground blob to persistent tracked SAD object to use persistent ID for trends
+            int persistent_id = f_obj.id; 
+            float min_dist = 1e9;
+            float block_w = (float)W / motionCfg.grid_cols;
+            float block_h = (float)H / motionCfg.grid_rows;
+
+            for (const auto& s_obj : objects) {
+                float sx = (s_obj.centerX + 0.5f) * block_w;
+                float sy = (s_obj.centerY + 0.5f) * block_h;
+                float dx = sx - f_obj.cx;
+                float dy = sy - f_obj.cy;
+                float dist = std::sqrt(dx*dx + dy*dy);
+                if (dist < min_dist) {
+                    min_dist = dist;
+                    persistent_id = s_obj.id;
+                }
+            }
+
+            // Strict match: 80 pixels (Confirmed scale is correct)
+            if (min_dist > 80.0f) persistent_id = (f_obj.id + 5000); 
+
+            int obj_id = persistent_id;
             auto& hist = obj_histories[obj_id];
-            hist.area_hist.push_back(f_obj.area);
-            hist.red_hist.push_back(red_count);
-            if (hist.area_hist.size() > 30) hist.area_hist.pop_front();
-            if (hist.red_hist.size() > 30) hist.red_hist.pop_front();
+            
+            if (hist.last_update_frame != (int)i) {
+                hist.area_hist.push_back(f_obj.area);
+                hist.red_hist.push_back(red_count);
+                
+                float current_lk_s = (lk_pix_count > 0) ? (lk_sum_speed / lk_pix_count) : 0.0f;
+                hist.current_lk_accel = 0.0f;
+                if (!hist.lk_strength_hist.empty()) {
+                    hist.current_lk_accel = current_lk_s - hist.lk_strength_hist.back();
+                }
+                hist.current_lk_strength = current_lk_s;
+                hist.lk_strength_hist.push_back(current_lk_s);
+
+                if (hist.area_hist.size() > 30) hist.area_hist.pop_front();
+                if (hist.red_hist.size() > 30) hist.red_hist.pop_front();
+                if (hist.lk_strength_hist.size() > 30) hist.lk_strength_hist.pop_front();
+                
+                hist.last_update_frame = i;
+            } else {
+                // If matched multiple times, pick largest
+                if (f_obj.area > hist.area_hist.back()) {
+                    hist.area_hist.back() = f_obj.area;
+                    hist.red_hist.back() = red_count;
+                }
+            }
 
             bool red_trend_down = false;
             bool area_trend_down = false;
@@ -923,14 +977,8 @@ int main(int argc, char** argv) {
                     first_10_area += hist.area_hist[j];
                     last_10_area += hist.area_hist[20+j];
                 }
-                if (first_10_red > 10 && last_10_red < first_10_red * 0.8f) red_trend_down = true;
-                if (first_10_area > 100 && last_10_area < first_10_area * 0.9f) area_trend_down = true;
-            }
-
-            // Condition 1: Red trend down in 30 frames
-            if (red_trend_down) {
-                hist.red_down_trend_triggered = true;
-                hist.frames_since_red_trigger = 0;
+                if (first_10_red > 200 && last_10_red < first_10_red * 0.7f) red_trend_down = true;
+                if (first_10_area > 500 && last_10_area < first_10_area * 0.85f) area_trend_down = true;
             }
 
             // Axial Inconsistency Check
@@ -944,21 +992,54 @@ int main(int argc, char** argv) {
             if (hist.red_down_trend_triggered) {
                 hist.frames_since_red_trigger++;
                 if (inconsistent) hist.inconsistent_count++;
-                else hist.inconsistent_count = 0;
+                else hist.inconsistent_count = std::max(0, (int)hist.inconsistent_count - 1); // Slow decay instead of instant reset
 
-                // Stop tracking after some time if logic never fully triggers
-                if (hist.frames_since_red_trigger > 120) {
+                // Stop tracking after some time (about 5 seconds)
+                // AND enter a mandatory cool-off period of 300 frames (10 seconds)
+                if (hist.frames_since_red_trigger > 150) {
                     hist.red_down_trend_triggered = false;
                     hist.inconsistent_count = 0;
+                    hist.frames_since_red_trigger = -300; // Use negative as cool-off countdown
                 }
+            } else if (hist.frames_since_red_trigger < 0) {
+                hist.frames_since_red_trigger++; // Cool-off progress
+            }
+
+            // Condition 1: Red trend down in 30 frames
+            // ONLY start a new latch if not already in one AND not in cool-off
+            if (red_trend_down && !hist.red_down_trend_triggered && hist.frames_since_red_trigger == 0) {
+                hist.red_down_trend_triggered = true;
+                hist.frames_since_red_trigger = 0;
             }
 
             // Final Custom Signal Decision
+            // Logic: (Condition 1: Red Trend Down) AND (2-a: Area Trend Down OR 2-b: Acute Angle Inconsistency)
             if (hist.red_down_trend_triggered) {
-                if (area_trend_down || hist.inconsistent_count > 60) {
+                // Calculate Sliding Peaks from 30 frame buffer (for logging/analysis)
+                float max_sad_s = 0, max_sad_a = 0;
+                for (float s : hist.sad_strength_hist) if (s > max_sad_s) max_sad_s = s;
+                for (float a : hist.sad_accel_hist) if (a > max_sad_a) max_sad_a = a;
+
+                // Condition 2-b: immediate angle inconsistency (using a 10-frame debounce to avoid flicker)
+                bool angle_fail = (hist.inconsistent_count > 10);
+                
+                // Human-size guard: Real falls are usually > 300 pixels
+                bool size_ok = (f_obj.area > 300 && f_obj.area < 30000);
+                
+                // Physical Strength Guard: Low-energy noise filtered
+                bool motion_ok = (max_sad_s > 1.5f);
+
+                // Anti-persistence: Limit trigger duration
+                bool in_trigger_window = (hist.frames_since_red_trigger < 120); 
+
+                if (size_ok && motion_ok && in_trigger_window && (area_trend_down || angle_fail)) {
                     custom_fall_signal = true;
-                    std::cout << "[CUSTOM_FALL] ID:" << obj_id << " RedTrend:" << red_trend_down 
-                              << " AreaTrend:" << area_trend_down << " InconCount:" << hist.inconsistent_count << std::endl;
+                    std::string reason = area_trend_down ? "AreaTrend" : "AngleIncon";
+                    if (area_trend_down && angle_fail) reason = "Both";
+
+                    std::cout << "[CUSTOM_FALL] Frame:" << i << " ID:" << obj_id << " Target:" << reason 
+                              << " RedTrend:1" << " AreaTrend:" << area_trend_down << " InconCount:" << hist.inconsistent_count 
+                              << " MaxStr:" << max_sad_s << " MaxAcc:" << max_sad_a << " Area:" << f_obj.area << std::endl;
                 }
             }
 
@@ -1189,8 +1270,25 @@ int main(int argc, char** argv) {
             
             // NEW METRICS
             if (f_log_accel.is_open()) f_log_accel << i << " " << obj.id << " " << obj.acceleration << "\n";
-            // Format: Frame ObjID avgDx avgDy Strength
-            if (f_log_speed.is_open()) f_log_speed << i << " " << obj.id << " " << obj.avgDx << " " << obj.avgDy << " " << obj.strength << "\n";
+            
+            if (obj_histories.count(obj.id)) {
+                auto& hist = obj_histories[obj.id];
+                hist.sad_strength_hist.push_back(obj.strength);
+                hist.sad_accel_hist.push_back(obj.acceleration);
+                if (hist.sad_strength_hist.size() > 30) hist.sad_strength_hist.pop_front();
+                if (hist.sad_accel_hist.size() > 30) hist.sad_accel_hist.pop_front();
+            }
+            
+            // Re-map speed log to LK metrics for the primary tracked objects
+            // Format: Frame ObjID LK_Strength LK_Acceleration SAD_Strength
+            float lk_s = 0, lk_a = 0;
+            if (obj_histories.count(obj.id)) {
+                lk_s = obj_histories[obj.id].current_lk_strength;
+                lk_a = obj_histories[obj.id].current_lk_accel;
+            }
+            if (f_log_speed.is_open()) {
+                f_log_speed << i << " " << obj.id << " " << lk_s << " " << lk_a << " " << obj.strength << "\n";
+            }
             // f_log_bri moved out of loop to show ONLY largest object red count
             // ---------------------------------------------------------
             //printf("[Debug] Inside Obj Loop. ID=%d Blocks=%zu MVs=%zu. &obj=%p\n", obj.id, obj.blocks.size(), obj.block_motion_vectors.size(), &obj);
