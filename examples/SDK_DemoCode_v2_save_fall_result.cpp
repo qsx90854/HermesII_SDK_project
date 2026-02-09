@@ -13,6 +13,7 @@
 #include <deque>
 #include <map>
 #include <sstream>
+#include <set>
 
 #define STB_IMAGE_WRITE_IMPLEMENTATION
 #include "stb_image_write.h"
@@ -124,6 +125,22 @@ void drawArrow(std::vector<uint8_t>& img, int w, int h, int x1, int y1, int x2, 
     // Draw Wings
     drawLine(img, w, h, x2, y2, p1x, p1y, r, g, b, thickness);
     drawLine(img, w, h, x2, y2, p2x, p2y, r, g, b, thickness);
+}
+
+bool isPointInConvexQuad(const std::vector<std::pair<float, float>>& poly, float px, float py) {
+    if (poly.size() < 3) return false;
+    bool positive = false;
+    bool negative = false;
+    for (size_t i = 0; i < poly.size(); ++i) {
+        float x1 = poly[i].first;
+        float y1 = poly[i].second;
+        float x2 = poly[(i + 1) % poly.size()].first;
+        float y2 = poly[(i + 1) % poly.size()].second;
+        float cross_product = (x2 - x1) * (py - y1) - (y2 - y1) * (px - x1);
+        if (cross_product > 0) positive = true;
+        if (cross_product < 0) negative = true;
+    }
+    return !(positive && negative);
 }
 
 // Minimal 5x7 bitmap font helper (for text)
@@ -302,6 +319,8 @@ int pH = 450;
 bool enable_save_face_images = false;
 bool is_fall_in_current_frame = false;
 bool is_strong_fall = false;
+bool custom_fall_signal = false;
+std::string current_frame_reasons = "";
 bool is_bed_exit_in_current_frame = false;
 int global_fall_event_id = 0;
 int fall_red_box_countdown = 0;
@@ -391,11 +410,25 @@ const int DELAY_FRAMES = 30;
 
 // Custom Fall Logic History
 struct ObjStatsHistory {
+    // Short-term history (30 frames)
     std::deque<int> area_hist;
     std::deque<int> red_hist;
     std::deque<float> lk_strength_hist; 
     std::deque<float> sad_strength_hist; // for sliding peak
     std::deque<float> sad_accel_hist;    // for sliding peak
+    
+    // NEW: Long-term history (120 frames) for peak-valley detection
+    std::deque<int> red_hist_long;
+    std::deque<int> area_hist_long;
+    
+    // NEW: Peak-valley tracking
+    int red_peak_value = 0;           // Recorded peak value
+    int red_peak_frame_offset = -1;   // Frames since peak
+    bool in_decline_phase = false;    // Whether in decline phase
+    int decline_start_frame = -1;     // Frame offset when decline started
+    int low_value_counter = 0;        // Frames maintaining low value
+    
+    // Original fields
     int inconsistent_count = 0;
     bool red_down_trend_triggered = false;
     int frames_since_red_trigger = 0;
@@ -489,6 +522,7 @@ int main(int argc, char** argv) {
     fallCfg.fall_acceleration_threshold = (float)cfg.getFloat("FallDetect.Fall_Detect_Acceleration_Threshold", 5.0f);
     fallCfg.fall_acceleration_upper_threshold = (float)cfg.getFloat("FallDetect.Fall_Detect_Accel_Upper_Threshold", 2.0f);
     fallCfg.fall_acceleration_lower_threshold = (float)cfg.getFloat("FallDetect.Fall_Detect_Accel_Lower_Threshold", -2.0f);
+    float bed_pixel_ratio_threshold = (float)cfg.getFloat("FallDetect.Fall_Detect_Bed_Pixel_Ratio_Threshold", 0.3f);
     fallCfg.safe_area_ratio_threshold = (float)cfg.getFloat("FallDetect.Safe_Area_Ratio_Threshold", 0.5);
     fallCfg.fall_window_size = cfg.getInt("FallDetect.Fall_Detect_Frame_History_Length", 30);
     fallCfg.fall_duration = cfg.getInt("FallDetect.Fall_Detect_Frame_History_Threshold", 5);
@@ -629,7 +663,12 @@ int main(int argc, char** argv) {
     
     
     // Stored Intervals for Verification
-    std::vector<std::pair<int, int>> detected_intervals_vec;
+    struct FallInterval {
+        int start;
+        int end;
+        std::string reasons;
+    };
+    std::vector<FallInterval> detected_intervals_vec;
 
     // Main processing loop
     int total_frames = start_frame + num_images; // Define total_frames based on existing variables
@@ -887,7 +926,12 @@ int main(int argc, char** argv) {
                     int py = pix_idx / W;
                     int px = pix_idx % W;
 
-                    uint8_t r = 120, g = 120, b = 120; // Default Gray
+                    uint8_t r, g, b;
+                    if (i_obj == 0) {
+                        r = 100; g = 100; b = 255; // Light Blue for largest group base
+                    } else {
+                        r = 120; g = 120; b = 120; // Gray for others
+                    }
 
                     if (i_pix < f_obj.pixel_dx.size()) {
                         float dx = f_obj.pixel_dx[i_pix];
@@ -901,7 +945,11 @@ int main(int argc, char** argv) {
                         // Downward is PI/2 (90 deg). PI/2 +/- 40 deg => [50 deg, 130 deg]
                         // 50 deg = 0.8726 rad, 130 deg = 2.2689 rad
                         if (speed > opt_flow_vel_threshold && angle >= 0.8726f && angle <= 2.2689f) {
-                            r = 255; g = 0; b = 0; // Red
+                            if (i_obj == 0) {
+                                r = 255; g = 255; b = 0; // Yellow for largest group "red" points
+                            } else {
+                                r = 255; g = 0; b = 0; // Red for others
+                            }
                             red_count++;
                         }
                     }
@@ -942,8 +990,13 @@ int main(int argc, char** argv) {
             auto& hist = obj_histories[obj_id];
             
             if (hist.last_update_frame != (int)i) {
+                // Short-term history (30 frames)
                 hist.area_hist.push_back(f_obj.area);
                 hist.red_hist.push_back(red_count);
+                
+                // NEW: Long-term history (120 frames)
+                hist.red_hist_long.push_back(red_count);
+                hist.area_hist_long.push_back(f_obj.area);
                 
                 float current_lk_s = (lk_pix_count > 0) ? (lk_sum_speed / lk_pix_count) : 0.0f;
                 hist.current_lk_accel = 0.0f;
@@ -953,9 +1006,14 @@ int main(int argc, char** argv) {
                 hist.current_lk_strength = current_lk_s;
                 hist.lk_strength_hist.push_back(current_lk_s);
 
+                // Maintain short-term buffer size (30 frames)
                 if (hist.area_hist.size() > 30) hist.area_hist.pop_front();
                 if (hist.red_hist.size() > 30) hist.red_hist.pop_front();
                 if (hist.lk_strength_hist.size() > 30) hist.lk_strength_hist.pop_front();
+                
+                // NEW: Maintain long-term buffer size (120 frames)
+                if (hist.red_hist_long.size() > 120) hist.red_hist_long.pop_front();
+                if (hist.area_hist_long.size() > 120) hist.area_hist_long.pop_front();
                 
                 hist.last_update_frame = i;
             } else {
@@ -966,22 +1024,97 @@ int main(int argc, char** argv) {
                 }
             }
 
-            bool red_trend_down = false;
-            bool area_trend_down = false;
-            if (hist.red_hist.size() == 30) {
-                float first_10_red = 0, last_10_red = 0;
-                float first_10_area = 0, last_10_area = 0;
-                for(int j=0; j<10; ++j) {
-                    first_10_red += hist.red_hist[j];
-                    last_10_red += hist.red_hist[20+j];
-                    first_10_area += hist.area_hist[j];
-                    last_10_area += hist.area_hist[20+j];
+
+            // ========== NEW: Peak-Valley Detection Algorithm ==========
+            bool fall_detected = false;
+            int peak_red = 0;
+            int peak_idx = -1;
+            float decline_ratio = 0.0f;
+            float recent_avg_red = 0.0f;
+            bool area_declined = false;
+            
+            // Need at least 60 frames of history for peak detection
+            if (hist.red_hist_long.size() >= 60) {
+                
+                // Step 1: Find peak in past 60-120 frames
+                int history_size = hist.red_hist_long.size();
+                
+                // Search from at least 30 frames ago, up to 90 frames ago
+                int search_start = std::max(30, history_size - 90);
+                int search_end = history_size - 5; // Leave 5-frame buffer
+                
+                for (int idx = search_start; idx < search_end; ++idx) {
+                    int val = hist.red_hist_long[idx];
+                    
+                    // Check if this is a local peak (higher than +/- 10 frames around it)
+                    bool is_peak = true;
+                    for (int offset = -10; offset <= 10; ++offset) {
+                        if (offset == 0) continue;
+                        int check_idx = idx + offset;
+                        if (check_idx >= 0 && check_idx < history_size) {
+                            if (hist.red_hist_long[check_idx] > val) {
+                                is_peak = false;
+                                break;
+                            }
+                        }
+                    }
+                    
+                    if (is_peak && val > peak_red) {
+                        peak_red = val;
+                        peak_idx = idx;
+                    }
                 }
-                if (first_10_red > 200 && last_10_red < first_10_red * 0.7f) red_trend_down = true;
-                if (first_10_area > 500 && last_10_area < first_10_area * 0.85f) area_trend_down = true;
+                
+                // Step 2: Check for significant decline from peak  
+                // FILTER: 提高peak閾值,過濾低峰值誤判(FP1: peak=372)
+                if (peak_red > 400) { // Raised from 300 to 400
+                    int current_red = hist.red_hist_long.back();
+                    decline_ratio = (float)(peak_red - current_red) / peak_red;
+                    
+                    // Decline must be > 60%
+                    if (decline_ratio > 0.6f) {
+                        
+                        // Step 3: Verify sustained low value
+                        // Check average of recent 30 frames
+                        int recent_sum = 0;
+                        int recent_count = std::min(30, (int)hist.red_hist_long.size());
+                        for (int j = history_size - recent_count; j < history_size; ++j) {
+                            recent_sum += hist.red_hist_long[j];
+                        }
+                        recent_avg_red = (float)recent_sum / recent_count;
+                        
+                        // NEW FILTER: RecentAvg下限 - 過濾物體消失的情況
+                        // Data4 FP: RecentAvg=0-43 (物體離開視野)
+                        // Real falls: RecentAvg=187-345 (人倒在地上仍可見)
+                        if (recent_avg_red < 80.0f) {
+                            // Recent avg太低,可能是物體已離開視野或太小
+                            fall_detected = false;
+                            break; // Exit the peak-valley check
+                        }
+                        
+                        // Recent average must be < 30% of peak (strictened from 40%)
+                        // Real falls: <6.3%, FP1: 32-40%
+                        if (recent_avg_red < peak_red * 0.30f) {
+                            
+                            // Step 4: Check foreground area decline
+                            if (hist.area_hist_long.size() >= 60 && peak_idx >= 0) {
+                                int peak_area = hist.area_hist_long[peak_idx];
+                                int current_area = hist.area_hist_long.back();
+                                
+                                // Area decline > 40%
+                                if (peak_area > 500 && current_area < peak_area * 0.6f) {
+                                    area_declined = true;
+                                }
+                            }
+                            
+                            // Mark as fall detected if area declined
+                            fall_detected = area_declined;
+                        }
+                    }
+                }
             }
 
-            // Axial Inconsistency Check
+            // Axial Inconsistency Check (unchanged)
             float dx_p = f_obj.cx - (float)perspective_x;
             float dy_p = f_obj.cy - (float)perspective_y;
             float p_angle = std::atan2(dy_p, dx_p);
@@ -989,57 +1122,50 @@ int main(int argc, char** argv) {
             while (diff > M_PI/2.0f) diff = std::abs(diff - (float)M_PI);
             bool inconsistent = (diff > 0.785f); // > 45 deg
 
-            if (hist.red_down_trend_triggered) {
-                hist.frames_since_red_trigger++;
-                if (inconsistent) hist.inconsistent_count++;
-                else hist.inconsistent_count = std::max(0, (int)hist.inconsistent_count - 1); // Slow decay instead of instant reset
-
-                // Stop tracking after some time (about 5 seconds)
-                // AND enter a mandatory cool-off period of 300 frames (10 seconds)
-                if (hist.frames_since_red_trigger > 150) {
-                    hist.red_down_trend_triggered = false;
-                    hist.inconsistent_count = 0;
-                    hist.frames_since_red_trigger = -300; // Use negative as cool-off countdown
-                }
-            } else if (hist.frames_since_red_trigger < 0) {
-                hist.frames_since_red_trigger++; // Cool-off progress
-            }
-
-            // Condition 1: Red trend down in 30 frames
-            // ONLY start a new latch if not already in one AND not in cool-off
-            if (red_trend_down && !hist.red_down_trend_triggered && hist.frames_since_red_trigger == 0) {
-                hist.red_down_trend_triggered = true;
-                hist.frames_since_red_trigger = 0;
+            // Complete the fall detection by combining with angle inconsistency
+            if (fall_detected || (inconsistent && hist.red_hist_long.size() >= 60 && peak_red > 400)) {
+                fall_detected = true;
+            } else {
+                fall_detected = false;
             }
 
             // Final Custom Signal Decision
-            // Logic: (Condition 1: Red Trend Down) AND (2-a: Area Trend Down OR 2-b: Acute Angle Inconsistency)
-            if (hist.red_down_trend_triggered) {
-                // Calculate Sliding Peaks from 30 frame buffer (for logging/analysis)
-                float max_sad_s = 0, max_sad_a = 0;
-                for (float s : hist.sad_strength_hist) if (s > max_sad_s) max_sad_s = s;
-                for (float a : hist.sad_accel_hist) if (a > max_sad_a) max_sad_a = a;
-
-                // Condition 2-b: immediate angle inconsistency (using a 10-frame debounce to avoid flicker)
-                bool angle_fail = (hist.inconsistent_count > 10);
+            // Logic: Peak-Valley Decline detected AND (Area declined OR Angle inconsistent)
+            if (fall_detected) {
                 
                 // Human-size guard: Real falls are usually > 300 pixels
                 bool size_ok = (f_obj.area > 300 && f_obj.area < 30000);
-                
-                // Physical Strength Guard: Low-energy noise filtered
-                bool motion_ok = (max_sad_s > 1.5f);
 
-                // Anti-persistence: Limit trigger duration
-                bool in_trigger_window = (hist.frames_since_red_trigger < 120); 
+                // --- Bed Region Filtering ---
+                int in_bed_count = 0;
+                if (!bed_points_sorted.empty()) {
+                    std::vector<std::pair<float, float>> poly;
+                    for(auto& p : bed_points_sorted) poly.push_back({(float)p.first, (float)p.second});
+                    for(int pix_idx : f_obj.pixels) {
+                        int py = pix_idx / W;
+                        int px = pix_idx % W;
+                        if (isPointInConvexQuad(poly, (float)px, (float)py)) {
+                            in_bed_count++;
+                        }
+                    }
+                }
+                float bed_ratio = (f_obj.pixels.size() > 0) ? (float)in_bed_count / f_obj.pixels.size() : 0.0f;
+                bool not_in_bed = (bed_ratio < bed_pixel_ratio_threshold);
 
-                if (size_ok && motion_ok && in_trigger_window && (area_trend_down || angle_fail)) {
+                if (size_ok && not_in_bed) {
                     custom_fall_signal = true;
-                    std::string reason = area_trend_down ? "AreaTrend" : "AngleIncon";
-                    if (area_trend_down && angle_fail) reason = "Both";
-
-                    std::cout << "[CUSTOM_FALL] Frame:" << i << " ID:" << obj_id << " Target:" << reason 
-                              << " RedTrend:1" << " AreaTrend:" << area_trend_down << " InconCount:" << hist.inconsistent_count 
-                              << " MaxStr:" << max_sad_s << " MaxAcc:" << max_sad_a << " Area:" << f_obj.area << std::endl;
+                    
+                    // Detailed Trigger Logging: Peak-Valley Detection
+                    current_frame_reasons += "PeakDecline;";
+                    
+                    std::cout << "[CUSTOM_FALL] Frame:" << i << " ID:" << obj_id 
+                              << " Trigger:PeakDecline"
+                              << " Peak:" << peak_red << " Current:" << hist.red_hist_long.back()
+                              << " Decline:" << (int)(decline_ratio*100) << "%"
+                              << " RecentAvg:" << (int)recent_avg_red
+                              << " BedRatio:" << bed_ratio
+                              << " Area:" << f_obj.area 
+                              << " Inconsistent:" << inconsistent << std::endl;
                 }
             }
 
@@ -1066,10 +1192,21 @@ int main(int argc, char** argv) {
         if (custom_hold_frames > 0) custom_hold_frames--;
 
         // Interval Tracking Logic (Moved here)
+        static std::set<std::string> current_interval_reasons_set;
+
         if (is_fall_in_current_frame) {
             if (!is_currently_falling) {
                 is_currently_falling = true;
                 fall_start_frame = i;
+                current_interval_reasons_set.clear();
+            }
+            if (!current_frame_reasons.empty()) {
+                // Parse "Area;Angle;" into set
+                std::stringstream ss(current_frame_reasons);
+                std::string segment;
+                while(std::getline(ss, segment, ';')) {
+                    if(!segment.empty()) current_interval_reasons_set.insert(segment);
+                }
             }
         } else {
             if (is_currently_falling) {
@@ -1077,7 +1214,11 @@ int main(int argc, char** argv) {
                 if (f_interval.is_open()) {
                      f_interval << fall_start_frame << "," << (i - 1) << "\n";
                      f_interval.flush(); // Ensure written
-                     detected_intervals_vec.push_back({fall_start_frame, i - 1});
+                     
+                     std::string combined_reasons = "";
+                     for(const auto& r : current_interval_reasons_set) combined_reasons += r + " ";
+                     
+                     detected_intervals_vec.push_back({fall_start_frame, (int)(i - 1), combined_reasons});
                      total_fall_events++;
                 }
             }
@@ -1616,7 +1757,12 @@ int main(int argc, char** argv) {
     // Close interval if still falling at end
     if (is_currently_falling && f_interval.is_open()) {
         f_interval << fall_start_frame << "," << (total_frames - 1) << "\n";
-        detected_intervals_vec.push_back({fall_start_frame, total_frames - 1});
+        
+        std::string combined_reasons = "";
+        // reuse static set? No, it's outside main loop now. 
+        // We'll just put "Unknown/AtEnd" or similar if we didn't capture.
+        // But better to just close it.
+        detected_intervals_vec.push_back({fall_start_frame, (int)(total_frames - 1), "AtEnd"});
         total_fall_events++;
     }
     
@@ -1638,8 +1784,8 @@ int main(int argc, char** argv) {
             bool matched = false;
             for(size_t k=0; k<gt_intervals.size(); ++k) {
                 // Expanded Overlap Check
-                int det_start = std::max(0, det.first - tolerance);
-                int det_end = det.second + tolerance;
+                int det_start = std::max(0, det.start - tolerance);
+                int det_end = det.end + tolerance;
                 
                 int overlap_start = std::max(det_start, gt_intervals[k].first);
                 int overlap_end = std::min(det_end, gt_intervals[k].second);
@@ -1689,6 +1835,16 @@ int main(int argc, char** argv) {
             std::cout << "  [" << k << "] " << gt_intervals[k].first << "-" << gt_intervals[k].second << status << "\n";
         }
         report.close();
+    }
+
+    // Append Detailed Detections to Report
+    std::ofstream report_app(f_ver_name, std::ios::app);
+    if(report_app.is_open()) {
+        report_app << "\n--- Detected Intervals ---\n";
+        for(const auto& det : detected_intervals_vec) {
+            report_app << "Start: " << det.start << " End: " << det.end << " Reason: " << det.reasons << "\n";
+        }
+        report_app.close();
     }
     
     // NEW: Save Count File (User Request)

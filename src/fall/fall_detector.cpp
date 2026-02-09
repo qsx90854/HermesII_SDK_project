@@ -1813,6 +1813,485 @@ void detectFallPixelStats(
     return mask;
 }
 
+// ==================================================================================
+//  Pyramid LK Helper Structures & Functions
+// ==================================================================================
+
+namespace LK_Utils {
+
+    // Simple image for signed 16-bit gradients
+    struct ShortImage {
+        int w, h;
+        std::vector<int16_t> data;
+        
+        ShortImage() : w(0), h(0) {}
+        ShortImage(int _w, int _h) : w(_w), h(_h) {
+            data.resize(w * h, 0);
+        }
+    };
+
+    struct ImagePyramid {
+        std::vector<::Image> levels;
+        std::vector<ShortImage> Ix_levels;
+        std::vector<ShortImage> Iy_levels;
+    };
+
+    // NEON-optimized Sobel Gradient
+    void computeGradients(const ::Image& img, ShortImage& Ix, ShortImage& Iy) {
+        int w = img.width();
+        int h = img.height();
+        
+        if (Ix.w != w || Ix.h != h) Ix = ShortImage(w, h);
+        if (Iy.w != w || Iy.h != h) Iy = ShortImage(w, h);
+        
+        const uint8_t* src = img.getData();
+        int16_t* dx = Ix.data.data();
+        int16_t* dy = Iy.data.data();
+        
+        // Zero borders
+        // (Simplified: just zero out for now, can be optimized)
+        std::fill(dx, dx + w, 0); 
+        std::fill(dx + (h - 1) * w, dx + h * w, 0);
+        std::fill(dy, dy + w, 0);
+        std::fill(dy + (h - 1) * w, dy + h * w, 0);
+
+        for (int y = 1; y < h - 1; ++y) {
+            int x = 1;
+            
+#if defined(__ARM_NEON) || defined(__ARM_NEON__)
+            // NEON Implementation
+            for (; x <= w - 1 - 16; x += 16) {
+                // Load 3 rows: top, mid, bot
+                // We need 16+2 pixels for the window (x-1 to x+16)
+                // Load 2 v128 (16 bytes) + overlap? 
+                // Using vld1q_u8 loads 16 bytes.
+                // To get neighbors, we can load unaligned or use tbl?
+                // Unaligned load is easiest on modern ARM.
+                
+                int top_idx = (y - 1) * w + x;
+                int mid_idx = (y) * w + x;
+                int bot_idx = (y + 1) * w + x;
+                
+                // Load p(x-1) .. p(x+16)
+                // We need [x-1, x+15] ? No, for 16 results at x..x+15, we need inputs x-1..x+16
+                // So 18 pixels.
+                
+                uint8x16_t t_m1 = vld1q_u8(src + top_idx - 1);
+                uint8x16_t t_p1 = vld1q_u8(src + top_idx + 1);
+                
+                uint8x16_t m_m1 = vld1q_u8(src + mid_idx - 1); // For Ix: -2*src(x-1)
+                uint8x16_t m_p1 = vld1q_u8(src + mid_idx + 1); // For Ix: +2*src(x+1)
+                
+                uint8x16_t b_m1 = vld1q_u8(src + bot_idx - 1);
+                uint8x16_t b_p1 = vld1q_u8(src + bot_idx + 1);
+                
+                // Also need center col for Iy
+                uint8x16_t t_0 = vld1q_u8(src + top_idx);
+                uint8x16_t b_0 = vld1q_u8(src + bot_idx);
+
+                // Convert to u16
+                uint16x8_t t_m1_L = vmovl_u8(vget_low_u8(t_m1));
+                uint16x8_t t_m1_H = vmovl_u8(vget_high_u8(t_m1));
+                uint16x8_t t_p1_L = vmovl_u8(vget_low_u8(t_p1));
+                uint16x8_t t_p1_H = vmovl_u8(vget_high_u8(t_p1));
+                
+                uint16x8_t m_m1_L = vmovl_u8(vget_low_u8(m_m1));
+                uint16x8_t m_m1_H = vmovl_u8(vget_high_u8(m_m1));
+                uint16x8_t m_p1_L = vmovl_u8(vget_low_u8(m_p1));
+                uint16x8_t m_p1_H = vmovl_u8(vget_high_u8(m_p1));
+
+                uint16x8_t b_m1_L = vmovl_u8(vget_low_u8(b_m1));
+                uint16x8_t b_m1_H = vmovl_u8(vget_high_u8(b_m1));
+                uint16x8_t b_p1_L = vmovl_u8(vget_low_u8(b_p1));
+                uint16x8_t b_p1_H = vmovl_u8(vget_high_u8(b_p1));
+                
+                // Ix = (t_p1 + 2*m_p1 + b_p1) - (t_m1 + 2*m_m1 + b_m1)
+                // Low 8
+                uint16x8_t sum_p_L = vaddq_u16(t_p1_L, vaddq_u16(vshlq_n_u16(m_p1_L, 1), b_p1_L));
+                uint16x8_t sum_m_L = vaddq_u16(t_m1_L, vaddq_u16(vshlq_n_u16(m_m1_L, 1), b_m1_L));
+                int16x8_t ix_L = vsubq_s16(vreinterpretq_s16_u16(sum_p_L), vreinterpretq_s16_u16(sum_m_L));
+
+                // High 8
+                uint16x8_t sum_p_H = vaddq_u16(t_p1_H, vaddq_u16(vshlq_n_u16(m_p1_H, 1), b_p1_H));
+                uint16x8_t sum_m_H = vaddq_u16(t_m1_H, vaddq_u16(vshlq_n_u16(m_m1_H, 1), b_m1_H));
+                int16x8_t ix_H = vsubq_s16(vreinterpretq_s16_u16(sum_p_H), vreinterpretq_s16_u16(sum_m_H));
+                
+                vst1q_s16(dx + (y * w + x), ix_L);
+                vst1q_s16(dx + (y * w + x) + 8, ix_H);
+
+                // Iy = (b_m1 + 2*b_0 + b_p1) - (t_m1 + 2*t_0 + t_p1)
+                uint16x8_t t_0_L = vmovl_u8(vget_low_u8(t_0));
+                uint16x8_t t_0_H = vmovl_u8(vget_high_u8(t_0));
+                uint16x8_t b_0_L = vmovl_u8(vget_low_u8(b_0));
+                uint16x8_t b_0_H = vmovl_u8(vget_high_u8(b_0));
+
+                uint16x8_t sum_b_L = vaddq_u16(b_m1_L, vaddq_u16(vshlq_n_u16(b_0_L, 1), b_p1_L));
+                uint16x8_t sum_t_L = vaddq_u16(t_m1_L, vaddq_u16(vshlq_n_u16(t_0_L, 1), t_p1_L));
+                int16x8_t iy_L = vsubq_s16(vreinterpretq_s16_u16(sum_b_L), vreinterpretq_s16_u16(sum_t_L));
+
+                uint16x8_t sum_b_H = vaddq_u16(b_m1_H, vaddq_u16(vshlq_n_u16(b_0_H, 1), b_p1_H));
+                uint16x8_t sum_t_H = vaddq_u16(t_m1_H, vaddq_u16(vshlq_n_u16(t_0_H, 1), t_p1_H));
+                int16x8_t iy_H = vsubq_s16(vreinterpretq_s16_u16(sum_b_H), vreinterpretq_s16_u16(sum_t_H));
+
+                vst1q_s16(dy + (y * w + x), iy_L);
+                vst1q_s16(dy + (y * w + x) + 8, iy_H);
+            }
+#endif
+            // Scalar fallback/cleanup
+            for (; x < w - 1; ++x) {
+                int cur = y * w + x;
+                int ix = (int)src[cur + 1 - w] - (int)src[cur - 1 - w] +
+                         2 * ((int)src[cur + 1] - (int)src[cur - 1]) +
+                         (int)src[cur + 1 + w] - (int)src[cur - 1 + w];
+                         
+                int iy = (int)src[cur - 1 + w] + 2 * (int)src[cur + w] + (int)src[cur + 1 + w] -
+                        ((int)src[cur - 1 - w] + 2 * (int)src[cur - w] + (int)src[cur + 1 - w]);
+                
+                dx[cur] = (int16_t)ix;
+                dy[cur] = (int16_t)iy;
+            }
+            
+            // Fix Right Border
+            dx[y * w + w - 1] = 0;
+            dy[y * w + w - 1] = 0;
+        }
+    }
+    
+    // Downsample 2x2
+    void downsample(const ::Image& src, ::Image& dst) {
+        int w = src.width();
+        int h = src.height();
+        int nw = w / 2;
+        int nh = h / 2;
+        if (dst.width() != nw || dst.height() != nh || dst.getChannels() != 1) {
+            // Need a way to resize/create. Image class doesn't have realloc in public?
+            // "Image result(new_w, new_h, channels)" - we can assign.
+            // But passed as reference.
+            // Just assume dst is correct size or we can't resize it in place efficiently without assignment.
+            // Actually Image has assignments.
+             dst = ::Image(nw, nh, 1);
+        }
+        
+        const uint8_t* val = src.getData();
+        uint8_t* dval = dst.getData();
+        
+        for(int y=0; y<nh; ++y) {
+            for(int x=0; x<nw; ++x) {
+                int sx = x*2;
+                int sy = y*2;
+                // Simple block average
+                int sum = val[sy*w + sx] + val[sy*w + sx+1] + 
+                          val[(sy+1)*w + sx] + val[(sy+1)*w + sx+1];
+                dval[y*nw + x] = (uint8_t)((sum + 2) >> 2);
+            }
+        }
+    }
+
+    void buildPyramid(const ::Image& img, ImagePyramid& pyr, int levels) {
+        pyr.levels.clear();
+        pyr.Ix_levels.clear();
+        pyr.Iy_levels.clear();
+        
+        // Base level
+        pyr.levels.push_back(img.clone()); // Assuming we might want to keep original or just ref? clone safe.
+        pyr.Ix_levels.resize(levels);
+        pyr.Iy_levels.resize(levels);
+        
+        computeGradients(pyr.levels[0], pyr.Ix_levels[0], pyr.Iy_levels[0]);
+        
+        for(int l=1; l<levels; ++l) {
+            ::Image nextL;
+            downsample(pyr.levels.back(), nextL);
+            pyr.levels.push_back(nextL);
+            computeGradients(nextL, pyr.Ix_levels[l], pyr.Iy_levels[l]);
+        }
+    }
+    void computeLK_Level(const ImagePyramid& prev_pyr, const ImagePyramid& curr_pyr, 
+                         int level, 
+                         float prev_x, float prev_y, 
+                         float& curr_x, float& curr_y) 
+    {
+        const ::Image& prev_img = prev_pyr.levels[level];
+        const ::Image& curr_img = curr_pyr.levels[level];
+        const ShortImage& Ix_img = prev_pyr.Ix_levels[level];
+        const ShortImage& Iy_img = prev_pyr.Iy_levels[level];
+        
+        int w = prev_img.width();
+        int h = prev_img.height();
+        
+        int ix = (int)prev_x;
+        int iy = (int)prev_y;
+        
+        // Win 3 -> 7x7. Boundary Check: Need +3/-3 for win, +1 for bilinear => 4
+        if (ix < 4 || iy < 4 || ix >= w - 4 || iy >= h - 4) return;
+
+        // 1. Compute Spatial Gradient Matrix G (Sum(Ix^2)...) AND mismatch setup
+        // We can precompute this since the window on Prev is fixed.
+        int32_t Gxx = 0, Gxy = 0, Gyy = 0;
+        
+        const int win_r = 3;
+        
+        // NEON Acc
+        
+        for (int dy = -win_r; dy <= win_r; ++dy) {
+            int row_offset = (iy + dy) * w + ix;
+            const int16_t* ptr_Ix = Ix_img.data.data() + row_offset;
+            const int16_t* ptr_Iy = Iy_img.data.data() + row_offset;
+            
+            // Process 7 pixels. Vector 8 (last one masked or unused?)
+            // Just use scalar loop for 7 pixels or vector logic? 
+            // 7 is small. But we can load 8 and mask.
+            // Or just scalar for G matrix since it's only once per point.
+            // Let's optimize robustly.
+            
+            for (int dx = -win_r; dx <= win_r; ++dx) {
+                int16_t valIx = ptr_Ix[dx];
+                int16_t valIy = ptr_Iy[dx];
+                Gxx += valIx * valIx;
+                Gxy += valIx * valIy;
+                Gyy += valIy * valIy;
+            }
+        }
+        
+        // Invert G
+        // det = Gxx*Gyy - Gxy*Gxy
+        float det = (float)((double)Gxx * Gyy - (double)Gxy * Gxy);
+        if (det < 1.0f) return; // Singular
+        
+        float inv_det = 1.0f / det;
+        // invG = [Gyy -Gxy; -Gxy Gxx] * inv_det
+        
+        // 2. Iterations
+        for(int k=0; k<10; ++k) {
+            // Compute b vector: Sum(Ix * dt), Sum(Iy * dt)
+            // dt = Curr(interp) - Prev(exact)
+            // We need to interpolate Curr at (curr_x + dx, curr_y + dy)
+            // Iterate window again.
+            
+            float bx = 0, by = 0;
+            
+            if (curr_x < 3.0f || curr_y < 3.0f || curr_x >= w - 4.0f || curr_y >= h - 4.0f) break;
+
+            int cx_i = (int)curr_x;
+            int cy_i = (int)curr_y;
+            float fx = curr_x - cx_i;
+            float fy = curr_y - cy_i;
+            
+            // Bilinear weights
+            // For NEON: w00, w01, w10, w11
+            // We iterate dy from -3 to 3
+            // For each row in window:
+            //   Prev Row is (iy+dy, ix-3..ix+3)
+            //   Curr Row is (cy_i+dy, cx_i-3..cx_i+3) PLUS bilinear (+1 row, +1 col)
+            //   i.e. we access Curr at Y_row and Y_row+1.
+            
+            // Optimization: Load 8 pixels from Curr Row, interpolating X using NEON (vdup fx)
+            // Then interpolate Y.
+            
+            // Let's allow SCALAR for now inside iteration to guarantee correctness first, 
+            // as this is complex to vectorize without mistakes in blind coding.
+            // The G-matrix vectorization above was skipped, so performance gain comes mainly from Pyramid (less iterations needed at fine scale usually)
+            // But user asked for optimized NEON.
+            // I will implement a simplified NEON loop for the 7 pixels row mismatch.
+            
+            // Precompute weights for current iteration
+            float w00 = (1.0f - fy) * (1.0f - fx);
+            float w01 = (1.0f - fy) * fx;
+            float w10 = fy * (1.0f - fx);
+            float w11 = fy * fx;
+            
+            // Scale by 256 for integer SIMD? Or use float32x4?
+            // Image data is u8. Ix/Iy are s16.
+            // Result b is float (accumulated).
+            // Let's use float32x4 NEON.
+            
+#if defined(__ARM_NEON) || defined(__ARM_NEON__)
+            float32x4_t vBox = vdupq_n_f32(0);
+            float32x4_t vBoy = vdupq_n_f32(0);
+            
+            float32x4_t vW00 = vdupq_n_f32(w00);
+            float32x4_t vW01 = vdupq_n_f32(w01);
+            float32x4_t vW10 = vdupq_n_f32(w10);
+            float32x4_t vW11 = vdupq_n_f32(w11);
+            
+            for (int dy = -win_r; dy <= win_r; ++dy) {
+                // Pointers
+                const uint8_t* pPrev = prev_img.getData() + (iy + dy) * w + ix - win_r;
+                const int16_t* pIx   = Ix_img.data.data() + (iy + dy) * w + ix - win_r;
+                const int16_t* pIy   = Iy_img.data.data() + (iy + dy) * w + ix - win_r;
+                
+                const uint8_t* pCurrRow0 = curr_img.getData() + (cy_i + dy) * w + cx_i - win_r;
+                const uint8_t* pCurrRow1 = curr_img.getData() + (cy_i + dy + 1) * w + cx_i - win_r; // for Y interp
+                
+                // We handle 7 pixels. 
+                // Load 8 (safe since we have border)
+                uint8x8_t vPrev = vld1_u8(pPrev);
+                
+                // Current Rows: Need TR/BR (offset +1). 
+                // Load 8 from offset 0, 8 from offset 1 -> or just load 16 unaligned and pick?
+                // Load 8 is fine. pCurrRow0[0..7] covers -3..+4. logic needs 0..1 (offset).
+                // Wait, if dx goes -3 to +3. p[dx] and p[dx+1].
+                // So index 0..6 need neighbors 1..7.
+                // Loading 8 pixels (0..7) gives neighbors for 0..6!
+                
+                uint8x8_t vC00 = vld1_u8(pCurrRow0);    // Top-Lefts
+                uint8x8_t vC01 = vld1_u8(pCurrRow0+1);  // Top-Rights
+                uint8x8_t vC10 = vld1_u8(pCurrRow1);    // Bot-Lefts
+                uint8x8_t vC11 = vld1_u8(pCurrRow1+1);  // Bot-Rights
+                
+                // Convert to float
+                // Use vmovl to u16 then vcvt to f32?
+                // Only need low 8 bytes (actually only first 7 lanes used).
+                
+                uint16x8_t vPrev16 = vmovl_u8(vPrev);
+                uint16x8_t vC00_16 = vmovl_u8(vC00);
+                uint16x8_t vC01_16 = vmovl_u8(vC01);
+                uint16x8_t vC10_16 = vmovl_u8(vC10);
+                uint16x8_t vC11_16 = vmovl_u8(vC11);
+                
+                float32x4_t vPrevF_L = vcvtq_f32_u32(vmovl_u16(vget_low_u16(vPrev16)));
+                float32x4_t vPrevF_H = vcvtq_f32_u32(vmovl_u16(vget_high_u16(vPrev16)));
+                
+                float32x4_t vC00F_L = vcvtq_f32_u32(vmovl_u16(vget_low_u16(vC00_16)));
+                float32x4_t vC00F_H = vcvtq_f32_u32(vmovl_u16(vget_high_u16(vC00_16)));
+                float32x4_t vC01F_L = vcvtq_f32_u32(vmovl_u16(vget_low_u16(vC01_16)));
+                float32x4_t vC01F_H = vcvtq_f32_u32(vmovl_u16(vget_high_u16(vC01_16)));
+                float32x4_t vC10F_L = vcvtq_f32_u32(vmovl_u16(vget_low_u16(vC10_16)));
+                float32x4_t vC10F_H = vcvtq_f32_u32(vmovl_u16(vget_high_u16(vC10_16)));
+                float32x4_t vC11F_L = vcvtq_f32_u32(vmovl_u16(vget_low_u16(vC11_16)));
+                float32x4_t vC11F_H = vcvtq_f32_u32(vmovl_u16(vget_high_u16(vC11_16)));
+                
+                // Interpolate
+                // val = C00*w00 + C01*w01 + C10*w10 + C11*w11
+                float32x4_t vInterp_L = vmulq_f32(vC00F_L, vW00);
+                vInterp_L = vmlaq_f32(vInterp_L, vC01F_L, vW01);
+                vInterp_L = vmlaq_f32(vInterp_L, vC10F_L, vW10);
+                vInterp_L = vmlaq_f32(vInterp_L, vC11F_L, vW11);
+
+                float32x4_t vInterp_H = vmulq_f32(vC00F_H, vW00);
+                vInterp_H = vmlaq_f32(vInterp_H, vC01F_H, vW01);
+                vInterp_H = vmlaq_f32(vInterp_H, vC10F_H, vW10);
+                vInterp_H = vmlaq_f32(vInterp_H, vC11F_H, vW11);
+                
+                // Diff = Interp - Prev
+                float32x4_t vDiff_L = vsubq_f32(vInterp_L, vPrevF_L);
+                float32x4_t vDiff_H = vsubq_f32(vInterp_H, vPrevF_H);
+                
+                // Load Gradients
+                int16x8_t vIx = vld1q_s16(pIx);
+                int16x8_t vIy = vld1q_s16(pIy);
+                
+                float32x4_t vIxF_L = vcvtq_f32_s32(vmovl_s16(vget_low_s16(vIx)));
+                float32x4_t vIxF_H = vcvtq_f32_s32(vmovl_s16(vget_high_s16(vIx)));
+                float32x4_t vIyF_L = vcvtq_f32_s32(vmovl_s16(vget_low_s16(vIy)));
+                float32x4_t vIyF_H = vcvtq_f32_s32(vmovl_s16(vget_high_s16(vIy)));
+                
+                // Accumulate Sum(Ix*Diff)
+                // Only 7 lanes (index 0..6). Lane 7 should be zeroed or handled.
+                // We'll mask logic later or simpler:
+                // Just use vsetq_lane to 0 for lane 3 of High part (idx 7).
+                vDiff_H = vsetq_lane_f32(0.0f, vDiff_H, 3);
+                
+                vBox = vmlaq_f32(vBox, vIxF_L, vDiff_L);
+                vBox = vmlaq_f32(vBox, vIxF_H, vDiff_H);
+                vBoy = vmlaq_f32(vBoy, vIyF_L, vDiff_L);
+                vBoy = vmlaq_f32(vBoy, vIyF_H, vDiff_H);
+            }
+            
+            // Horizontal Sum
+            bx = vgetq_lane_f32(vBox, 0) + vgetq_lane_f32(vBox, 1) + vgetq_lane_f32(vBox, 2) + vgetq_lane_f32(vBox, 3);
+            by = vgetq_lane_f32(vBoy, 0) + vgetq_lane_f32(vBoy, 1) + vgetq_lane_f32(vBoy, 2) + vgetq_lane_f32(vBoy, 3);
+#else
+            // Scalar Mismatch calculation
+            for (int dy = -win_r; dy <= win_r; ++dy) {
+                int row_offset = (iy + dy) * w + ix;
+                int row_offset_curr = (cy_i + dy) * w + cx_i;
+                for (int dx = -win_r; dx <= win_r; ++dx) {
+                     float valPrev = (float)prev_img.getData()[row_offset + dx]; // Can use direct ptr
+                     float valIx = (float)Ix_img.data[row_offset + dx];
+                     float valIy = (float)Iy_img.data[row_offset + dx];
+                     
+                     // Bilinear sample curr
+                     int c_idx = row_offset_curr + dx;
+                     const uint8_t* ptr = curr_img.getData() + c_idx;
+                     float valCurr = w00 * ptr[0] + w01 * ptr[1] + 
+                                     w10 * ptr[w] + w11 * ptr[w+1];
+                                     
+                     float diff = valCurr - valPrev;
+                     bx += valIx * diff;
+                     by += valIy * diff;
+                }
+            }
+#endif
+            
+            // Compute Delta
+            float delta_x = (Gyy * bx - Gxy * by) * inv_det;
+            float delta_y = (Gxx * by - Gxy * bx) * inv_det;
+            
+            curr_x += delta_x;
+            curr_y += delta_y;
+            
+            if (std::abs(delta_x) < 0.05f && std::abs(delta_y) < 0.05f) break;
+        }
+    }
+    // Pyramid LK Entry Point
+    void computeOpticalFlowPyrLK(const ::Image& prev, const ::Image& curr, 
+                                 const std::vector<int>& pixels, 
+                                 std::vector<float>& dx_out, 
+                                 std::vector<float>& dy_out, 
+                                 std::vector<float>& dir_out,
+                                 int levels=3) 
+    {
+        int w = curr.width();
+        
+        dx_out.assign(pixels.size(), 0.0f);
+        dy_out.assign(pixels.size(), 0.0f);
+        dir_out.assign(pixels.size(), 0.0f);
+        
+        // Build Pyramids
+        ImagePyramid prev_pyr, curr_pyr;
+        buildPyramid(prev, prev_pyr, levels);
+        buildPyramid(curr, curr_pyr, levels);
+        
+        for (size_t i = 0; i < pixels.size(); ++i) {
+            int idx = pixels[i];
+            int py = idx / w;
+            int px = idx % w;
+            
+            // Initial guess (0 flow)
+            float flow_x = 0;
+            float flow_y = 0;
+            
+            // Iterate levels
+            for (int l = levels - 1; l >= 0; --l) {
+                if (l < levels - 1) {
+                    flow_x *= 2.0f;
+                    flow_y *= 2.0f;
+                }
+                
+                float scaler = 1.0f / (float)(1 << l);
+                float p_lvl_x = px * scaler;
+                float p_lvl_y = py * scaler;
+                
+                float c_lvl_x = p_lvl_x + flow_x;
+                float c_lvl_y = p_lvl_y + flow_y;
+                
+                // Refine
+                computeLK_Level(prev_pyr, curr_pyr, l, p_lvl_x, p_lvl_y, c_lvl_x, c_lvl_y);
+                
+                flow_x = c_lvl_x - p_lvl_x;
+                flow_y = c_lvl_y - p_lvl_y;
+            }
+            
+            dx_out[i] = flow_x;
+            dy_out[i] = flow_y;
+            dir_out[i] = std::atan2(dy_out[i], dx_out[i]);
+        }
+    }
+} // namespace LK_Utils
+
+
+
 // Alias or Wrapper for Bed Region Mask
 ::Image createBedRegionMask(int width, int height, const std::vector<std::pair<int, int>>& points) {
     std::vector<std::pair<float, float>> floatPoints;
@@ -1982,139 +2461,25 @@ public:
     }
 
     // Integer-only Lucas-Kanade Optical Flow (PC Version)
+    // Integer-only Lucas-Kanade Optical Flow (Replaced by Pyramid LK)
     void computeIntegerLK(const ::Image& prev, const ::Image& curr, 
                           const std::vector<int>& pixels, 
                           std::vector<float>& dx_out, 
                           std::vector<float>& dy_out, 
                           std::vector<float>& dir_out) {
-        int w = curr.width();
-        int h = curr.height();
-        const uint8_t* p_prev = prev.getData();
-        const uint8_t* p_curr = curr.getData();
-
-        dx_out.assign(pixels.size(), 0.0f);
-        dy_out.assign(pixels.size(), 0.0f);
-        dir_out.assign(pixels.size(), 0.0f);
-
-        int win = 2; // 5x5 window
-        for (size_t i = 0; i < pixels.size(); ++i) {
-            int idx = pixels[i];
-            int py = idx / w;
-            int px = idx % w;
-
-            if (px < win + 1 || px >= w - win - 1 || py < win + 1 || py >= h - win - 1) continue;
-
-            long long Sxx = 0, Syy = 0, Sxy = 0;
-            long long Sxt = 0, Syt = 0;
-
-            for (int dy_i = -win; dy_i <= win; ++dy_i) {
-                for (int dx_i = -win; dx_i <= win; ++dx_i) {
-                    int cur_idx = (py + dy_i) * w + (px + dx_i);
-                    
-                    // Integer Gradients
-                    int Ix = (int)p_curr[cur_idx + 1] - (int)p_curr[cur_idx - 1];
-                    int Iy = (int)p_curr[cur_idx + w] - (int)p_curr[cur_idx - w];
-                    int It = (int)p_curr[cur_idx] - (int)p_prev[cur_idx];
-
-                    Sxx += Ix * Ix;
-                    Syy += Iy * Iy;
-                    Sxy += Ix * Iy;
-                    Sxt += Ix * It;
-                    Syt += Iy * It;
-                }
-            }
-
-            long long det = Sxx * Syy - Sxy * Sxy;
-            // Robustness: Minimum Eigenvalue check
-            // lambda_min = (trace - sqrt(trace^2 - 4*det)) / 2
-            long long trace = Sxx + Syy;
-            double disc = std::sqrt((double)(Sxx - Syy) * (Sxx - Syy) + 4.0 * Sxy * Sxy);
-            double eig_min = (trace - disc) * 0.5;
-
-            if (eig_min > 80.0) { // Increased confidence threshold
-                float dx = (float)(Sxy * Syt - Syy * Sxt) / det;
-                float dy = (float)(Sxy * Sxt - Sxx * Syt) / det;
-                dx_out[i] = dx;
-                dy_out[i] = dy;
-                dir_out[i] = std::atan2(dy, dx);
-            }
-        }
+         // Forward to Pyramid implementation (default 3 levels)
+         LK_Utils::computeOpticalFlowPyrLK(prev, curr, pixels, dx_out, dy_out, dir_out, 3);
     }
 
 #if defined(__ARM_NEON) || defined(__ARM_NEON__)
-    // NEON-optimized Integer-only Lucas-Kanade
+    // NEON-optimized Integer-only Lucas-Kanade (Replaced by Pyramid LK)
     void computeIntegerLK_NEON(const ::Image& prev, const ::Image& curr, 
                                const std::vector<int>& pixels, 
                                std::vector<float>& dx_out, 
                                std::vector<float>& dy_out, 
                                std::vector<float>& dir_out) {
-        int w = curr.width();
-        int h = curr.height();
-        const uint8_t* p_prev = prev.getData();
-        const uint8_t* p_curr = curr.getData();
-
-        dx_out.assign(pixels.size(), 0.0f);
-        dy_out.assign(pixels.size(), 0.0f);
-        dir_out.assign(pixels.size(), 0.0f);
-
-        int win = 2; 
-        for (size_t i = 0; i < pixels.size(); ++i) {
-            int idx = pixels[i];
-            int py = idx / w;
-            int px = idx % w;
-
-            if (px < win + 1 || px >= w - win - 1 || py < win + 1 || py >= h - win - 1) continue;
-
-            int32x4_t vSxx = vdupq_n_s32(0);
-            int32x4_t vSyy = vdupq_n_s32(0);
-            int32x4_t vSxy = vdupq_n_s32(0);
-            int32x4_t vSxt = vdupq_n_s32(0);
-            int32x4_t vSyt = vdupq_n_s32(0);
-
-            for (int dy_i = -win; dy_i <= win; ++dy_i) {
-                int row_offset = (py + dy_i) * w;
-                for (int dx_i = -win; dx_i <= win; ++dx_i) {
-                    int c_idx = row_offset + (px + dx_i);
-                    
-                    int Ix = (int)p_curr[c_idx + 1] - (int)p_curr[c_idx - 1];
-                    int Iy = (int)p_curr[c_idx + w] - (int)p_curr[c_idx - w];
-                    int It = (int)p_curr[c_idx] - (int)p_prev[c_idx];
-
-                    // For NEON, we usually process multiple pixels at once.
-                    // But here pixels are usually non-contiguous (scattered in foreground).
-                    // So we vectorize the window summation instead? 
-                    // No, 5x5 window (25 iterations) is small.
-                    // For now, let's keep it simple and vectorize the inner loop if possible, 
-                    // or just use scalar as a placeholder if contiguity is bad.
-                    // Actually, a better NEON optimization is to compute Ix, Iy, It for the whole ROI first.
-
-                    vSxx = vsetq_lane_s32(vgetq_lane_s32(vSxx, 0) + Ix * Ix, vSxx, 0);
-                    vSyy = vsetq_lane_s32(vgetq_lane_s32(vSyy, 0) + Iy * Iy, vSyy, 0);
-                    vSxy = vsetq_lane_s32(vgetq_lane_s32(vSxy, 0) + Ix * Iy, vSxy, 0);
-                    vSxt = vsetq_lane_s32(vgetq_lane_s32(vSxt, 0) + Ix * It, vSxt, 0);
-                    vSyt = vsetq_lane_s32(vgetq_lane_s32(vSyt, 0) + Iy * It, vSyt, 0);
-                }
-            }
-
-            int32_t Sxx = vgetq_lane_s32(vSxx, 0);
-            int32_t Syy = vgetq_lane_s32(vSyy, 0);
-            int32_t Sxy = vgetq_lane_s32(vSxy, 0);
-            int32_t Sxt = vgetq_lane_s32(vSxt, 0);
-            int32_t Syt = vgetq_lane_s32(vSyt, 0);
-
-            long long det = (long long)Sxx * Syy - (long long)Sxy * Sxy;
-            long long trace = (long long)Sxx + Syy;
-            double disc = std::sqrt((double)(Sxx - Syy) * (Sxx - Syy) + 4.0 * (double)Sxy * Sxy);
-            double eig_min = (trace - disc) * 0.5;
-
-            if (eig_min > 80.0) { 
-                float dx = (float)((long long)Sxy * Syt - (long long)Syy * Sxt) / det;
-                float dy = (float)((long long)Sxy * Sxt - (long long)Sxx * Syt) / det;
-                dx_out[i] = dx;
-                dy_out[i] = dy;
-                dir_out[i] = std::atan2(dy, dx);
-            }
-        }
+         // Forward to Pyramid implementation (NEON inside)
+         LK_Utils::computeOpticalFlowPyrLK(prev, curr, pixels, dx_out, dy_out, dir_out, 3);
     }
 #endif
 
