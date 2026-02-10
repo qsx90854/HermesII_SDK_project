@@ -939,8 +939,11 @@ int main(int argc, char** argv) {
                         float angle = f_obj.pixel_dir[i_pix]; // Radians
                         float speed = std::sqrt(dx*dx + dy*dy);
                         
-                        lk_sum_speed += speed;
-                        lk_pix_count++;
+                        // NEW: Filter small motions for average
+                        if (speed > 1.0f) {
+                            lk_sum_speed += speed;
+                            lk_pix_count++;
+                        }
 
                         // Downward is PI/2 (90 deg). PI/2 +/- 40 deg => [50 deg, 130 deg]
                         // 50 deg = 0.8726 rad, 130 deg = 2.2689 rad
