@@ -224,6 +224,21 @@ StatusCode VisionSDK::VisionSDK::SetInputMemory(unsigned char* buffer, int width
     return StatusCode::OK;
 }
 
+StatusCode VisionSDK::VisionSDK::SetBackground(const unsigned char* buffer, int width, int height, int channels) {
+    if (!buffer) return StatusCode::ERROR_INVALID_INPUT;
+
+    // Wrap buffer in Image struct
+    Image frame; 
+    frame.data = (unsigned char*)buffer; // Casting const away for struct compatibility, but SetBackground should treat as read-only/copy
+    frame.width = width;
+    frame.height = height;
+    frame.channels = channels;
+    frame.timestamp = 0; 
+
+    pImpl->fall_detector.SetBackground(frame);
+    return StatusCode::OK;
+}
+
 StatusCode VisionSDK::VisionSDK::ProcessNextFrame() {
     if (!pImpl->input_buffer) return StatusCode::ERROR_INVALID_INPUT;
 

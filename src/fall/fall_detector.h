@@ -99,6 +99,9 @@ public:
     // Set Bed Region directly with 4 points
     void SetBedRegion(const std::vector<std::pair<int, int>>& points);
 
+    // Set Background explicitely
+    void SetBackground(const Image& frame);
+
     // Set the number of previous frames to check for block changes (default 5)
     // Set the number of previous frames to check for block changes (default 5)
     void SetHistorySize(int n);

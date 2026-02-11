@@ -241,7 +241,7 @@ std::vector<::VisionSDK::ObjectFeatures> find_objects_optimized(const uint8_t* m
     }
 
     // 2. BBox Expansion Merging (DSU-like logic)
-    int expansion = 10;
+    int expansion = 1;  // Reduced from 10 to 1 pixel for tighter merging
     bool changed = true;
     while (changed) {
         changed = false;
@@ -2377,6 +2377,34 @@ public:
     std::vector<FallCandidate> candidates;
     bool was_inside_bed = false; // State tracking
 
+    // --- Case 5: Momentum Transition Observation ---
+    struct ObservationState {
+        int object_id;
+        int trigger_frame;           // Frame when high momentum detected
+        int frames_observed;         // Frames observed so far (in observation phase)
+        int frames_waiting;          // Frames spent waiting for deceleration
+        std::vector<float> momentum_samples;  // Momentum values during observation phase
+        bool is_active;              // Whether currently in observation mode
+        bool waiting_for_deceleration; // Whether waiting for momentum to drop before observation
+        
+        // Perspective Filter State
+        int aligned_frames;
+        int valid_angle_frames;
+        
+        ObservationState() : object_id(-1), trigger_frame(-1), frames_observed(0), 
+                            frames_waiting(0), is_active(false), waiting_for_deceleration(false),
+                            aligned_frames(0), valid_angle_frames(0), flat_posture_frames(0), accumulated_bed_ratio(0.0f) {}
+
+        // Posture State
+        int flat_posture_frames;
+        
+        // Bed State
+        float accumulated_bed_ratio;
+
+
+    };
+    std::map<int, ObservationState> observation_states;
+
     // Face Model Init State
     bool face_model_inited = false;
     
@@ -2482,6 +2510,14 @@ public:
          LK_Utils::computeOpticalFlowPyrLK(prev, curr, pixels, dx_out, dy_out, dir_out, 3);
     }
 #endif
+
+    void LogTrace(int id, int frame, const char* type, float val, const char* msg) {
+        FILE* fp = fopen("detection_trace.txt", "a");
+        if (fp) {
+            fprintf(fp, "F:%d ID:%d Type:%s Val:%.2f Msg:%s\n", frame, id, type, val, msg);
+            fclose(fp);
+        }
+    }
 
     Impl() {
         // Initialize estimator with default config
@@ -3519,8 +3555,20 @@ StatusCode FallDetector::Detect(const Image& frame, bool& is_fall) {
         const uint8_t* bg = pImpl->backgroundFrame.getData();
         int diff_thr = pImpl->config.bg_diff_threshold;
         
+        const unsigned char* bed_data = (pImpl->hasBedMask) ? pImpl->bedMask.getData() : nullptr;
+        int bed_w = (pImpl->hasBedMask) ? pImpl->bedMask.width() : 0;
+        int bed_h = (pImpl->hasBedMask) ? pImpl->bedMask.height() : 0;
+
         for(int i = 0; i < w * h; ++i) {
             int diff = std::abs((int)curr[i] - (int)bg[i]);
+            
+            // Apply Bed Mask filter immediately
+            if (bed_data) {
+                if (bed_data[i] == 0) { // 0 is Inside Bed
+                     diff = 0; // Force to background
+                }
+            }
+            
             if (diff > diff_thr) {
                 maskData[i] = 255;
                 global_fg_count++;
@@ -3691,7 +3739,40 @@ StatusCode FallDetector::Detect(const Image& frame, bool& is_fall) {
                                                pImpl->active_blocks, 
                                                pImpl->active_indices,
                                                pImpl->config.block_dilation_threshold);
-    // (Misplaced Slow Fall Logic Removed)
+    
+    // NEW: Bed Region Foreground Masking (User Request)
+    // "找完前景點時, 在床的區域內的點, 直接當背景點"
+    if (pImpl->hasBedMask) {
+        int cols = pImpl->config.grid_cols;
+        int rows = pImpl->config.grid_rows;
+        int bw = frame.width / cols;
+        int bh = frame.height / rows;
+        const unsigned char* bed_data = pImpl->bedMask.getData();
+        int bed_w = pImpl->bedMask.width();
+        int bed_h = pImpl->bedMask.height();
+
+        for (size_t i = 0; i < pImpl->changed_mask.size(); ++i) {
+            if (pImpl->changed_mask[i]) {
+                int r = i / cols;
+                int c = i % cols;
+                int cx = c * bw + bw / 2;
+                int cy = r * bh + bh / 2;
+                
+                // Check if center is in bed mask (0 = Inside)
+                if (cx >= 0 && cx < bed_w && cy >= 0 && cy < bed_h) {
+                    if (bed_data[cy * bed_w + cx] == 0) {
+                        // Force to background
+                        pImpl->changed_mask[i] = false;
+                        
+                        // Safety Check: active_blocks might not be same size
+                        if (i < pImpl->active_blocks.size()) {
+                            pImpl->active_blocks[i] = ::Image(); // Clear block image data
+                        }
+                    }
+                }
+            }
+        }
+    }
     
 
     #if ENABLE_PERF_PROFILING
@@ -4324,6 +4405,10 @@ StatusCode FallDetector::Detect(const Image& frame, bool& is_fall) {
             float mom_drop_ratio = 0.8f; // Relaxed from 0.5
             float fg_drop_ratio = 0.8f; // Relaxed from 0.75
             
+            
+            /* ============================================================
+             * CASE 1-4: COMMENTED OUT - Replaced by Case 5
+             * ============================================================
             if (y_dominant && !is_upward) {
                 // --- CASE 1: Upward Momentum ---
                 // 1-a. Consistency Check (Reject if Consistent)
@@ -4395,7 +4480,342 @@ StatusCode FallDetector::Detect(const Image& frame, bool& is_fall) {
                         }
                     }
                 }
+                
+                // --- CASE 4: Sustained FG Decline (Peak-to-Current, Any Direction) ---
+                // Data3 pattern: FG gradually declines over extended period
+                // Strategy: Within 20-frame window, check if current FG dropped significantly from peak
+                if (!potential_fall) {
+                    printf("[C4_ENTRY] ID:%d entering Case 4 check\n", curr.id);
+                    int len = hist_fg.size();
+                    printf("[C4_DEBUG] ID:%d hist_fg.size=%d (need>=10)\n", curr.id, len);
+                    if (len >= 10) {  // Need sufficient history
+                        // Find peak in first 60% of window and current minimum in last 40%
+                        int peak_search_end = (int)(len * 0.6f);
+                        int recent_search_start = (int)(len * 0.6f);
+                        
+                        float peak_fg = 0;
+                        float recent_sum = 0;
+                        int recent_count = 0;
+                        
+                        for(int k=0; k < peak_search_end; ++k) {
+                            if (hist_fg[k] > peak_fg) peak_fg = hist_fg[k];
+                        }
+                        
+                        // Use AVERAGE (not minimum) to avoid 0-value problem
+                        // Only count non-zero values
+                        for(int k=recent_search_start; k < len; ++k) {
+                            if (hist_fg[k] > 0) {
+                                recent_sum += hist_fg[k];
+                                recent_count++;
+                            }
+                        }
+                        
+                        float recent_avg_fg = (recent_count > 0) ? (recent_sum / recent_count) : 0.0f;
+                        float drop_ratio = (peak_fg > 100 && recent_avg_fg > 0) ? ((peak_fg - recent_avg_fg) / peak_fg) : 0.0f;
+                        
+                        // DEBUG: Check thresholds
+                        bool drop_ok = (drop_ratio >= 0.45f);
+                        bool peak_ok = (peak_fg > 3000);
+                        bool avg_ok = (recent_avg_fg > 2000);
+                        
+                        if (peak_ok && !drop_ok) {
+                            printf("[C4_FAIL] ID:%d peak:%.0f avg:%.0f drop:%.1f%% (need>=45%%) FAILED DROP\\n", 
+                                   curr.id, peak_fg, recent_avg_fg, drop_ratio * 100);
+                        } else if (peak_ok && drop_ok && !avg_ok) {
+                            printf("[C4_FAIL] ID:%d peak:%.0f avg:%.0f drop:%.1f%% FAILED AVG (need>2000)\\n", 
+                                   curr.id, peak_fg, recent_avg_fg, drop_ratio * 100);
+                        }
+                        
+                        // Trigger if:
+                        // 1. Significant drop (>= 45%) - relaxed to catch data3
+                        // 2. Peak was meaningful (> 3000) - lowered from 5000
+                        // 3. Recent avg is NOT near zero (> 2000) - prevents "leaving scene" false positives
+                        if (drop_ratio >= 0.45f && peak_fg >3000 && recent_avg_fg > 2000) {
+                            // Additional guard: some movement
+                            float avg_str = 0;
+                            for(float s : hist_str) avg_str += s;
+                            avg_str /= hist_str.size();
+                            
+                            if (avg_str > 1.0f) {
+                                potential_fall = true;
+                                fall_type = "Sustained_Decline";
+                                case_num = 4;
+                                printf("[NewLogic] Peak-to-Current FG Decline! ID %d peak:%.0f avg:%.0f drop:%.1f%%\n", 
+                                       curr.id, peak_fg, recent_avg_fg, drop_ratio * 100);
+                            }
+                        }
+                    }
+                }
             }
+            * ============================================================ */
+            
+            // --- CASE 5: Momentum Transition Detection (Two-Phase) ---
+            // Phase 1: Wait for deceleration (momentum drops below threshold)
+            // Phase 2: Observe 60 frames of sustained low momentum
+            
+            // Step 1: Calculate recent 3-frame momentum average
+            int recent_window = std::min(3, (int)hist_str.size());
+            if (recent_window > 0) {
+                float recent_mom_sum = 0.0f;
+                for (int k = hist_str.size() - recent_window; k < (int)hist_str.size(); ++k) {
+                    recent_mom_sum += hist_str[k];
+                }
+                float recent_mom_avg = recent_mom_sum / recent_window;
+
+                const float threshold1 = 5.5f;  // High momentum trigger (peak detection)
+                const float decel_threshold = 4.0f;  // Deceleration complete threshold
+                const float threshold2 = 5.5f;  // Low momentum threshold - Balanced for ~90% TP retention
+                const int observation_frames = 120;  // Extended from 60 to 120 frames (4 seconds @ 30fps)
+                const int max_waiting_frames = 30;  // Max frames to wait for deceleration
+
+                auto& state = pImpl->observation_states[curr.id];
+
+                // Step 2: Trigger on high momentum peak
+                if (!state.is_active && !state.waiting_for_deceleration && recent_mom_avg >= threshold1) {
+                    // Enter waiting phase - wait for momentum to drop
+                    state.waiting_for_deceleration = true;
+                    state.object_id = curr.id;
+                    state.trigger_frame = pImpl->frame_idx;
+                    state.frames_waiting = 0;
+                    state.frames_observed = 0;
+                    state.momentum_samples.clear();
+                    printf("[Case5] ID:%d PEAK detected at frame %d (peak_mom=%.2f >= %.2f) - waiting for deceleration\n", 
+                           curr.id, pImpl->frame_idx, recent_mom_avg, threshold1);
+                    pImpl->LogTrace(curr.id, pImpl->frame_idx, "TRIGGER", recent_mom_avg, "Peak Momentum > 5.5");
+                }
+
+                // Step 3: Waiting phase - check if deceleration is complete
+                if (state.waiting_for_deceleration && state.object_id == curr.id) {
+                    state.frames_waiting++;
+                    
+                    // Check if momentum has dropped below deceleration threshold
+                    if (curr.strength < decel_threshold) {
+                        // Deceleration complete - start observation phase
+                        state.waiting_for_deceleration = false;
+                        state.is_active = true;
+                        state.frames_observed = 0;
+                        state.momentum_samples.clear();
+                        printf("[Case5] ID:%d DECELERATION complete at frame %d (curr_mom=%.2f < %.2f) - starting observation\n", 
+                               curr.id, pImpl->frame_idx, curr.strength, decel_threshold);
+                    } else if (state.frames_waiting >= max_waiting_frames) {
+                        // Timeout - momentum didn't drop in time, reset
+                        state.waiting_for_deceleration = false;
+                        printf("[Case5] ID:%d waiting TIMEOUT at frame %d (waited %d frames, mom still %.2f)\n", 
+                               curr.id, pImpl->frame_idx, state.frames_waiting, curr.strength);
+                    }
+                }
+
+                // Step 4: Observation phase - collect momentum samples
+                if (state.is_active && !state.waiting_for_deceleration && state.object_id == curr.id) {
+                    state.momentum_samples.push_back(curr.strength);
+                    state.frames_observed++;
+                    
+                    // Step 4.0: Aspect Ratio Check (Flat Posture)
+                    int box_w = 0, box_h = 0, m1, m2, m3, m4;
+                    getObjectBoundingBoxPixels(curr, pImpl->config.grid_cols, pImpl->config.grid_rows, frame.width, frame.height, box_w, box_h, m1, m2, m3, m4);
+                    if (box_h > 0) {
+                        float aspect_ratio = (float)box_w / box_h;
+                        if (aspect_ratio > 1.0f) {
+                            state.flat_posture_frames++;
+                        }
+                    }
+
+                    // Step 4.0b: Bed Ratio Accumulation
+                    // Calculate ratio of blocks in bed
+                    if (pImpl->hasBedMask) {
+                        int bed_blocks = 0;
+                        int blk_w = pImpl->config.block_size; // Assuming square blocks approx for center
+                        int cols = pImpl->config.grid_cols;
+                        const unsigned char* bed_data = pImpl->bedMask.getData();
+                        int W = pImpl->bedMask.width();
+                        int H = pImpl->bedMask.height();
+                        
+                        for (int blk_idx : curr.blocks) {
+                            int r = blk_idx / cols;
+                            int c = blk_idx % cols;
+                            int px = c * (frame.width / cols) + (frame.width / cols) / 2;
+                            int py = r * (frame.height / pImpl->config.grid_rows) + (frame.height / pImpl->config.grid_rows) / 2;
+                            
+                            if (px >= 0 && px < W && py >= 0 && py < H) {
+                                if (bed_data[py * W + px] == 0) { // 0 is Inside Bed
+                                    bed_blocks++;
+                                }
+                            }
+                        }
+                        if (!curr.blocks.empty()) {
+                            float ratio = (float)bed_blocks / curr.blocks.size();
+                            state.accumulated_bed_ratio += ratio;
+                        }
+                    }
+
+
+                    
+                    // Step 4.1: Continuous Perspective Check (Accumulate stats)
+                    if (state.frames_observed % 5 == 0) { // Check every 5 frames to save CPU? Or every frame? Let's do every frame for now or every 2nd.
+                         // Every frame is fine, find_objects_optimized is already called.
+                         
+                         if (!pImpl->full_frame_objects.empty()) {
+                            // Calculate scaling factors (Pixels per Block)
+                            float blk_w = (float)frame.width / pImpl->config.grid_cols;
+                            float blk_h = (float)frame.height / pImpl->config.grid_rows;
+                            
+                            // Find matching object in full_frame_objects
+                            // Compare in BLOCK coordinates
+                            float min_dist = 999999.0f;
+                            int best_idx = -1;
+                            
+                            for (size_t i = 0; i < pImpl->full_frame_objects.size(); ++i) {
+                                // Convert FG object (Pixels) to Blocks
+                                float fg_blk_cx = pImpl->full_frame_objects[i].cx / blk_w;
+                                float fg_blk_cy = pImpl->full_frame_objects[i].cy / blk_h;
+                                
+                                float dx = fg_blk_cx - curr.centerX;
+                                float dy = fg_blk_cy - curr.centerY;
+                                float dist = dx*dx + dy*dy;
+                                
+                                if (dist < min_dist) {
+                                    min_dist = dist;
+                                    best_idx = (int)i;
+                                }
+                            }
+                            
+                            // printf("[Case5-DEBUG] ID:%d F:%lld best_idx=%d min_dist=%.2f\n", curr.id, pImpl->frame_idx, best_idx, min_dist);
+
+                            if (best_idx >= 0 && min_dist < 25.0f) {  // Within 5 grid blocks
+                                auto& fg_obj = pImpl->full_frame_objects[best_idx];
+                                
+                                // Calculate perspective line angle in PIXELS
+                                float persp_px_x = (416.0f / 800.0f) * frame.width;
+                                float persp_px_y = (474.0f / 450.0f) * frame.height;
+                                
+                                float curr_px_x = curr.centerX * blk_w;
+                                float curr_px_y = curr.centerY * blk_h;
+                                
+                                float dx_to_persp = persp_px_x - curr_px_x;
+                                float dy_to_persp = persp_px_y - curr_px_y;
+                                float persp_angle = std::atan2(dy_to_persp, dx_to_persp) * 180.0f / 3.14159f;
+                                
+                                float obj_angle = fg_obj.angle * 180.0f / 3.14159f;
+                                
+                                float angle_diff = std::abs(obj_angle - persp_angle);
+                                if (angle_diff > 180.0f) angle_diff = 360.0f - angle_diff;
+                                if (angle_diff > 90.0f) angle_diff = 180.0f - angle_diff;
+                                
+                                state.valid_angle_frames++;
+                                if (angle_diff < 30.0f) {
+                                    state.aligned_frames++;
+                                }
+                            }
+                         }
+                    }
+
+                    // Step 4.2: After observation_frames, evaluate
+                    if (state.frames_observed >= observation_frames) {
+                        float obs_mom_sum = 0.0f;
+                        float obs_min_mom = 999.0f;
+                        float obs_max_mom = -1.0f;
+                        
+                        for (float m : state.momentum_samples) {
+                            obs_mom_sum += m;
+                            if(m < obs_min_mom) obs_min_mom = m;
+                            if(m > obs_max_mom) obs_max_mom = m;
+                        }
+                        float obs_mom_avg = obs_mom_sum / state.momentum_samples.size();
+                        
+                        // Adaptive Threshold based on Posture
+                        float current_threshold2 = threshold2;
+                        bool is_flat_posture = (state.flat_posture_frames > (state.frames_observed * 0.5f));
+                        
+                        if (is_flat_posture) {
+                            current_threshold2 = 11.0f; // Relaxed threshold for struggling/seizure (high momentum but lying down)
+                            printf("[Case5-DEBUG] ID:%d ADAPTIVE THRESHOLD: Flat Ratio=%.2f (>0.5) (Flat: %d/%d) -> Threshold=11.0\n",
+                                   curr.id, (float)state.flat_posture_frames/state.frames_observed, state.flat_posture_frames, state.frames_observed);
+                        }
+                        
+                        if (obs_mom_avg < current_threshold2) {
+                            
+                            // Bed Filter Check
+                            bool is_bed_event = false;
+                            float avg_bed_ratio = 0.0f;
+                            int center_in_bed_flag = 0;
+
+                            if (pImpl->hasBedMask) {
+                                avg_bed_ratio = state.accumulated_bed_ratio / state.frames_observed;
+                                
+                                // Check Center
+                                int cx = (int)(curr.centerX * (frame.width / pImpl->config.grid_cols)); 
+                                int cy = (int)(curr.centerY * (frame.height / pImpl->config.grid_rows));
+                                
+                                if (cx >= 0 && cx < pImpl->bedMask.width() && cy >= 0 && cy < pImpl->bedMask.height()) {
+                                    if (pImpl->bedMask.getData()[cy * pImpl->bedMask.width() + cx] == 0) {
+                                        center_in_bed_flag = 1;
+                                    }
+                                }
+                                
+                                if (center_in_bed_flag || avg_bed_ratio > 0.30f) {
+                                    is_bed_event = true;
+                                     printf("[Case5] ID:%d Rejected: Bed Event (Center:%d, AvgRatio:%.2f > 0.30)\n", 
+                                            curr.id, center_in_bed_flag, avg_bed_ratio);
+                                     pImpl->LogTrace(curr.id, pImpl->frame_idx, "FILTER_BED", avg_bed_ratio, "Bed Region Reject");
+                                }
+                            }
+
+                            // NEW: Perspective Line Angle Check (Majority Vote)
+                            bool perspective_aligned = false;
+                            
+                            if (!is_bed_event) {
+                                float alignment_ratio = 0.0f;
+                                if (state.valid_angle_frames > 0) {
+                                    alignment_ratio = (float)state.aligned_frames / state.valid_angle_frames;
+                                }
+                                
+                                printf("[Case5-DEBUG] ID:%d Observation Persp Check: Aligned=%d/%d (Ratio=%.2f)\n", 
+                                       curr.id, state.aligned_frames, state.valid_angle_frames, alignment_ratio);
+                                
+                                // If > 75% of valid frames are aligned, consider it a non-fall (lying down aligned)
+                                if (state.valid_angle_frames > 10 && alignment_ratio > 0.75f) {
+                                    perspective_aligned = true;
+                                    printf("[Case5] ID:%d PERSPECTIVE ALIGNED (Majority): Ratio=%.2f > 0.75\n", curr.id, alignment_ratio);
+                                    pImpl->LogTrace(curr.id, pImpl->frame_idx, "FILTER_PERSP", alignment_ratio, "Perspective Aligned > 0.75");
+                                } else {
+                                    printf("[Case5] ID:%d NOT ALIGNED (Majority): Ratio=%.2f <= 0.75\n", curr.id, alignment_ratio);
+                                }
+                            }
+                            
+                            // Fall detected only if NOT aligned with perspective line AND NOT Bed Event
+                            if (is_bed_event) {
+                                // Rejected
+                            } else if (!perspective_aligned) {
+                                potential_fall = true;
+                                fall_type = "Momentum_Transition";
+                                case_num = 5;
+                                printf("[Case5] FALL DETECTED ID:%d obs_avg=%.2f (min=%.2f, max=%.2f) < %.2f (Adaptive: %s, Flat: %d/%d) (triggered at F:%d, observed %d frames)\n", 
+                                       curr.id, obs_mom_avg, obs_min_mom, obs_max_mom, current_threshold2, (is_flat_posture?"YES":"NO"), state.flat_posture_frames, state.frames_observed, state.trigger_frame, state.frames_observed);
+                                
+                                pImpl->LogTrace(curr.id, pImpl->frame_idx, "DETECTED", obs_mom_avg, (is_flat_posture ? "Adaptive Threshold Passed" : "Normal Threshold Passed"));
+
+                            } else {
+                                printf("[Case5] ID:%d observation ENDED - PERSPECTIVE ALIGNED (obs_avg=%.2f, min=%.2f, max=%.2f) < %.2f but NOT a fall (Flat: %d/%d)\n", 
+                                       curr.id, obs_mom_avg, obs_min_mom, obs_max_mom, current_threshold2, state.flat_posture_frames, state.frames_observed);
+                            }
+                        } else {
+                            printf("[Case5] ID:%d observation ENDED - NO FALL (obs_avg=%.2f, min=%.2f, max=%.2f) >= %.2f (Adaptive: %s, Flat: %d/%d)\n", 
+                                   curr.id, obs_mom_avg, obs_min_mom, obs_max_mom, current_threshold2, (is_flat_posture?"YES":"NO"), state.flat_posture_frames, state.frames_observed);
+                            pImpl->LogTrace(curr.id, pImpl->frame_idx, "FILTER_MOMENTUM", obs_mom_avg, "Observation Avg > Threshold");
+                        }
+                        
+                        // Reset state
+                        state.is_active = false;
+                        state.momentum_samples.clear();
+                        state.frames_observed = 0;
+                        state.aligned_frames = 0;
+                        state.valid_angle_frames = 0;
+                        state.flat_posture_frames = 0;
+                        state.accumulated_bed_ratio = 0.0f;
+                    }
+                }
+            }
+            
             
             if (potential_fall) {
                 // Common Checks: Bed Region & Leaving Scene & Static
@@ -4707,8 +5127,14 @@ std::vector<::VisionSDK::ObjectFeatures> FallDetector::GetFullFrameObjects() con
 std::vector<std::pair<int, int>> FallDetector::GetBedRegion() const {
     return pImpl->bed_region;
 }
-
-
+void FallDetector::SetBackground(const Image& frame) {
+    if (!pImpl) return;
+    if (!frame.data) return;
+    ::Image wrapper(frame.width, frame.height, frame.channels);
+    wrapper.setData(frame.data, frame.width * frame.height * frame.channels);
+    pImpl->backgroundFrame = wrapper;
+    printf("[FallDetector] Background Explicitly Set to %dx%d image\n", frame.width, frame.height);
+}
 
 
 std::vector<uint8_t> FallDetector::GetChangedBlocks() const {

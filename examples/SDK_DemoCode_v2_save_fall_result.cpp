@@ -24,6 +24,9 @@ using namespace VisionSDK;
 #include <sys/types.h>
 #include <unistd.h>
 
+// TOGGLE: 1 = Use SDK Internal Logic, 0 = Use Demo Custom Logic (Peak-Valley)
+#define USE_SDK_FALL_RESULT 1
+
 // Drawing Helper
 void drawRectRGB(std::vector<uint8_t>& img, int w, int h, int x, int y, int rw, int rh, uint8_t r, uint8_t g, uint8_t b, int thickness=2) {
     if (x < 0) x = 0; if (y < 0) y = 0;
@@ -618,6 +621,28 @@ int main(int argc, char** argv) {
     int bg_frames_count = 0;
     bool bg_saved_flag = false;
 
+    // Load Initial Background if specified
+    std::string bg_file_path = appCfg.getString("Demo.Demo_Background_Image_Path", "");
+    if (!bg_file_path.empty()) {
+        std::ifstream fbg(bg_file_path, std::ios::binary | std::ios::ate);
+        if (fbg) {
+            std::streamsize size = fbg.tellg();
+            fbg.seekg(0, std::ios::beg);
+            if (size == W * H * 3) {
+                bg_reference.resize(W * H * 3);
+                if (fbg.read((char*)bg_reference.data(), size)) {
+                    printf("[Demo] Loaded Background Image: %s\n", bg_file_path.c_str());
+                    sdk.SetBackground(bg_reference.data(), W, H, 3);
+                    bg_saved_flag = true;
+                }
+            } else {
+                printf("[Demo] Warning: Background Image size mismatch! Expected %d, Got %ld. Ignoring.\n", W*H*3, size);
+            }
+        } else {
+             printf("[Demo] Warning: Background Image path provided but file not found: %s\n", bg_file_path.c_str());
+        }
+    }
+
     // ------------------------------------------------------------------
     // NEW: Data Logging (User Request)
     // ------------------------------------------------------------------
@@ -795,9 +820,22 @@ int main(int argc, char** argv) {
              // User wants "bg_mask frame", likely full frame or at least same as before.
              // Previous code used object bbox. Let's do FULL FRAME for now to be safe.
              
+            // Pre-process bed polygon for fast check
+            std::vector<std::pair<float, float>> bed_poly;
+            if (bed_points_sorted.size() == 4) {
+                 for(auto& p : bed_points_sorted) bed_poly.push_back({(float)p.first, (float)p.second});
+            }
+
              for(int y=startY; y<endY; ++y) {
                  for(int x=startX; x<endX; ++x) {
                      int idx = (y * W + x) * 3;
+                     
+                     // Check Bed Mask (Demo Side)
+                     if (!bed_poly.empty()) {
+                         if (isPointInConvexQuad(bed_poly, (float)x, (float)y)) {
+                             continue; // Skip bed pixels
+                         }
+                     }
                      
                      int diff = std::abs((int)current_frame_rgb[idx] - (int)bg_reference[idx]) +
                                 std::abs((int)current_frame_rgb[idx+1] - (int)bg_reference[idx+1]) +
@@ -1183,7 +1221,43 @@ int main(int argc, char** argv) {
             int maj_y1 = (int)(cy - (major/2.0f) * sin_a);
             int maj_x2 = (int)(cx + (major/2.0f) * cos_a);
             int maj_y2 = (int)(cy + (major/2.0f) * sin_a);
+            
+            // Draw Major Axis (Yellow)
             drawArrow(ff_viz_img, W, H, maj_x1, maj_y1, maj_x2, maj_y2, 255, 255, 0, 2);
+
+            // ==========================================================
+            // NEW: Draw Perspective Line for Visualization
+            // ==========================================================
+            // Calculate perspective angle
+            float viz_dx_p = perspective_x - cx;  // Direction TO vanishing point
+            float viz_dy_p = perspective_y - cy;
+            float viz_p_angle = std::atan2(viz_dy_p, viz_dx_p); // Radians
+            
+            // Calculate difference (degrees)
+            float obj_deg = angle_pca * 180.0f / 3.14159f;
+            float persp_deg = viz_p_angle * 180.0f / 3.14159f;
+            float angle_diff = std::abs(obj_deg - persp_deg);
+            if (angle_diff > 180.0f) angle_diff = 360.0f - angle_diff;
+            if (angle_diff > 90.0f) angle_diff = 180.0f - angle_diff;
+            
+            // Limit line length for visualization (don't draw all the way to vanishing point if too far)
+            float p_dist = std::sqrt(viz_dx_p*viz_dx_p + viz_dy_p*viz_dy_p);
+            float viz_len = std::min(p_dist, 100.0f); // Max 100 pixels length
+            float unit_dx = viz_dx_p / p_dist;
+            float unit_dy = viz_dy_p / p_dist;
+            
+            int p_x2 = (int)(cx + unit_dx * viz_len);
+            int p_y2 = (int)(cy + unit_dy * viz_len);
+            
+            // Color: MAGENTA if Filtered (<30 deg), CYAN if Allowed (>30 deg)
+            if (angle_diff < 30.0f) {
+                 // Filtered (Aligned) -> Magenta
+                 drawArrow(ff_viz_img, W, H, (int)cx, (int)cy, p_x2, p_y2, 255, 0, 255, 2);
+            } else {
+                 // Allowed (Not Aligned) -> Cyan
+                 drawArrow(ff_viz_img, W, H, (int)cx, (int)cy, p_x2, p_y2, 0, 255, 255, 2);
+            }
+            // ==========================================================
         }
 
         // Override SDK fall signal
@@ -1191,7 +1265,13 @@ int main(int argc, char** argv) {
         if (custom_fall_signal) custom_hold_frames = 30; // Hold for 1 second at 30fps
         
         // Reset original flag and use custom one
-        is_fall_in_current_frame = (custom_hold_frames > 0);
+        #if USE_SDK_FALL_RESULT
+            // SDK Logic: Do nothing (keep result from onFallDetected)
+            // But we still countdown for debug visualization if needed
+        #else
+            // Demo Logic: Override SDK result
+            is_fall_in_current_frame = (custom_hold_frames > 0);
+        #endif
         if (custom_hold_frames > 0) custom_hold_frames--;
 
         // Interval Tracking Logic (Moved here)

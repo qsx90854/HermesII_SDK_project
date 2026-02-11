@@ -302,6 +302,18 @@ public:
     StatusCode SetInputMemory(unsigned char* buffer, int width, int height, int channels);
 
     /**
+     * @brief Set the Background Image explicitly.
+     * Takes a deep copy of the buffer.
+     * 
+     * @param buffer Pointer to the image data.
+     * @param width Image width.
+     * @param height Image height.
+     * @param channels Image channels.
+     * @return StatusCode 
+     */
+    StatusCode SetBackground(const unsigned char* buffer, int width, int height, int channels);
+
+    /**
      * @brief Trigger the SDK to process the current frame in the shared buffer.
      * The result will be reported via the registered FallCallback.
      * 
