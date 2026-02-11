@@ -84,6 +84,7 @@ StatusCode VisionSDK::VisionSDK::SetConfig(const void* config) {
             const auto* c = static_cast<const ObjectExtraction_v1*>(config);
             pImpl->config.object_extraction_threshold = c->object_extraction_threshold;
             pImpl->config.object_merge_radius = c->object_merge_radius;
+            pImpl->config.foreground_merge_radius = c->foreground_merge_radius; // NEW
             pImpl->config.tracking_overlap_threshold = c->tracking_overlap_threshold;
             pImpl->config.tracking_mode = c->tracking_mode;
             break;

@@ -510,6 +510,7 @@ int main(int argc, char** argv) {
     objCfg.header.type = VisionSDK::ConfigType::ObjectExtraction_v1;
     objCfg.header.version = 1;
     objCfg.object_merge_radius = cfg.getInt("Object.Block_Merge_Range", 3);
+    objCfg.foreground_merge_radius = cfg.getInt("Object.Foreground_Merge_Range", 1); // Default 1 pixel
     objCfg.object_extraction_threshold = 2.0f; 
     objCfg.tracking_overlap_threshold = cfg.getFloat("Tracking.Tracking_Overlap_Threshold", 0.5f);
     objCfg.tracking_mode = cfg.getInt("Tracking.Tracking_Mode", 1);
@@ -634,6 +635,12 @@ int main(int argc, char** argv) {
                     printf("[Demo] Loaded Background Image: %s\n", bg_file_path.c_str());
                     sdk.SetBackground(bg_reference.data(), W, H, 3);
                     bg_saved_flag = true;
+
+                    // NEW: Save loaded background for verification (as requested)
+                    char bg_save_name[256];
+                    snprintf(bg_save_name, sizeof(bg_save_name), "%s/background_init.jpg", save_dir.c_str());
+                    stbi_write_jpg(bg_save_name, W, H, 3, bg_reference.data(), 90);
+                    printf("[Demo] Saved raw background as %s\n", bg_save_name);
                 }
             } else {
                 printf("[Demo] Warning: Background Image size mismatch! Expected %d, Got %ld. Ignoring.\n", W*H*3, size);
@@ -950,9 +957,22 @@ int main(int argc, char** argv) {
         int largest_obj_pixel_count = 0;
         int largest_obj_red_count = 0;
 
-        // Process top 3 objects for custom logic
-        for (int i_obj = 0; i_obj < std::min(3, (int)ff_objs.size()); ++i_obj) {
+        // Detect Objects used in Case 5 Perspective Check
+        std::set<int> highlight_fg_ids;
+        for (const auto& obj : objects) {
+            if (obj.matched_fg_obj_id != -1) {
+                highlight_fg_ids.insert(obj.matched_fg_obj_id);
+            }
+        }
+
+        // Process all objects, but only draw Top 3 OR Highlighted ones
+        for (int i_obj = 0; i_obj < (int)ff_objs.size(); ++i_obj) {
             const auto& f_obj = ff_objs[i_obj];
+            bool is_highlighted = (highlight_fg_ids.count(f_obj.id) > 0);
+            
+            // Skip small/irrelevant ones unless highlighted
+            if (!is_highlighted && i_obj >= 3) continue;
+
             int red_count = 0;
             
             float lk_sum_speed = 0.0f;
@@ -965,8 +985,10 @@ int main(int argc, char** argv) {
                     int px = pix_idx % W;
 
                     uint8_t r, g, b;
-                    if (i_obj == 0) {
-                        r = 100; g = 100; b = 255; // Light Blue for largest group base
+                    if (is_highlighted) {
+                         r = 255; g = 255; b = 0; // Yellow for Perspective-Checked Object
+                    } else if (i_obj == 0) {
+                        r = 100; g = 100; b = 255; // Light Blue for largest group base (if not highlighted)
                     } else {
                         r = 120; g = 120; b = 120; // Gray for others
                     }

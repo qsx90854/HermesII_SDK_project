@@ -163,7 +163,8 @@ struct ObjectFeatures {
 // 假設 mask 已經是上面 NEON 算出來的 0/255 陣列
 // width, height: 影像尺寸
 // minArea: 過濾噪點用
-std::vector<::VisionSDK::ObjectFeatures> find_objects_optimized(const uint8_t* mask, int width, int height, int minArea) {
+// Update Signature
+std::vector<::VisionSDK::ObjectFeatures> find_objects_optimized(const uint8_t* mask, int width, int height, int minArea, int merge_radius) {
     std::vector<::VisionSDK::ObjectFeatures> results;
     
     static std::vector<uint8_t> visited;
@@ -241,7 +242,7 @@ std::vector<::VisionSDK::ObjectFeatures> find_objects_optimized(const uint8_t* m
     }
 
     // 2. BBox Expansion Merging (DSU-like logic)
-    int expansion = 1;  // Reduced from 10 to 1 pixel for tighter merging
+    int expansion = merge_radius;  // Configurable merge radius
     bool changed = true;
     while (changed) {
         changed = false;
@@ -2541,6 +2542,7 @@ public:
     int bg_update_counter = 0;
     std::vector<int32_t> bg_accumulator; // For accumulating frames during init
     int bg_accumulated_count = 0;
+    bool background_initialized_externally = false; // NEW
     
     void updateBackground(const ::Image& current, const InternalConfig& cfg, int frame_idx) {
         printf("[Debug] updateBackground called for frame %d\n", frame_idx);
@@ -2554,7 +2556,7 @@ public:
         }
         
         // 1. Initialization Phase (Average Logic)
-        if (cfg.bg_init_start_frame > 0 && cfg.bg_init_end_frame > cfg.bg_init_start_frame) {
+        if (!background_initialized_externally && cfg.bg_init_start_frame > 0 && cfg.bg_init_end_frame > cfg.bg_init_start_frame) {
             if (frame_idx >= cfg.bg_init_start_frame && frame_idx <= cfg.bg_init_end_frame) {
                 int size = current.width() * current.height() * current.getChannels();
                 if(bg_accumulator.size() != size) bg_accumulator.resize(size, 0);
@@ -3563,12 +3565,6 @@ StatusCode FallDetector::Detect(const Image& frame, bool& is_fall) {
             int diff = std::abs((int)curr[i] - (int)bg[i]);
             
             // Apply Bed Mask filter immediately
-            if (bed_data) {
-                if (bed_data[i] == 0) { // 0 is Inside Bed
-                     diff = 0; // Force to background
-                }
-            }
-            
             if (diff > diff_thr) {
                 maskData[i] = 255;
                 global_fg_count++;
@@ -3578,7 +3574,8 @@ StatusCode FallDetector::Detect(const Image& frame, bool& is_fall) {
         }
 
         // Identify and store full-frame foreground objects
-        pImpl->full_frame_objects = find_objects_optimized(maskData.data(), w, h, 20); // Min area 20 pixels
+        // Identify and store full-frame foreground objects
+        pImpl->full_frame_objects = find_objects_optimized(maskData.data(), w, h, 20, pImpl->config.foreground_merge_radius); // Min area 20, config merge radius
 
         // --- NEW: Optical Flow (Integer-LK) for top 2 objects ---
         if ((int)pImpl->raw_frame_history.size() >= max_history) {
@@ -4651,7 +4648,8 @@ StatusCode FallDetector::Detect(const Image& frame, bool& is_fall) {
 
                     
                     // Step 4.1: Continuous Perspective Check (Accumulate stats)
-                    if (state.frames_observed % 5 == 0) { // Check every 5 frames to save CPU? Or every frame? Let's do every frame for now or every 2nd.
+                    // Step 4.1: Continuous Perspective Check (Accumulate stats)
+                    if (true) { // Run every frame to ensure matched_fg_obj_id is always fresh
                          // Every frame is fine, find_objects_optimized is already called.
                          
                          if (!pImpl->full_frame_objects.empty()) {
@@ -4683,6 +4681,7 @@ StatusCode FallDetector::Detect(const Image& frame, bool& is_fall) {
 
                             if (best_idx >= 0 && min_dist < 25.0f) {  // Within 5 grid blocks
                                 auto& fg_obj = pImpl->full_frame_objects[best_idx];
+                                curr.matched_fg_obj_id = fg_obj.id; // Store ID for visualization
                                 
                                 // Calculate perspective line angle in PIXELS
                                 float persp_px_x = (416.0f / 800.0f) * frame.width;
@@ -4700,6 +4699,12 @@ StatusCode FallDetector::Detect(const Image& frame, bool& is_fall) {
                                 float angle_diff = std::abs(obj_angle - persp_angle);
                                 if (angle_diff > 180.0f) angle_diff = 360.0f - angle_diff;
                                 if (angle_diff > 90.0f) angle_diff = 180.0f - angle_diff;
+                                
+                                // DEBUG PRINT
+                                if (state.frames_observed % 10 == 0) { // Reduce spam, print every 10th
+                                     printf("[Case5-Res] ID:%d ObjAngle:%.2f PerspAngle:%.2f Diff:%.2f\n", 
+                                            curr.id, obj_angle, persp_angle, angle_diff);
+                                }
                                 
                                 state.valid_angle_frames++;
                                 if (angle_diff < 30.0f) {
@@ -4743,8 +4748,25 @@ StatusCode FallDetector::Detect(const Image& frame, bool& is_fall) {
                                 avg_bed_ratio = state.accumulated_bed_ratio / state.frames_observed;
                                 
                                 // Check Center
-                                int cx = (int)(curr.centerX * (frame.width / pImpl->config.grid_cols)); 
-                                int cy = (int)(curr.centerY * (frame.height / pImpl->config.grid_rows));
+                                int cx = -1;
+                                int cy = -1;
+                                
+                                // NEW: Try to use matched FG object center (Pixel-based)
+                                if (curr.matched_fg_obj_id != -1) {
+                                    for (const auto& f_obj : pImpl->full_frame_objects) {
+                                        if (f_obj.id == curr.matched_fg_obj_id) {
+                                            cx = (int)f_obj.cx;
+                                            cy = (int)f_obj.cy;
+                                            break;
+                                        }
+                                    }
+                                }
+                                
+                                // Fallback to Motion Block Center
+                                if (cx == -1) {
+                                    cx = (int)(curr.centerX * (frame.width / pImpl->config.grid_cols)); 
+                                    cy = (int)(curr.centerY * (frame.height / pImpl->config.grid_rows));
+                                }
                                 
                                 if (cx >= 0 && cx < pImpl->bedMask.width() && cy >= 0 && cy < pImpl->bedMask.height()) {
                                     if (pImpl->bedMask.getData()[cy * pImpl->bedMask.width() + cx] == 0) {
@@ -4769,8 +4791,9 @@ StatusCode FallDetector::Detect(const Image& frame, bool& is_fall) {
                                     alignment_ratio = (float)state.aligned_frames / state.valid_angle_frames;
                                 }
                                 
-                                printf("[Case5-DEBUG] ID:%d Observation Persp Check: Aligned=%d/%d (Ratio=%.2f)\n", 
-                                       curr.id, state.aligned_frames, state.valid_angle_frames, alignment_ratio);
+                                // ALWAYS PRINT for debugging
+                                printf("[Case5-RATIO] ID:%d F:%d Aligned=%d/%d (Ratio=%.2f)\n", 
+                                       curr.id, pImpl->frame_idx, state.aligned_frames, state.valid_angle_frames, alignment_ratio);
                                 
                                 // If > 75% of valid frames are aligned, consider it a non-fall (lying down aligned)
                                 if (state.valid_angle_frames > 10 && alignment_ratio > 0.75f) {
@@ -5130,12 +5153,33 @@ std::vector<std::pair<int, int>> FallDetector::GetBedRegion() const {
 void FallDetector::SetBackground(const Image& frame) {
     if (!pImpl) return;
     if (!frame.data) return;
-    ::Image wrapper(frame.width, frame.height, frame.channels);
-    wrapper.setData(frame.data, frame.width * frame.height * frame.channels);
-    pImpl->backgroundFrame = wrapper;
-    printf("[FallDetector] Background Explicitly Set to %dx%d image\n", frame.width, frame.height);
-}
+    
+    // Ensure background is Grayscale (1 channel) as expected by Detect()
+    ::Image wrapper(frame.width, frame.height, 1);
+    
+    if (frame.channels == 3) {
+        // Convert RGB to Gray
+        const uint8_t* p_src = frame.data;
+        uint8_t* p_dst = wrapper.getData();
+        int size = frame.width * frame.height;
+        for (int i = 0; i < size; ++i) {
+            int r = p_src[i * 3];
+            int g = p_src[i * 3 + 1];
+            int b = p_src[i * 3 + 2];
+            p_dst[i] = (uint8_t)((r * 77 + g * 150 + b * 29) >> 8);
+        }
+        printf("[FallDetector] Converted RGB Background to Grayscale (%dx%d)\n", frame.width, frame.height);
+    } else if (frame.channels == 1) {
+        wrapper.setData(frame.data, frame.width * frame.height);
+    } else {
+        printf("[FallDetector] Unsupported background channels: %d\n", frame.channels);
+        return;
+    }
 
+    pImpl->backgroundFrame = wrapper;
+    pImpl->background_initialized_externally = true; 
+    printf("[FallDetector] Background Explicitly Set.\n");
+}
 
 std::vector<uint8_t> FallDetector::GetChangedBlocks() const {
     std::vector<uint8_t> ret;

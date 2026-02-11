@@ -51,6 +51,7 @@ struct InternalConfig {
     // Object Extraction
     float object_extraction_threshold = 2.0f;
     int object_merge_radius = 3;
+    int foreground_merge_radius = 1; // NEW: Separate pixel merge radius
     float tracking_overlap_threshold = 0.5f;
     int tracking_mode = 1; 
 

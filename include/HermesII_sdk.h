@@ -47,7 +47,8 @@ struct MotionEstimation_v1 {
 struct ObjectExtraction_v1 {
     ConfigHeader header;
     float object_extraction_threshold = 0.0f;
-    int object_merge_radius = 0;
+    int object_merge_radius = 3;
+    int foreground_merge_radius = 1; // NEW: Default 1 pixel merge
     float tracking_overlap_threshold = 0.0f;
     int tracking_mode = 0; 
 };
@@ -205,6 +206,9 @@ struct MotionObject {
 
     // NEW: Global Frame Stats
     int total_frame_pixel_count = 0;
+    
+    // NEW: Debug info for visualization
+    int matched_fg_obj_id = -1; // ID of the FullFrameObject used for perspective check
 };
 
 
