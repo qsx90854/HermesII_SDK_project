@@ -796,7 +796,16 @@ int main(int argc, char** argv) {
         
 
         // 1. Get Objects (Deep Copy)
-        std::vector<MotionObject> objects = sdk.GetMotionObjects();
+        // std::vector<MotionObject> objects = sdk.GetMotionObjects();
+        std::vector<MotionObject> objects;
+        sdk.GetMotionObjects(objects);
+
+        if (i >= 300 && i <= 302) {
+             printf("[Demo-Size-Check] F:%d ObjsSize:%lu\n", i, objects.size());
+             printf("[Demo-Struct] sizeof(MotionObject)=%lu offset(id)=%lu offset(Obs)=%lu\n", 
+               sizeof(MotionObject), offsetof(MotionObject, id), offsetof(MotionObject, is_in_observation_mode));
+        }
+        std::vector<VisionSDK::ObjectFeatures> full_objs = sdk.GetFullFrameObjects(); // NEW: Fetch for visualization
         std::vector<uint8_t> changed_blocks = sdk.GetChangedBlocks(); // Mask
         std::vector<MotionVector> vectors = sdk.GetMotionVectors();
         
@@ -1475,7 +1484,36 @@ int main(int argc, char** argv) {
                     }
                 }
                 
+                
             }
+
+            
+            // NEW: Highlight Observed Object Foreground Points (After Hull Filling)
+            for (const auto& obj : objects) {
+                if (i >= 300 && i <= 310) {
+                    printf("[Demo-Loop-Check] F:%d ID:%d Obs:%d MatchID:%d\n", i, obj.id, obj.is_in_observation_mode, obj.matched_fg_obj_id);
+                }
+                if (i >= 300 && i <= 310 && obj.id == 1006) {
+                    printf("[Demo-Viz] F:%d ID:%d Obs:%d MatchID:%d\n", i, obj.id, obj.is_in_observation_mode, obj.matched_fg_obj_id);
+                }
+                if (obj.is_in_observation_mode && obj.matched_fg_obj_id != -1) {
+                    for (const auto& f_obj : full_objs) {
+                        if (f_obj.id == obj.matched_fg_obj_id) {
+                            // Draw Pixels
+                            for (int pix_idx : f_obj.pixels) {
+                                int idx = pix_idx * 3;
+                                if (idx >= 0 && idx < (int)final_mask.size() - 2) {
+                                    final_mask[idx] = 255;   // R
+                                    final_mask[idx+1] = 0;   // G
+                                    final_mask[idx+2] = 255; // B (Magenta)
+                                }
+                            }
+                            break; 
+                        }
+                    }
+                }
+            }
+
             bg_mask_img = final_mask; // Update Global Mask
             //printf("[Debug] Skipping Hull Filter (Before Loop). MaskSz=%zu ObjSz=%zu\n", bg_mask_img.size(), objects.size());
         }

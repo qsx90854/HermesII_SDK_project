@@ -209,6 +209,7 @@ struct MotionObject {
     
     // NEW: Debug info for visualization
     int matched_fg_obj_id = -1; // ID of the FullFrameObject used for perspective check
+    bool is_in_observation_mode = false; // NEW: True if currently in Case 5 observation (or waiting)
 };
 
 
@@ -332,7 +333,8 @@ public:
     std::vector<std::pair<int, int>> GetBedRegion();
 
     // Get internal state for visualization
-    std::vector<MotionObject> GetMotionObjects();
+    // std::vector<MotionObject> GetMotionObjects(); // Deprecated: Return by value causes ABI issues
+    void GetMotionObjects(std::vector<MotionObject>& out_objects); // NEW: Pass by ref
     std::vector<uint8_t> GetChangedBlocks(); // Returns mask data same size as grid (cols*rows)
     std::vector<MotionVector> GetMotionVectors(); // Returns vector map same size as grid
 

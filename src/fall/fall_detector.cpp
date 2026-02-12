@@ -497,6 +497,51 @@ static void getObjectBoundingBoxPixels(const MotionObject& obj, int grid_cols, i
     out_bbox_height = out_max_y - out_min_y;
 }
 
+static float calculateBlockAngle(const MotionObject& obj, int grid_cols, int grid_rows, int width, int height) {
+    if (obj.blocks.empty()) return 0.0f;
+    
+    // Centers
+    float sum_x = 0, sum_y = 0;
+    int count = 0;
+    int blk_w = width / grid_cols;
+    int blk_h = height / grid_rows;
+    if (blk_w <= 0 || blk_h <= 0) return 0.0f; // Prevent div zero
+
+    std::vector<std::pair<float, float>> points;
+    points.reserve(obj.blocks.size());
+
+    for (int blk_idx : obj.blocks) {
+        int r = blk_idx / grid_cols;
+        int c = blk_idx % grid_cols;
+        float cx = c * blk_w + blk_w * 0.5f;
+        float cy = r * blk_h + blk_h * 0.5f;
+        
+        sum_x += cx;
+        sum_y += cy;
+        points.push_back({cx, cy});
+        count++;
+    }
+    
+    if (count == 0) return 0.0f;
+    float mean_x = sum_x / count;
+    float mean_y = sum_y / count;
+    
+    // Moments
+    float u20 = 0, u02 = 0, u11 = 0;
+    for (const auto& p : points) {
+        float dx = p.first - mean_x;
+        float dy = p.second - mean_y;
+        u20 += dx * dx;
+        u02 += dy * dy;
+        u11 += dx * dy;
+    }
+    
+    // Angle (-90 to 90 degrees)
+    float angle_rad = 0.5f * std::atan2(2 * u11, u20 - u02);
+    return angle_rad * 180.0f / 3.14159f;
+}
+
+
 } // anonymous namespace
 
 // ==================================================================================
@@ -2392,17 +2437,30 @@ public:
         int aligned_frames;
         int valid_angle_frames;
         
-        ObservationState() : object_id(-1), trigger_frame(-1), frames_observed(0), 
-                            frames_waiting(0), is_active(false), waiting_for_deceleration(false),
-                            aligned_frames(0), valid_angle_frames(0), flat_posture_frames(0), accumulated_bed_ratio(0.0f) {}
+        // Rotation Check (Head-First Fall)
+        std::deque<float> angle_history;
+        bool rotation_detected;
+        
+
 
         // Posture State
         int flat_posture_frames;
         
         // Bed State
         float accumulated_bed_ratio;
+        
+        // FG Object Tracking (Stability)
+        float last_fg_cx = -1.0f;
+        float last_fg_cy = -1.0f;
+        bool last_fg_valid = false;
+        
+        // Momentum Tracking
+        float peak_momentum = 0.0f; // NEW: Track peak during Wait phase
 
-
+        ObservationState() : object_id(-1), trigger_frame(-1), frames_observed(0), 
+                            frames_waiting(0), is_active(false), waiting_for_deceleration(false),
+                            aligned_frames(0), valid_angle_frames(0), rotation_detected(false), flat_posture_frames(0), 
+                            accumulated_bed_ratio(0.0f), peak_momentum(0.0f) {}
     };
     std::map<int, ObservationState> observation_states;
 
@@ -4562,28 +4620,103 @@ StatusCode FallDetector::Detect(const Image& frame, bool& is_fall) {
                 const float threshold1 = 5.5f;  // High momentum trigger (peak detection)
                 const float decel_threshold = 4.0f;  // Deceleration complete threshold
                 const float threshold2 = 5.5f;  // Low momentum threshold - Balanced for ~90% TP retention
-                const int observation_frames = 120;  // Extended from 60 to 120 frames (4 seconds @ 30fps)
+                const int observation_frames = 90;  // Extended from 60 to 120 frames (4 seconds @ 30fps)
                 const int max_waiting_frames = 30;  // Max frames to wait for deceleration
 
                 auto& state = pImpl->observation_states[curr.id];
 
                 // Step 2: Trigger on high momentum peak
-                if (!state.is_active && !state.waiting_for_deceleration && recent_mom_avg >= threshold1) {
-                    // Enter waiting phase - wait for momentum to drop
-                    state.waiting_for_deceleration = true;
-                    state.object_id = curr.id;
-                    state.trigger_frame = pImpl->frame_idx;
-                    state.frames_waiting = 0;
-                    state.frames_observed = 0;
-                    state.momentum_samples.clear();
-                    printf("[Case5] ID:%d PEAK detected at frame %d (peak_mom=%.2f >= %.2f) - waiting for deceleration\n", 
-                           curr.id, pImpl->frame_idx, recent_mom_avg, threshold1);
-                    pImpl->LogTrace(curr.id, pImpl->frame_idx, "TRIGGER", recent_mom_avg, "Peak Momentum > 5.5");
+                if (recent_mom_avg >= threshold1) {
+                    bool start_new_trigger = false;
+
+                    // Scenario A: First Trigger
+                    if (!state.is_active && !state.waiting_for_deceleration) {
+                        start_new_trigger = true;
+                    } 
+                    // Scenario B: Re-Trigger during Wait (Extend Wait or Reset)
+                    else if (state.waiting_for_deceleration) {
+                        // If momentum keeps rising, just reset the wait counter
+                        // state.frames_waiting = 0; // Optional: Keep waiting
+                        // printf("[Case5] ID:%d High Momentum continues... resetting wait check.\n", curr.id);
+                        // Actually, better to just let it ride, but if we want to capture the *peak*, we might update trigger_frame.
+                        if (recent_mom_avg > state.peak_momentum) { // Need to track peak?
+                             // Just reset wait count to ensure we don't timeout mid-fall
+                             state.frames_waiting = 0;
+                        }
+                    }
+                    // Scenario C: Re-Trigger during Observation (The "Walk then Fall" case)
+                    else if (state.is_active) {
+                        printf("[Case5] ID:%d RE-TRIGGER detected during observation (new peak=%.2f) - restarting logic.\n", 
+                               curr.id, recent_mom_avg);
+                        pImpl->LogTrace(curr.id, pImpl->frame_idx, "RE-TRIGGER", recent_mom_avg, "New Impact during Obs");
+                        start_new_trigger = true;
+                    }
+
+                    if (start_new_trigger) {
+                        // Enter waiting phase - wait for momentum to drop
+                        state.waiting_for_deceleration = true;
+                        state.is_active = false; // Reset observation if active
+                        state.object_id = curr.id;
+                        state.trigger_frame = pImpl->frame_idx;
+                        state.frames_waiting = 0;
+                        state.frames_observed = 0;
+                        state.momentum_samples.clear();
+                        state.accumulated_bed_ratio = 0.0f; // Reset accumulators
+                        state.flat_posture_frames = 0;
+                        state.peak_momentum = recent_mom_avg; // NEW: Init peak
+                        
+                        printf("[Case5] ID:%d PEAK detected at frame %d (peak_mom=%.2f >= %.2f) - waiting for deceleration\n", 
+                               curr.id, pImpl->frame_idx, recent_mom_avg, threshold1);
+                        pImpl->LogTrace(curr.id, pImpl->frame_idx, "TRIGGER", recent_mom_avg, "Peak Momentum > 5.5");
+                    }
                 }
 
                 // Step 3: Waiting phase - check if deceleration is complete
                 if (state.waiting_for_deceleration && state.object_id == curr.id) {
+                    curr.is_in_observation_mode = true; // NEW: Flag for visualization
                     state.frames_waiting++;
+                    
+                    /*
+                    // Track Rotation during High Momentum Phase
+                    float cur_angle = calculateBlockAngle(curr, pImpl->config.grid_cols, pImpl->config.grid_rows, frame.width, frame.height);
+                    state.angle_history.push_back(cur_angle);
+                    
+                    // Analyze Rotation (Rapid Consistent Change)
+                    if (state.angle_history.size() >= 3 && !state.rotation_detected) {
+                         float total_delta = 0.0f;
+                         int consistency_count = 0;
+                         int total_steps = 0;
+                         
+                         for (size_t k = 1; k < state.angle_history.size(); ++k) {
+                             float delta = state.angle_history[k] - state.angle_history[k-1];
+                             if (delta > 90.0f) delta -= 180.0f;
+                             else if (delta < -90.0f) delta += 180.0f;
+                             
+                             total_delta += delta;
+                             total_steps++;
+                         }
+                         
+                         // Check Consistency (Majority direction matches Total direction)
+                         for (size_t k = 1; k < state.angle_history.size(); ++k) {
+                             float delta = state.angle_history[k] - state.angle_history[k-1];
+                             if (delta > 90.0f) delta -= 180.0f;
+                             else if (delta < -90.0f) delta += 180.0f;
+                             
+                             if (total_delta > 0 && delta > 0) consistency_count++;
+                             else if (total_delta < 0 && delta < 0) consistency_count++;
+                         }
+                         
+                         float consistency = (total_steps > 0) ? (float)consistency_count / total_steps : 0.0f;
+                         
+                         // Threshold: > 45 degrees rotation AND > 70% consistency
+                         if (std::abs(total_delta) > 45.0f && consistency > 0.70f) {
+                             state.rotation_detected = true;
+                             printf("[Case5] ID:%d ROTATION DETECTED! Delta=%.1f Consistency=%.2f. (Head-First Fall Candidate)\n", 
+                                    curr.id, total_delta, consistency);
+                             pImpl->LogTrace(curr.id, pImpl->frame_idx, "ROTATION_DETECT", total_delta, "Rapid Consistent Rotation");
+                         }
+                    }
+                    */
                     
                     // Check if momentum has dropped below deceleration threshold
                     if (curr.strength < decel_threshold) {
@@ -4604,6 +4737,7 @@ StatusCode FallDetector::Detect(const Image& frame, bool& is_fall) {
 
                 // Step 4: Observation phase - collect momentum samples
                 if (state.is_active && !state.waiting_for_deceleration && state.object_id == curr.id) {
+                    curr.is_in_observation_mode = true; // NEW: Flag for visualization
                     state.momentum_samples.push_back(curr.strength);
                     state.frames_observed++;
                     
@@ -4652,6 +4786,12 @@ StatusCode FallDetector::Detect(const Image& frame, bool& is_fall) {
                     if (true) { // Run every frame to ensure matched_fg_obj_id is always fresh
                          // Every frame is fine, find_objects_optimized is already called.
                          
+                         // Debug Print Number of Full Frame Objects (Moved outside check)
+                         if (pImpl->frame_idx >= 300 && pImpl->frame_idx <= 310) {
+                             printf("[Match-Frame-Start] F:%lld TotalFG:%lu MotionObjs:%lu\n", 
+                                    pImpl->frame_idx, pImpl->full_frame_objects.size(), pImpl->current_objects.size());
+                         }
+
                          if (!pImpl->full_frame_objects.empty()) {
                             // Calculate scaling factors (Pixels per Block)
                             float blk_w = (float)frame.width / pImpl->config.grid_cols;
@@ -4662,26 +4802,115 @@ StatusCode FallDetector::Detect(const Image& frame, bool& is_fall) {
                             float min_dist = 999999.0f;
                             int best_idx = -1;
                             
-                            for (size_t i = 0; i < pImpl->full_frame_objects.size(); ++i) {
-                                // Convert FG object (Pixels) to Blocks
-                                float fg_blk_cx = pImpl->full_frame_objects[i].cx / blk_w;
-                                float fg_blk_cy = pImpl->full_frame_objects[i].cy / blk_h;
-                                
-                                float dx = fg_blk_cx - curr.centerX;
-                                float dy = fg_blk_cy - curr.centerY;
-                                float dist = dx*dx + dy*dy;
-                                
-                                if (dist < min_dist) {
-                                    min_dist = dist;
-                                    best_idx = (int)i;
+                            // (Inner loop logic continues...)
+
+                            // Debug Per-Object Info (Inside Loop)
+                            if (pImpl->frame_idx >= 300 && pImpl->frame_idx <= 310) {
+                                printf("[Match-Loop-Start] F:%lld ID:%d Blk:%lu LastValid:%d LastPos(%.1f,%.1f) ObsMode:%d Active:%d Wait:%d\n", 
+                                       pImpl->frame_idx, curr.id, curr.blocks.size(), state.last_fg_valid, state.last_fg_cx, state.last_fg_cy,
+                                       curr.is_in_observation_mode, state.is_active, state.waiting_for_deceleration);
+                            }
+
+                            // User Request: Only perform standard matching if block count >= 3.
+                            // If < 3, use Last Known Position (Rescue).
+                            bool large_enough_motion = (curr.blocks.size() >= 3);
+                            
+                            if (large_enough_motion) {
+                                for (size_t i = 0; i < pImpl->full_frame_objects.size(); ++i) {
+                                    // NEW: Size Filter to avoid matching small noise fragments
+                                    if (pImpl->full_frame_objects[i].pixels.size() < 100) continue; // Relaxed from 500
+    
+                                    
+                                    // Convert FG object (Pixels) to Blocks
+                                    float fg_blk_cx = pImpl->full_frame_objects[i].cx / blk_w;
+                                    float fg_blk_cy = pImpl->full_frame_objects[i].cy / blk_h;
+                                    
+                                    float dx = fg_blk_cx - curr.centerX;
+                                    float dy = fg_blk_cy - curr.centerY;
+                                    float dist = dx*dx + dy*dy;
+                                    
+                                    if (dist < min_dist) {
+                                        min_dist = dist;
+                                        best_idx = (int)i;
+                                    }
                                 }
                             }
                             
+                            // Debug Print if no suitable object found
+                            // if (best_idx == -1 && !pImpl->full_frame_objects.empty()) {
+                            // }
+                            
                             // printf("[Case5-DEBUG] ID:%d F:%lld best_idx=%d min_dist=%.2f\n", curr.id, pImpl->frame_idx, best_idx, min_dist);
 
-                            if (best_idx >= 0 && min_dist < 25.0f) {  // Within 5 grid blocks
+                            // Relaxed distance threshold: 10 blocks (100.0)
+                            if (best_idx >= 0 && min_dist < 100.0f) {  // Was 25.0f (5 blocks)
+                                // Standard Match Success
                                 auto& fg_obj = pImpl->full_frame_objects[best_idx];
+                                
+                                // Update Tracking State ONLY if enough motion blocks (User Request)
+                                if (large_enough_motion) {
+                                    state.last_fg_cx = fg_obj.cx / blk_w;
+                                    state.last_fg_cy = fg_obj.cy / blk_h;
+                                    state.last_fg_valid = true;
+                                }
+                                
                                 curr.matched_fg_obj_id = fg_obj.id; // Store ID for visualization
+                                
+                                // DEBUG
+                                if (pImpl->frame_idx >= 300 && pImpl->frame_idx <= 310) {
+                                    printf("[Match-OK] F:%lld ID:%d Blk:%lu Dist:%.2f FG_ID:%d LastValid:%d\n", 
+                                           pImpl->frame_idx, curr.id, curr.blocks.size(), min_dist, fg_obj.id, state.last_fg_valid);
+                                }
+
+                            } else if (state.last_fg_valid) {
+                                // Match Failed, but we have a last known position.
+                                // Search near Last Known Position
+                                float rec_min_dist = 999999.0f;
+                                int rec_best_idx = -1;
+                                
+                                for (size_t i = 0; i < pImpl->full_frame_objects.size(); ++i) {
+                                    if (pImpl->full_frame_objects[i].pixels.size() < 100) continue; 
+                                    
+                                    float fg_blk_cx = pImpl->full_frame_objects[i].cx / blk_w;
+                                    float fg_blk_cy = pImpl->full_frame_objects[i].cy / blk_h;
+                                    
+                                    float dx = fg_blk_cx - state.last_fg_cx;
+                                    float dy = fg_blk_cy - state.last_fg_cy;
+                                    float dist = dx*dx + dy*dy;
+                                    
+                                    if (dist < rec_min_dist) {
+                                        rec_min_dist = dist;
+                                        rec_best_idx = (int)i;
+                                    }
+                                }
+                                
+                                // DEBUG FAIL INFO
+                                if (pImpl->frame_idx >= 300 && pImpl->frame_idx <= 310) {
+                                     printf("[Match-Fail-Rescue] F:%d ID:%d Blk:%lu StdDist:%.2f LastValid:%d RecDist:%.2f\n",
+                                            pImpl->frame_idx, curr.id, curr.blocks.size(), min_dist, state.last_fg_valid, rec_min_dist);
+                                }
+
+                                if (rec_best_idx >= 0 && rec_min_dist < 100.0f) {
+                                    // Recovered!
+                                    best_idx = rec_best_idx;
+                                    auto& fg_obj = pImpl->full_frame_objects[best_idx];
+                                    
+                                    // Update Tracking State (Follow the FG object)
+                                    state.last_fg_cx = fg_obj.cx / blk_w;
+                                    state.last_fg_cy = fg_obj.cy / blk_h;
+                                    
+                                    curr.matched_fg_obj_id = fg_obj.id;
+                                    
+                                    printf("[Case5-Recover] ID:%d Recovered FG Object %d via LastPos (Dist: %.2f)\n", curr.id, fg_obj.id, rec_min_dist);
+                                }
+                            }
+                            
+                            if (curr.matched_fg_obj_id != -1) {
+                                auto& fg_obj = pImpl->full_frame_objects[best_idx]; // Re-get ref carefully (best_idx might have changed)
+                                if (fg_obj.id != curr.matched_fg_obj_id) { // Sanity check if recovering logic messed up indices (it shouldn't if we use best_idx)
+                                    // If we recovered, best_idx is correct.
+                                    // But verify we simply proceed.
+                                }
                                 
                                 // Calculate perspective line angle in PIXELS
                                 float persp_px_x = (416.0f / 800.0f) * frame.width;
@@ -4796,10 +5025,23 @@ StatusCode FallDetector::Detect(const Image& frame, bool& is_fall) {
                                        curr.id, pImpl->frame_idx, state.aligned_frames, state.valid_angle_frames, alignment_ratio);
                                 
                                 // If > 75% of valid frames are aligned, consider it a non-fall (lying down aligned)
+                                // UNLESS Rotation (Head-First) was detected, in which case we TRUST the fall (Bypass Filter)
                                 if (state.valid_angle_frames > 10 && alignment_ratio > 0.75f) {
+                                    /*
+                                    if (!state.rotation_detected) {
+                                        perspective_aligned = true;
+                                        printf("[Case5] ID:%d PERSPECTIVE ALIGNED (Majority): Ratio=%.2f > 0.75\n", curr.id, alignment_ratio);
+                                        pImpl->LogTrace(curr.id, pImpl->frame_idx, "FILTER_PERSP", alignment_ratio, "Perspective Aligned > 0.75");
+                                    } else {
+                                        printf("[Case5] ID:%d PERSPECTIVE CHECK BYPASSED due to ROTATION DETECTED. (Ratio=%.2f would have filtered)\n", curr.id, alignment_ratio);
+                                        pImpl->LogTrace(curr.id, pImpl->frame_idx, "FILTER_BYPASS", 1.0f, "Rotation Detected Bypass");
+                                    }
+                                    */
+                                    // Original Logic (No Rotation Bypass)
                                     perspective_aligned = true;
                                     printf("[Case5] ID:%d PERSPECTIVE ALIGNED (Majority): Ratio=%.2f > 0.75\n", curr.id, alignment_ratio);
                                     pImpl->LogTrace(curr.id, pImpl->frame_idx, "FILTER_PERSP", alignment_ratio, "Perspective Aligned > 0.75");
+                                    
                                 } else {
                                     printf("[Case5] ID:%d NOT ALIGNED (Majority): Ratio=%.2f <= 0.75\n", curr.id, alignment_ratio);
                                 }
@@ -4827,6 +5069,7 @@ StatusCode FallDetector::Detect(const Image& frame, bool& is_fall) {
                             pImpl->LogTrace(curr.id, pImpl->frame_idx, "FILTER_MOMENTUM", obs_mom_avg, "Observation Avg > Threshold");
                         }
                         
+                        // Case 5 State
                         // Reset state
                         state.is_active = false;
                         state.momentum_samples.clear();
@@ -5135,11 +5378,23 @@ StatusCode FallDetector::Detect(const Image& frame, bool& is_fall) {
     }
     #endif
 
+    if (pImpl->frame_idx >= 300 && pImpl->frame_idx <= 302) {
+        printf("[SDK-End-Detect] F:%d Size:%lu IDs:", pImpl->frame_idx, pImpl->current_objects.size());
+        for(const auto& o : pImpl->current_objects) printf(" %d(Obs:%d Match:%d)", o.id, o.is_in_observation_mode, o.matched_fg_obj_id);
+        printf("\n");
+        printf("[SDK-Struct] sizeof(MotionObject)=%lu offset(id)=%lu offset(Obs)=%lu\n", 
+               sizeof(MotionObject), offsetof(MotionObject, id), offsetof(MotionObject, is_in_observation_mode));
+    }
     printf("[Debug] FallDetector::Detect End Frame %lld\n", pImpl->absolute_frame_count);
     return StatusCode::OK;
 }
 
 const std::vector<MotionObject>& FallDetector::GetMotionObjects() const {
+    if (!pImpl->current_objects.empty() && pImpl->frame_idx >= 300 && pImpl->frame_idx <= 302) {
+        printf("[SDK-FD-Get] F:%d Size:%lu IDs:", pImpl->frame_idx, pImpl->current_objects.size());
+        for(const auto& o : pImpl->current_objects) printf(" %d", o.id);
+        printf("\n");
+    }
     return pImpl->current_objects;
 }
 
@@ -5152,27 +5407,32 @@ std::vector<std::pair<int, int>> FallDetector::GetBedRegion() const {
 }
 void FallDetector::SetBackground(const Image& frame) {
     if (!pImpl) return;
-    if (!frame.data) return;
+    const uint8_t* p_frame_data = frame.data; 
+    if (!p_frame_data) return;
     
     // Ensure background is Grayscale (1 channel) as expected by Detect()
-    ::Image wrapper(frame.width, frame.height, 1);
+    int f_w = frame.width;
+    int f_h = frame.height;
+    int f_c = frame.channels;
+
+    ::Image wrapper(f_w, f_h, 1);
     
-    if (frame.channels == 3) {
+    if (f_c == 3) {
         // Convert RGB to Gray
-        const uint8_t* p_src = frame.data;
+        const uint8_t* p_src = p_frame_data;
         uint8_t* p_dst = wrapper.getData();
-        int size = frame.width * frame.height;
+        int size = f_w * f_h;
         for (int i = 0; i < size; ++i) {
             int r = p_src[i * 3];
             int g = p_src[i * 3 + 1];
             int b = p_src[i * 3 + 2];
             p_dst[i] = (uint8_t)((r * 77 + g * 150 + b * 29) >> 8);
         }
-        printf("[FallDetector] Converted RGB Background to Grayscale (%dx%d)\n", frame.width, frame.height);
-    } else if (frame.channels == 1) {
-        wrapper.setData(frame.data, frame.width * frame.height);
+        printf("[FallDetector] Converted RGB Background to Grayscale (%dx%d)\n", f_w, f_h);
+    } else if (f_c == 1) {
+        wrapper.setData(const_cast<unsigned char*>(p_frame_data), f_w * f_h);
     } else {
-        printf("[FallDetector] Unsupported background channels: %d\n", frame.channels);
+        printf("[FallDetector] Unsupported background channels: %d\n", f_c);
         return;
     }
 

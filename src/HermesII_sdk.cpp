@@ -290,8 +290,33 @@ StatusCode VisionSDK::VisionSDK::MapPointV2(float ir_x, float ir_y, const Fusion
 }
 
 
-std::vector<MotionObject> VisionSDK::VisionSDK::GetMotionObjects() {
-    return pImpl->fall_detector.GetMotionObjects();
+// std::vector<MotionObject> VisionSDK::VisionSDK::GetMotionObjects() {
+//     return pImpl->fall_detector.GetMotionObjects();
+// }
+
+void VisionSDK::VisionSDK::GetMotionObjects(std::vector<MotionObject>& out_objects) {
+    out_objects.clear();
+    const auto& objs = pImpl->fall_detector.GetMotionObjects();
+    out_objects.reserve(objs.size());
+    
+    bool log_it = false;
+    for(const auto& o : objs) {
+        if(o.id == 1006) log_it = true;
+    }
+
+    if (log_it) {
+         printf("[SDK-Wrapper-Ref] Filling Source Size:%lu IDs:", objs.size());
+         for(const auto& o : objs) printf(" %d", o.id);
+         printf("\n");
+    }
+
+    for (const auto& o : objs) {
+        out_objects.push_back(o);
+        // Keep the mutation for verification? 
+        // Let's remove mutation now to see if REAL data flows.
+        // If we see 1006 with correct flags, we are good.
+        // if (out_objects.back().id == 1006) ...
+    }
 }
 
 std::vector<uint8_t> VisionSDK::VisionSDK::GetChangedBlocks() {
