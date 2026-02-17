@@ -2460,7 +2460,18 @@ public:
         ObservationState() : object_id(-1), trigger_frame(-1), frames_observed(0), 
                             frames_waiting(0), is_active(false), waiting_for_deceleration(false),
                             aligned_frames(0), valid_angle_frames(0), rotation_detected(false), flat_posture_frames(0), 
-                            accumulated_bed_ratio(0.0f), peak_momentum(0.0f) {}
+                            accumulated_bed_ratio(0.0f), peak_momentum(0.0f),
+                            trigger_pixel_count(0), accumulated_pixel_count(0) {}
+
+        // Area Tracking
+        int trigger_pixel_count;
+        long accumulated_pixel_count;
+
+        // Fall Visualization Persistence
+        int post_fall_counter = 0;
+        float fall_snapshot_dx = 0.0f;
+        float fall_snapshot_dy = 0.0f;
+        float fall_snapshot_mom = 0.0f;
     };
     std::map<int, ObservationState> observation_states;
 
@@ -4617,9 +4628,9 @@ StatusCode FallDetector::Detect(const Image& frame, bool& is_fall) {
                 }
                 float recent_mom_avg = recent_mom_sum / recent_window;
 
-                const float threshold1 = 5.5f;  // High momentum trigger (peak detection)
+                const float threshold1 = 7.f;  // High momentum trigger (peak detection)
                 const float decel_threshold = 4.0f;  // Deceleration complete threshold
-                const float threshold2 = 5.5f;  // Low momentum threshold - Balanced for ~90% TP retention
+                const float threshold2 = 6.5f;  // Low momentum threshold - Balanced for ~90% TP retention
                 const int observation_frames = 90;  // Extended from 60 to 120 frames (4 seconds @ 30fps)
                 const int max_waiting_frames = 30;  // Max frames to wait for deceleration
 
@@ -4628,28 +4639,50 @@ StatusCode FallDetector::Detect(const Image& frame, bool& is_fall) {
                 // Step 2: Trigger on high momentum peak
                 if (recent_mom_avg >= threshold1) {
                     bool start_new_trigger = false;
+                    bool suppress_trigger = false;
 
-                    // Scenario A: First Trigger
-                    if (!state.is_active && !state.waiting_for_deceleration) {
-                        start_new_trigger = true;
-                    } 
-                    // Scenario B: Re-Trigger during Wait (Extend Wait or Reset)
-                    else if (state.waiting_for_deceleration) {
-                        // If momentum keeps rising, just reset the wait counter
-                        // state.frames_waiting = 0; // Optional: Keep waiting
-                        // printf("[Case5] ID:%d High Momentum continues... resetting wait check.\n", curr.id);
-                        // Actually, better to just let it ride, but if we want to capture the *peak*, we might update trigger_frame.
-                        if (recent_mom_avg > state.peak_momentum) { // Need to track peak?
-                             // Just reset wait count to ensure we don't timeout mid-fall
-                             state.frames_waiting = 0;
+                    // NEW: Edge Object Filter (Suppress small objects appearing at edge)
+                    // Grid dimensions: pImpl->config.grid_cols, pImpl->config.grid_rows
+                    int g_cols = pImpl->config.grid_cols;
+                    int g_rows = pImpl->config.grid_rows;
+                    
+                    if (curr.pixel_count < 2000 && // Small Object
+                        (curr.centerX < 2.0f || curr.centerX >= (g_cols - 2.0f) || 
+                         curr.centerY < 2.0f || curr.centerY >= (g_rows - 2.0f))) {
+                        
+                        suppress_trigger = true;
+                        printf("[Case5] IGNORED Edge Trigger: ID:%d Area:%d Pos:(%.1f, %.1f) Mom:%.2f\n", 
+                               curr.id, curr.pixel_count, curr.centerX, curr.centerY, recent_mom_avg);
+                        
+                        // NEW: Abort if already waiting (e.g. jumped to edge)
+                        if (state.waiting_for_deceleration) {
+                            state.waiting_for_deceleration = false;
+                            state.is_active = false; // Reset
+                             printf("[Case5] ABORTED Trigger: ID:%d Moved to Edge during Wait\n", curr.id);
                         }
+                        // Don't start trigger
                     }
-                    // Scenario C: Re-Trigger during Observation (The "Walk then Fall" case)
-                    else if (state.is_active) {
-                        printf("[Case5] ID:%d RE-TRIGGER detected during observation (new peak=%.2f) - restarting logic.\n", 
-                               curr.id, recent_mom_avg);
-                        pImpl->LogTrace(curr.id, pImpl->frame_idx, "RE-TRIGGER", recent_mom_avg, "New Impact during Obs");
-                        start_new_trigger = true;
+                    
+                    if (!suppress_trigger) {
+                        // Scenario A: First Trigger
+                        if (!state.is_active && !state.waiting_for_deceleration) {
+                            start_new_trigger = true;
+                        } 
+                        // Scenario B: Re-Trigger during Wait (Extend Wait or Reset)
+                        else if (state.waiting_for_deceleration) {
+                            // If momentum keeps rising, just reset the wait counter
+                            if (recent_mom_avg > state.peak_momentum) { // Need to track peak?
+                                 // Just reset wait count to ensure we don't timeout mid-fall
+                                 state.frames_waiting = 0;
+                            }
+                        }
+                        // Scenario C: Re-Trigger during Observation (The "Walk then Fall" case)
+                        else if (state.is_active) {
+                            printf("[Case5] ID:%d RE-TRIGGER detected during observation (new peak=%.2f) - restarting logic.\n", 
+                                   curr.id, recent_mom_avg);
+                            pImpl->LogTrace(curr.id, pImpl->frame_idx, "RE-TRIGGER", recent_mom_avg, "New Impact during Obs");
+                            start_new_trigger = true;
+                        }
                     }
 
                     if (start_new_trigger) {
@@ -4664,9 +4697,11 @@ StatusCode FallDetector::Detect(const Image& frame, bool& is_fall) {
                         state.accumulated_bed_ratio = 0.0f; // Reset accumulators
                         state.flat_posture_frames = 0;
                         state.peak_momentum = recent_mom_avg; // NEW: Init peak
+                        state.trigger_pixel_count = curr.pixel_count; // NEW: Store Trigger Area
+                        state.accumulated_pixel_count = 0;
                         
-                        printf("[Case5] ID:%d PEAK detected at frame %d (peak_mom=%.2f >= %.2f) - waiting for deceleration\n", 
-                               curr.id, pImpl->frame_idx, recent_mom_avg, threshold1);
+                        printf("[Case5] ID:%d PEAK detected at frame %d (peak_mom=%.2f >= %.2f Area:%d) - waiting for deceleration\n", 
+                               curr.id, pImpl->frame_idx, recent_mom_avg, threshold1, curr.pixel_count);
                         pImpl->LogTrace(curr.id, pImpl->frame_idx, "TRIGGER", recent_mom_avg, "Peak Momentum > 5.5");
                     }
                 }
@@ -4740,6 +4775,7 @@ StatusCode FallDetector::Detect(const Image& frame, bool& is_fall) {
                     curr.is_in_observation_mode = true; // NEW: Flag for visualization
                     state.momentum_samples.push_back(curr.strength);
                     state.frames_observed++;
+                    state.accumulated_pixel_count += curr.pixel_count; // NEW: Accumulate Area
                     
                     // Step 4.0: Aspect Ratio Check (Flat Posture)
                     int box_w = 0, box_h = 0, m1, m2, m3, m4;
@@ -5042,6 +5078,24 @@ StatusCode FallDetector::Detect(const Image& frame, bool& is_fall) {
                                     printf("[Case5] ID:%d PERSPECTIVE ALIGNED (Majority): Ratio=%.2f > 0.75\n", curr.id, alignment_ratio);
                                     pImpl->LogTrace(curr.id, pImpl->frame_idx, "FILTER_PERSP", alignment_ratio, "Perspective Aligned > 0.75");
                                     
+                                    // NEW: Area Difference Override
+                                    // If the object area changed significantly between Trigger and Observation,
+                                    // it suggests a posture change (e.g., Standing -> Lying) even if it aligns with perspective line.
+                                    if (state.trigger_pixel_count > 0 && state.frames_observed > 0) {
+                                        float avg_obs_area = (float)state.accumulated_pixel_count / state.frames_observed;
+                                        float area_diff_ratio = std::abs((float)state.trigger_pixel_count - avg_obs_area) / state.trigger_pixel_count;
+                                        
+                                        printf("[Case5-Area] ID:%d TriggerArea:%d AvgObsArea:%.1f DiffRatio:%.2f\n", 
+                                               curr.id, state.trigger_pixel_count, avg_obs_area, area_diff_ratio);
+                                        
+                                        if (area_diff_ratio > 0.60f) { // 60% change threshold (Tuned)
+                                            perspective_aligned = false; // Override!
+                                            printf("[Case5] ID:%d PERSPECTIVE OVERRIDE: Area Change %.2f > 0.60 (Trigger:%d -> Obs:%.1f)\n", 
+                                                   curr.id, area_diff_ratio, state.trigger_pixel_count, avg_obs_area);
+                                            pImpl->LogTrace(curr.id, pImpl->frame_idx, "FILTER_OVERRIDE", area_diff_ratio, "Area Change Override");
+                                        }
+                                    }
+                                    
                                 } else {
                                     printf("[Case5] ID:%d NOT ALIGNED (Majority): Ratio=%.2f <= 0.75\n", curr.id, alignment_ratio);
                                 }
@@ -5058,6 +5112,12 @@ StatusCode FallDetector::Detect(const Image& frame, bool& is_fall) {
                                        curr.id, obs_mom_avg, obs_min_mom, obs_max_mom, current_threshold2, (is_flat_posture?"YES":"NO"), state.flat_posture_frames, state.frames_observed, state.trigger_frame, state.frames_observed);
                                 
                                 pImpl->LogTrace(curr.id, pImpl->frame_idx, "DETECTED", obs_mom_avg, (is_flat_posture ? "Adaptive Threshold Passed" : "Normal Threshold Passed"));
+
+                                // Activate Persistence
+                                state.post_fall_counter = 50; 
+                                state.fall_snapshot_dx = curr.avgDx;
+                                state.fall_snapshot_dy = curr.avgDy;
+                                state.fall_snapshot_mom = std::sqrt(curr.avgDx*curr.avgDx + curr.avgDy*curr.avgDy);
 
                             } else {
                                 printf("[Case5] ID:%d observation ENDED - PERSPECTIVE ALIGNED (obs_avg=%.2f, min=%.2f, max=%.2f) < %.2f but NOT a fall (Flat: %d/%d)\n", 
@@ -5082,6 +5142,23 @@ StatusCode FallDetector::Detect(const Image& frame, bool& is_fall) {
                 }
             }
             
+            // --- PERSISTENCE CHECK (Fall Visualization) ---
+            {
+                auto& state = pImpl->observation_states[curr.id];
+                if (state.post_fall_counter > 0) {
+                     state.post_fall_counter--;
+                     
+                     // Force Fall Result for visualization
+                     potential_fall = true;
+                     fall_type = "Persistent_Fall_Viz";
+                     
+                     // Override MotionObject momentum to ensure Red Arrow is drawn
+                     if (state.fall_snapshot_mom > 0) {
+                         curr.avgDx = state.fall_snapshot_dx;
+                         curr.avgDy = state.fall_snapshot_dy;
+                     }
+                }
+            }
             
             if (potential_fall) {
                 // Common Checks: Bed Region & Leaving Scene & Static

@@ -18,6 +18,10 @@
 #define STB_IMAGE_WRITE_IMPLEMENTATION
 #include "stb_image_write.h"
 
+#define USE_FFMPEG_READER 1
+#include "ffmpeg_precoss.h" // 加入這行
+
+
 using namespace VisionSDK;
 
 #include <sys/stat.h>
@@ -702,12 +706,19 @@ int main(int argc, char** argv) {
     };
     std::vector<FallInterval> detected_intervals_vec;
 
+
+    #if USE_FFMPEG_READER
+    VideoReader reader(video_path, 800, 450);
+    #endif
+
     // Main processing loop
     int total_frames = start_frame + num_images; // Define total_frames based on existing variables
     for (int i = start_frame; i < total_frames; i += frame_step) {
         
         auto t_read_start = std::chrono::steady_clock::now();
-
+#ifndef USE_FFMPEG_READER
+        reader.readFrame(file_buffer);
+        
         char raw_name[256];
         snprintf(raw_name, sizeof(raw_name), pattern.c_str(), i);
         
@@ -718,7 +729,13 @@ int main(int argc, char** argv) {
         }
         file.read(reinterpret_cast<char*>(file_buffer.data()), frame_size_rgb);
         file.close();
-
+#else
+        // 讀取 MP4 的下一幀到 file_buffer 中，並自動 Resize 轉 RGB
+        if (!videoReader.readFrame(file_buffer)) {
+            std::cout << "影片讀取完畢或發生錯誤，結束迴圈。" << std::endl;
+            break; // 影片結束就跳出迴圈
+        }
+#endif
         // Timer End for Read
         auto t_read_end = std::chrono::steady_clock::now();
         double read_duration_ms = std::chrono::duration<double, std::milli>(t_read_end - t_read_start).count();
