@@ -31,6 +31,69 @@ namespace VisionSDK {
 namespace {
 
 // =========================================================
+// Homography Utilities (Manual Implementation)
+// =========================================================
+// Gaussian elimination solver for Ax=b
+bool solveLinearSystem(int N, const float* A, const float* b, float* x) {
+    std::vector<float> M(N * (N + 1));
+    for (int i = 0; i < N; ++i) {
+        for (int j = 0; j < N; ++j) M[i * (N + 1) + j] = A[i * N + j];
+        M[i * (N + 1) + N] = b[i];
+    }
+    for (int i = 0; i < N; ++i) {
+        int pivot = i;
+        for (int j = i + 1; j < N; ++j) {
+            if (std::abs(M[j * (N + 1) + i]) > std::abs(M[pivot * (N + 1) + i])) pivot = j;
+        }
+        if (std::abs(M[pivot * (N + 1) + i]) < 1e-6) return false;
+        if (pivot != i) {
+            for (int k = i; k <= N; ++k) std::swap(M[i * (N + 1) + k], M[pivot * (N + 1) + k]);
+        }
+        float div = M[i * (N + 1) + i];
+        for (int k = i; k <= N; ++k) M[i * (N + 1) + k] /= div;
+        for (int j = 0; j < N; ++j) {
+            if (i != j) {
+                float mul = M[j * (N + 1) + i];
+                for (int k = i; k <= N; ++k) M[j * (N + 1) + k] -= mul * M[i * (N + 1) + k];
+            }
+        }
+    }
+    for (int i = 0; i < N; ++i) x[i] = M[i * (N + 1) + N];
+    return true;
+}
+
+// Compute Homography Matrix H (3x3) using 4 point correspondences
+bool computeHomography(const std::vector<std::pair<int, int>>& src_points, float target_w, float target_h, float H[9]) {
+    if (src_points.size() != 4) return false;
+    float dst_x[] = {0.0f, target_w, target_w, 0.0f};
+    float dst_y[] = {0.0f, 0.0f, target_h, target_h};
+    float A[64] = {0};
+    float b[8] = {0};
+    for (int i = 0; i < 4; ++i) {
+        float sx = (float)src_points[i].first;
+        float sy = (float)src_points[i].second;
+        float dx = dst_x[i];
+        float dy = dst_y[i];
+        int r1 = 2 * i;
+        A[r1*8+0]=sx; A[r1*8+1]=sy; A[r1*8+2]=1.0f; A[r1*8+6]=-sx*dx; A[r1*8+7]=-sy*dx; b[r1]=dx;
+        int r2 = 2 * i + 1;
+        A[r2*8+3]=sx; A[r2*8+4]=sy; A[r2*8+5]=1.0f; A[r2*8+6]=-sx*dy; A[r2*8+7]=-sy*dy; b[r2]=dy;
+    }
+    float x[8];
+    if (!solveLinearSystem(8, A, b, x)) return false;
+    H[0]=x[0]; H[1]=x[1]; H[2]=x[2]; H[3]=x[3]; H[4]=x[4]; H[5]=x[5]; H[6]=x[6]; H[7]=x[7]; H[8]=1.0f;
+    return true;
+}
+
+void projectPoint(float u, float v, const float H[9], float& x, float& y) {
+    float z = H[6] * u + H[7] * v + H[8];
+    if (std::abs(z) > 1e-4) {
+        x = (H[0] * u + H[1] * v + H[2]) / z;
+        y = (H[3] * u + H[4] * v + H[5]) / z;
+    } else { x = 0; y = 0; }
+}
+
+// =========================================================
 // Visualization Utilities (RGB)
 // =========================================================
 
@@ -569,6 +632,8 @@ struct TimerGuard {
         prof->add(name, ms);
     }
 };
+
+static FunctionTimer g_perf_timer;
 
 // ==================================================================================
 //  OptimizedBlockMotionEstimator (from C_V2_EDGE.cpp)
@@ -2358,6 +2423,8 @@ public:
     // New fields
     // Bed Region
     std::vector<std::pair<int, int>> bed_region = {{0,0}, {100,0}, {100,100}, {0,100}}; // Default
+    bool has_homography = false;
+    float homography_matrix[9];
 
     // Logic
     int fall_confirmation_counter = 0;
@@ -2722,9 +2789,19 @@ void FallDetector::SetConfig(const InternalConfig& config) {
 
 void FallDetector::SetBedRegion(const std::vector<std::pair<int, int>>& points) {
     pImpl->bed_region = points;
-    // Invalidate mask, will be recreated in Detect() when frame size is known
     pImpl->hasBedMask = false; 
-    if (!points.empty()) pImpl->hasBedMask = true; // Signal that we have a region
+    if (!points.empty()) {
+        pImpl->hasBedMask = true; // Signal that we have a region
+        if(points.size() == 4) {
+             pImpl->has_homography = computeHomography(points, 100.0f, 200.0f, pImpl->homography_matrix);
+             if(pImpl->has_homography) printf("[FallDetector] Homography Computed Successfully.\n");
+             else printf("[FallDetector] Failed to compute Homography (Singular?).\n");
+        } else {
+             pImpl->has_homography = false;
+        }
+    } else {
+        pImpl->has_homography = false;
+    }
     pImpl->bedMask = ::Image(); // Clear
 }
 
@@ -3566,6 +3643,8 @@ StatusCode FallDetector::Detect(const Image& frame, bool& is_fall) {
     // Needs Gray Image (1 channel) for correct stride/SAD in OptimizedBlockMotionEstimator
     ::Image wrapper(W, H, 1);
     
+    {
+    TimerGuard t_img(g_perf_timer, "0_ImageConv");
     if (frame.channels == 3) {
         // Simple RGB -> Gray Conversion
         const uint8_t* src = frame.data;
@@ -3582,6 +3661,7 @@ StatusCode FallDetector::Detect(const Image& frame, bool& is_fall) {
     } else if (frame.channels == 1) {
         memcpy(wrapper.getData(), frame.data, W * H);
     }
+    } // End ImageConv Timer
 
     // V3: Background Update Logic (Using Gray Image)
     // Background Update
@@ -3592,12 +3672,13 @@ StatusCode FallDetector::Detect(const Image& frame, bool& is_fall) {
         if (isInitPhase || (pImpl->bg_update_counter >= pImpl->config.bg_update_interval_frames)) {
             // Only periodic update if NOT in init phase (init phase handled inside updateBackground)
             // Wait, updateBackground logic handles check.
-            // 4. Background Update
-    #if ENABLE_PERF_PROFILING
-    long long t3 = pImpl->get_now_us();
-    #endif
-    printf("[Debug] Calling updateBackground...\n");
-    pImpl->updateBackground(wrapper, pImpl->config, pImpl->frame_idx); // Using frame_idx or absolute?
+    // 4. Background Update
+    {
+        TimerGuard t_bg(g_perf_timer, "1_BackgroundUpdate");
+        printf("[Debug] Calling updateBackground...\n");
+        pImpl->updateBackground(wrapper, pImpl->config, pImpl->frame_idx); 
+        printf("[Debug] updateBackground Done.\n");
+    }
                                                                       // Internal frame_idx is usually 0 if not set?
                                                                       // Wait, pImpl->frame_idx is 0. 
                                                                       // Maybe we should pass absolute_frame_count?
@@ -3617,6 +3698,7 @@ StatusCode FallDetector::Detect(const Image& frame, bool& is_fall) {
     int global_fg_count = 0;
     if (pImpl->backgroundFrame.width() > 0) 
     {
+        // TimerGuard moved to inner scope to protect maskData lifetime
         // Create Binary Mask
         int w = wrapper.width();
         int h = wrapper.height();
@@ -3630,6 +3712,8 @@ StatusCode FallDetector::Detect(const Image& frame, bool& is_fall) {
         int bed_w = (pImpl->hasBedMask) ? pImpl->bedMask.width() : 0;
         int bed_h = (pImpl->hasBedMask) ? pImpl->bedMask.height() : 0;
 
+        {
+        TimerGuard t_mask(g_perf_timer, "1_5_BGMask_FindObj");
         for(int i = 0; i < w * h; ++i) {
             int diff = std::abs((int)curr[i] - (int)bg[i]);
             
@@ -3645,9 +3729,12 @@ StatusCode FallDetector::Detect(const Image& frame, bool& is_fall) {
         // Identify and store full-frame foreground objects
         // Identify and store full-frame foreground objects
         pImpl->full_frame_objects = find_objects_optimized(maskData.data(), w, h, 20, pImpl->config.foreground_merge_radius); // Min area 20, config merge radius
+    } // End BGMask Timer
 
         // --- NEW: Optical Flow (Integer-LK) for top 2 objects ---
-        if ((int)pImpl->raw_frame_history.size() >= max_history) {
+    {
+    TimerGuard t_lk(g_perf_timer, "1_6_SparseLK");
+    if ((int)pImpl->raw_frame_history.size() >= max_history) {
             // Sort objects by area descending
             std::vector<::VisionSDK::ObjectFeatures*> sorted_objs;
             for (auto& obj : pImpl->full_frame_objects) {
@@ -3669,13 +3756,14 @@ StatusCode FallDetector::Detect(const Image& frame, bool& is_fall) {
             for (int i = 0; i < num_to_process; ++i) {
                 auto* obj = sorted_objs[i];
 #if defined(__ARM_NEON) || defined(__ARM_NEON__)
-                pImpl->computeIntegerLK_NEON(prev_frame, curr_frame, obj->pixels, obj->pixel_dx, obj->pixel_dy, obj->pixel_dir);
+                // OPTIMIZATION: Diabled unused LK calculation
+                // pImpl->computeIntegerLK_NEON(prev_frame, curr_frame, obj->pixels, obj->pixel_dx, obj->pixel_dy, obj->pixel_dir);
 #else
-                pImpl->computeIntegerLK(prev_frame, curr_frame, obj->pixels, obj->pixel_dx, obj->pixel_dy, obj->pixel_dir);
+                // pImpl->computeIntegerLK(prev_frame, curr_frame, sorted_objs[i]->pixels, sorted_objs[i]->pixel_dx, sorted_objs[i]->pixel_dy, sorted_objs[i]->pixel_dir);
 #endif
             }
         }
-        
+    } // End SparseLK Timer    
         // Optional: Save BG Mask if configured
         if (pImpl->config.enable_save_bg_mask) {
              // (Logic for saving here if needed)
@@ -3747,6 +3835,7 @@ StatusCode FallDetector::Detect(const Image& frame, bool& is_fall) {
     #endif
 
     // --- 0. Face Detection Integration ---
+    // Face variables declared in outer scope
     #if ENABLE_PERF_PROFILING
     long long t_face_start = pImpl->get_now_us();
     #endif
@@ -3772,6 +3861,8 @@ StatusCode FallDetector::Detect(const Image& frame, bool& is_fall) {
     // Resize for Face Detection (Uses RGB frame)
     Image faceInput;
     // std::cout << "[FallDetector] Calling FaceDetector Resize..." << std::endl; // Commented out
+    {
+    TimerGuard t_face(g_perf_timer, "1_9_FaceDetect");
     if (pImpl->config.enable_face_detection) {
         if (pImpl->faceDetector.Resize(frame, faceInput)) {
              // std::cout << "[FallDetector] Resize success. Calling Detect..." << std::endl;
@@ -3785,7 +3876,10 @@ StatusCode FallDetector::Detect(const Image& frame, bool& is_fall) {
         } else {
             // std::cout << "[FallDetector] Resize failed!" << std::endl;
         }
+        }
     }
+
+    // End Face logic
     
     #if ENABLE_PERF_PROFILING
     long long t_face_end = pImpl->get_now_us();
@@ -3798,13 +3892,16 @@ StatusCode FallDetector::Detect(const Image& frame, bool& is_fall) {
 
     // Run    // 2. Motion Estimation Execute
     printf("[Debug] Estimator->blockBasedMotionEstimation Start\n");
-    pImpl->estimator->blockBasedMotionEstimation(wrapper, 
-                                               pImpl->motion_vectors, 
-                                               pImpl->positions, 
-                                               pImpl->changed_mask, 
-                                               pImpl->active_blocks, 
-                                               pImpl->active_indices,
-                                               pImpl->config.block_dilation_threshold);
+    {
+        TimerGuard t_me(g_perf_timer, "2_MotionEstimation");
+        pImpl->estimator->blockBasedMotionEstimation(wrapper, 
+                                                   pImpl->motion_vectors, 
+                                                   pImpl->positions, 
+                                                   pImpl->changed_mask, 
+                                                   pImpl->active_blocks, 
+                                                   pImpl->active_indices,
+                                                   pImpl->config.block_dilation_threshold);
+    }
     
     // NEW: Bed Region Foreground Masking (User Request)
     // "找完前景點時, 在床的區域內的點, 直接當背景點"
@@ -3851,28 +3948,29 @@ StatusCode FallDetector::Detect(const Image& frame, bool& is_fall) {
     #endif
 
     // 2. Extract Objects
-    // 2. Extract Objects
-    // Save previous
     pImpl->previous_objects = pImpl->current_objects;
     
-    pImpl->current_objects = extractMotionObjects(pImpl->motion_vectors, 
-                                                  pImpl->changed_mask,
-                                                  pImpl->config.grid_rows, 
-                                                  pImpl->config.grid_cols, 
-                                                  pImpl->config.object_extraction_threshold, 
-                                                  pImpl->config.object_merge_radius);
-                                                  
-    // TRACKING
-    TrackObjects(pImpl->current_objects, 
-                 pImpl->previous_objects, 
-                 pImpl->config, 
-                 pImpl->kalmanFilters, 
-                 pImpl->track_ttl, 
-                 pImpl->global_id_counter,
-                 pImpl->object_first_seen_frame, 
-                 pImpl->object_is_new_entry, 
-                 pImpl->persistent_object_blocks, 
-                 (int)pImpl->frame_idx);
+    {
+        TimerGuard t_track(g_perf_timer, "3_TrackingAndExtraction");
+        pImpl->current_objects = extractMotionObjects(pImpl->motion_vectors, 
+                                                      pImpl->changed_mask,
+                                                      pImpl->config.grid_rows, 
+                                                      pImpl->config.grid_cols, 
+                                                      pImpl->config.object_extraction_threshold, 
+                                                      pImpl->config.object_merge_radius);
+                                                      
+        // TRACKING
+        TrackObjects(pImpl->current_objects, 
+                     pImpl->previous_objects, 
+                     pImpl->config, 
+                     pImpl->kalmanFilters, 
+                     pImpl->track_ttl, 
+                     pImpl->global_id_counter,
+                     pImpl->object_first_seen_frame, 
+                     pImpl->object_is_new_entry, 
+                     pImpl->persistent_object_blocks, 
+                     (int)pImpl->frame_idx);
+    }
     
     // INJECT LOST TRACKS (Coasting)
     // Ensures trend analysis sees valid data even if motion stops (High -> Low)
@@ -3908,8 +4006,31 @@ StatusCode FallDetector::Detect(const Image& frame, bool& is_fall) {
              
              // Only inject if it has blocks (history)
              if (!predObj.blocks.empty()) {
-                  pImpl->current_objects.push_back(predObj);
-                  printf("[FallDetector] Injected Coasting Object %d (Str: %.2f, Blocks: %zu)\n", id, predObj.strength, predObj.blocks.size());
+                  // Filter by State (Only inject if Falling/Observing or recently fell)
+                  bool should_inject = false;
+                  if (pImpl->observation_states.count(id)) {
+                      const auto& s = pImpl->observation_states[id];
+                      // If state exists, it implies we are observing or handling post-fall.
+                      // Check frames_observed to be safe? Or just assumed active.
+                      should_inject = true; 
+                      
+                      // CRITICAL: Propagate observation flag to the predicted object!
+                      predObj.is_in_observation_mode = true; 
+
+                      if (id == 1018) {
+                          printf("[DebugInject] ID:1018 FoundState. FramesObs:%d PostFall:%d Blocks:%zu ShouldInject:%d\n", 
+                                 s.frames_observed, s.post_fall_counter, predObj.blocks.size(), should_inject);
+                      }
+                  } else {
+                      if (id == 1018) printf("[DebugInject] ID:1018 No State Found!\n");
+                  }
+
+                  if (should_inject) {
+                      pImpl->current_objects.push_back(predObj);
+                      printf("[FallDetector] Injected Coasting Object %d (Str: %.2f, Blocks: %zu)\n", id, predObj.strength, predObj.blocks.size());
+                  }
+             } else {
+                 if (id == 1018) printf("[DebugInject] ID:1018 Blocks Empty!\n");
              }
         }
     }
@@ -4339,6 +4460,8 @@ StatusCode FallDetector::Detect(const Image& frame, bool& is_fall) {
 
 
     // --- NEW LOGIC: Direction-Based Detection (User Request) ---
+    {
+    TimerGuard t_logic(g_perf_timer, "4_FallLogic");
     // 1. Global Motion Safety Guard: Reject if > 1/4 screen is moving
     int total_grid_blocks = pImpl->config.grid_cols * pImpl->config.grid_rows;
     if (pImpl->active_blocks.size() > (size_t)(total_grid_blocks / 4)) {
@@ -4628,7 +4751,7 @@ StatusCode FallDetector::Detect(const Image& frame, bool& is_fall) {
                 }
                 float recent_mom_avg = recent_mom_sum / recent_window;
 
-                const float threshold1 = 7.f;  // High momentum trigger (peak detection)
+                const float threshold1 = 6.f;  // High momentum trigger (peak detection)
                 const float decel_threshold = 4.0f;  // Deceleration complete threshold
                 const float threshold2 = 6.5f;  // Low momentum threshold - Balanced for ~90% TP retention
                 const int observation_frames = 90;  // Extended from 60 to 120 frames (4 seconds @ 30fps)
@@ -4677,11 +4800,49 @@ StatusCode FallDetector::Detect(const Image& frame, bool& is_fall) {
                             }
                         }
                         // Scenario C: Re-Trigger during Observation (The "Walk then Fall" case)
+                        // Scenario C: Re-Trigger during Observation (The "Walk then Fall" case)
                         else if (state.is_active) {
-                            printf("[Case5] ID:%d RE-TRIGGER detected during observation (new peak=%.2f) - restarting logic.\n", 
-                                   curr.id, recent_mom_avg);
-                            pImpl->LogTrace(curr.id, pImpl->frame_idx, "RE-TRIGGER", recent_mom_avg, "New Impact during Obs");
-                            start_new_trigger = true;
+                            // NEW: Suppress Re-Trigger if we are deep in observation or flat posture (Post-Fall Struggle)
+                            bool suppress_retrigger = false;
+                            
+                            // 1. Duration / Flatness Check
+                            if (state.frames_observed > 45 || state.flat_posture_frames > 10) {
+                                suppress_retrigger = true;
+                            }
+                            
+                            // 2. Aspect Ratio Check (Lying Down)
+                            // If W > H*1.2 (Lying) and Momentum is not huge (< 12.0), it's likely struggle.
+                            // ALSO check Projection Dist < 250cm (Lying)
+                            float rt_proj_dist = 9999.0f;
+                            if (box_h > 0) {
+                                float ar = (float)box_w / (float)box_h;
+                                
+                                // Calc Projection
+                                float top_u = curr.centerX;
+                                float top_v = (float)m2; // min_y
+                                float bot_u = curr.centerX;
+                                float bot_v = (float)m4; // max_y
+                                float tx, ty, bx, by;
+                                projectPoint(top_u, top_v, pImpl->homography_matrix, tx, ty);
+                                projectPoint(bot_u, bot_v, pImpl->homography_matrix, bx, by);
+                                float pdx = tx - bx;
+                                float pdy = ty - by;
+                                rt_proj_dist = std::sqrt(pdx*pdx + pdy*pdy);
+
+                                if ((ar > 1.2f || rt_proj_dist < 250.0f) && recent_mom_avg < 12.0f) {
+                                    suppress_retrigger = true;
+                                }
+                            }
+                            
+                            if (suppress_retrigger) {
+                                printf("[Case5] ID:%d Re-Trigger IGNORED (Post-Fall Struggle? Obs:%d Flat:%d Mom:%.2f AR:%.2f Proj:%.1f)\n", 
+                                       curr.id, state.frames_observed, state.flat_posture_frames, recent_mom_avg, (box_h>0?(float)box_w/box_h:0), rt_proj_dist);
+                            } else {
+                                printf("[Case5] ID:%d RE-TRIGGER detected during observation (new peak=%.2f) - restarting logic.\n", 
+                                       curr.id, recent_mom_avg);
+                                pImpl->LogTrace(curr.id, pImpl->frame_idx, "RE-TRIGGER", recent_mom_avg, "New Impact during Obs");
+                                start_new_trigger = true;
+                            }
                         }
                     }
 
@@ -4972,7 +5133,7 @@ StatusCode FallDetector::Detect(const Image& frame, bool& is_fall) {
                                 }
                                 
                                 state.valid_angle_frames++;
-                                if (angle_diff < 30.0f) {
+                                if (angle_diff < 30.0f) {  // Small diff = Aligned with perspective = NOT a fall
                                     state.aligned_frames++;
                                 }
                             }
@@ -5040,10 +5201,19 @@ StatusCode FallDetector::Detect(const Image& frame, bool& is_fall) {
                                 }
                                 
                                 if (center_in_bed_flag || avg_bed_ratio > 0.30f) {
-                                    is_bed_event = true;
-                                     printf("[Case5] ID:%d Rejected: Bed Event (Center:%d, AvgRatio:%.2f > 0.30)\n", 
-                                            curr.id, center_in_bed_flag, avg_bed_ratio);
-                                     pImpl->LogTrace(curr.id, pImpl->frame_idx, "FILTER_BED", avg_bed_ratio, "Bed Region Reject");
+                                    // Relaxed Check: If Center is in Bed, we still require SOME motion blocks in bed (e.g. > 10%)
+                                    // to avoid rejecting objects that are mostly outside but have center slightly inside (or ghost center).
+                                    bool confirm_bed = true;
+                                    if (center_in_bed_flag && avg_bed_ratio < 0.10f) {
+                                        confirm_bed = false;
+                                    }
+                                    
+                                    if (confirm_bed) {
+                                        is_bed_event = true;
+                                        printf("[Case5] ID:%d Rejected: Bed Event (Center:%d, AvgRatio:%.2f)\n", 
+                                                curr.id, center_in_bed_flag, avg_bed_ratio);
+                                        pImpl->LogTrace(curr.id, pImpl->frame_idx, "FILTER_BED", avg_bed_ratio, "Bed Region Reject");
+                                    }
                                 }
                             }
 
@@ -5060,51 +5230,131 @@ StatusCode FallDetector::Detect(const Image& frame, bool& is_fall) {
                                 printf("[Case5-RATIO] ID:%d F:%d Aligned=%d/%d (Ratio=%.2f)\n", 
                                        curr.id, pImpl->frame_idx, state.aligned_frames, state.valid_angle_frames, alignment_ratio);
                                 
-                                // If > 75% of valid frames are aligned, consider it a non-fall (lying down aligned)
-                                // UNLESS Rotation (Head-First) was detected, in which case we TRUST the fall (Bypass Filter)
-                                if (state.valid_angle_frames > 10 && alignment_ratio > 0.75f) {
-                                    /*
-                                    if (!state.rotation_detected) {
-                                        perspective_aligned = true;
-                                        printf("[Case5] ID:%d PERSPECTIVE ALIGNED (Majority): Ratio=%.2f > 0.75\n", curr.id, alignment_ratio);
-                                        pImpl->LogTrace(curr.id, pImpl->frame_idx, "FILTER_PERSP", alignment_ratio, "Perspective Aligned > 0.75");
-                                    } else {
-                                        printf("[Case5] ID:%d PERSPECTIVE CHECK BYPASSED due to ROTATION DETECTED. (Ratio=%.2f would have filtered)\n", curr.id, alignment_ratio);
-                                        pImpl->LogTrace(curr.id, pImpl->frame_idx, "FILTER_BYPASS", 1.0f, "Rotation Detected Bypass");
-                                    }
-                                    */
-                                    // Original Logic (No Rotation Bypass)
-                                    perspective_aligned = true;
+                                // Base Verdict based on Angle Ratio
+                                bool ratio_aligned = (state.valid_angle_frames > 10 && alignment_ratio > 0.75f);
+                                perspective_aligned = ratio_aligned;
+
+                                if (ratio_aligned) {
                                     printf("[Case5] ID:%d PERSPECTIVE ALIGNED (Majority): Ratio=%.2f > 0.75\n", curr.id, alignment_ratio);
                                     pImpl->LogTrace(curr.id, pImpl->frame_idx, "FILTER_PERSP", alignment_ratio, "Perspective Aligned > 0.75");
-                                    
-                                    // NEW: Area Difference Override
-                                    // If the object area changed significantly between Trigger and Observation,
-                                    // it suggests a posture change (e.g., Standing -> Lying) even if it aligns with perspective line.
-                                    if (state.trigger_pixel_count > 0 && state.frames_observed > 0) {
-                                        float avg_obs_area = (float)state.accumulated_pixel_count / state.frames_observed;
-                                        float area_diff_ratio = std::abs((float)state.trigger_pixel_count - avg_obs_area) / state.trigger_pixel_count;
-                                        
-                                        printf("[Case5-Area] ID:%d TriggerArea:%d AvgObsArea:%.1f DiffRatio:%.2f\n", 
-                                               curr.id, state.trigger_pixel_count, avg_obs_area, area_diff_ratio);
-                                        
-                                        if (area_diff_ratio > 0.60f) { // 60% change threshold (Tuned)
-                                            perspective_aligned = false; // Override!
-                                            printf("[Case5] ID:%d PERSPECTIVE OVERRIDE: Area Change %.2f > 0.60 (Trigger:%d -> Obs:%.1f)\n", 
-                                                   curr.id, area_diff_ratio, state.trigger_pixel_count, avg_obs_area);
-                                            pImpl->LogTrace(curr.id, pImpl->frame_idx, "FILTER_OVERRIDE", area_diff_ratio, "Area Change Override");
-                                        }
-                                    }
-                                    
                                 } else {
                                     printf("[Case5] ID:%d NOT ALIGNED (Majority): Ratio=%.2f <= 0.75\n", curr.id, alignment_ratio);
                                 }
+                                
+                                // NEW: Projection, Shrinkage & Area Override Logic (Runs UNCONDITIONALLY to correct Angle Verdict)
+                                if (state.trigger_pixel_count > 0 && state.frames_observed > 0) {
+                                    float avg_obs_area = (float)state.accumulated_pixel_count / state.frames_observed;
+                                    float area_diff_ratio = std::abs((float)state.trigger_pixel_count - avg_obs_area) / state.trigger_pixel_count;
+                                    
+                                    // 2. Position-based dynamic minimum area threshold
+                                    int base_min_area = pImpl->config.min_trigger_area;
+                                    float y_ratio = (float)curr.centerY / pImpl->config.grid_rows;
+                                    int dynamic_min_area;
+                                    if (y_ratio < 0.33f) dynamic_min_area = (int)(base_min_area * 0.2f);
+                                    else if (y_ratio < 0.66f) dynamic_min_area = base_min_area;
+                                    else dynamic_min_area = (int)(base_min_area * 5.0f);
+                                    
+                                    // 3. Final Decision Logic (Runs Unconditionally)
+                                    // REPLACED: Planar Projection Logic (Top-Bottom Distance)
+                                    // User Request: Disable Area Shrinkage/Growth. Use Projection Error.
+                                    
+                                    bool is_standing_projection = false;
+                                    float proj_dist = 0.0f;
+
+                                    if (pImpl->has_homography && curr.matched_fg_obj_id != -1) {
+                                        // Get Full Frame Object to find Top/Bottom
+                                        const auto& fg = pImpl->full_frame_objects[curr.matched_fg_obj_id];
+                                        if (!fg.pixels.empty()) {
+                                            // 1. Calculate Motion ROI from Blocks (to filter out huge background noise ghosts)
+                                            int min_r = 1000, max_r = -1;
+                                            int min_c = 1000, max_c = -1;
+                                            int cols = pImpl->config.grid_cols;
+                                            int block_h = frame.height / pImpl->config.grid_rows;
+                                            int block_w = frame.width / cols;
+                                            
+                                            for(int b_idx : curr.blocks) {
+                                                int r = b_idx / cols;
+                                                int c = b_idx % cols;
+                                                if(r < min_r) min_r = r;
+                                                if(r > max_r) max_r = r;
+                                                if(c < min_c) min_c = c;
+                                                if(c > max_c) max_c = c;
+                                            }
+                                            
+                                            // Expand ROI by margin (e.g. 1 block ~ 16-32px to capture limbs)
+                                            int margin_y = block_h * 2; 
+                                            int margin_x = block_w * 2; 
+                                            
+                                            int valid_min_y = std::max(0, min_r * block_h - margin_y);
+                                            int valid_max_y = std::min(frame.height - 1, (max_r + 1) * block_h + margin_y);
+                                            int valid_min_x = std::max(0, min_c * block_w - margin_x);
+                                            int valid_max_x = std::min(frame.width - 1, (max_c + 1) * block_w + margin_x);
+                                            
+                                            // 2. Scan Pixels with Filter
+                                            int min_y = 10000;
+                                            int max_y = -1;
+                                            int w = frame.width; 
+                                            int valid_pixel_count = 0;
+                                            
+                                            for (int idx : fg.pixels) {
+                                                int y = idx / w;
+                                                int x = idx % w;
+                                                
+                                                // Filter: Must be within Motion ROI
+                                                if (y >= valid_min_y && y <= valid_max_y && x >= valid_min_x && x <= valid_max_x) {
+                                                    if (y < min_y) min_y = y;
+                                                    if (y > max_y) max_y = y;
+                                                    valid_pixel_count++;
+                                                }
+                                            }
+                                            
+                                            if (valid_pixel_count > 0) {
+                                                // Define Top and Bottom Points using Centroid X (Robustness)
+                                                float top_u = fg.cx;
+                                                float top_v = (float)min_y;
+                                                float bot_u = fg.cx;
+                                            float bot_v = (float)max_y;
+                                            
+                                            float tx, ty, bx, by;
+                                            projectPoint(top_u, top_v, pImpl->homography_matrix, tx, ty);
+                                            projectPoint(bot_u, bot_v, pImpl->homography_matrix, bx, by);
+                                            
+                                            float dx = tx - bx;
+                                            float dy = ty - by;
+                                            proj_dist = std::sqrt(dx*dx + dy*dy);
+                                            
+                                            // Threshold: Standing > 250cm (Conservative).
+                                            // User suggests 400-500cm. Lying ~170cm.
+                                            if (proj_dist > 250.0f) {
+                                                is_standing_projection = true;
+                                            }
+                                            printf("[Case5-Proj] ID:%d Top:(%.1f,%.1f) Bot:(%.1f,%.1f) ProjDist:%.1f cm (Thresh:250.0)\n", 
+                                                   curr.id, top_u, top_v, bot_u, bot_v, proj_dist);
+                                            }
+                                        }
+                                    }
+
+                                    // Decision
+                                    if (is_standing_projection) {
+                                        // Strong Filter: If projection says Standing, force Aligned (No Fall)
+                                        perspective_aligned = true; 
+                                        printf("[Case5] ID:%d FORCED ALIGNED by Planar Projection (Dist %.1f > 250cm)\n", curr.id, proj_dist);
+                                        pImpl->LogTrace(curr.id, pImpl->frame_idx, "FILTER_PROJ", proj_dist, "Forced Aligned (Projection)");
+                                    } else {
+                                        // Override Aligned -> Fall if Projection says Lying
+                                        if (perspective_aligned) { 
+                                            printf("[Case5] ID:%d Projection says LYING (%.1f <= 250cm) -> Override Angle (ALIGNED -> FALL)\n", curr.id, proj_dist);
+                                            perspective_aligned = false; 
+                                            pImpl->LogTrace(curr.id, pImpl->frame_idx, "PROJ_OVERRIDE", proj_dist, "Override: Aligned -> Fall");
+                                        }
+                                    }
+                                }
                             }
                             
-                            // Fall detected only if NOT aligned with perspective line AND NOT Bed Event
+                            // Fall detected only if PERPENDICULAR to perspective line (lying down) AND NOT Bed Event
                             if (is_bed_event) {
                                 // Rejected
-                            } else if (!perspective_aligned) {
+                            } else if (!perspective_aligned) {  // NOT aligned = Perpendicular to perspective = Fall posture
                                 potential_fall = true;
                                 fall_type = "Momentum_Transition";
                                 case_num = 5;
@@ -5462,7 +5712,21 @@ StatusCode FallDetector::Detect(const Image& frame, bool& is_fall) {
         printf("[SDK-Struct] sizeof(MotionObject)=%lu offset(id)=%lu offset(Obs)=%lu\n", 
                sizeof(MotionObject), offsetof(MotionObject, id), offsetof(MotionObject, is_in_observation_mode));
     }
+    } // End of FallLogic Timer
     printf("[Debug] FallDetector::Detect End Frame %lld\n", pImpl->absolute_frame_count);
+
+    if (pImpl->absolute_frame_count % 100 == 0) {
+        printf("\n=== PERFORMANCE PROFILE (Avg over last 100 frames) ===\n");
+        for (auto const& [name, total_ms] : g_perf_timer.total_ms) {
+             double avg = total_ms / (double)g_perf_timer.calls[name];
+             printf("  Step [%s]: %.3f ms\n", name.c_str(), avg);
+        }
+        printf("======================================================\n\n");
+        // Optional: Reset? No, let's keep running average or reset. 
+        // Resetting helps see spikes.
+        g_perf_timer.total_ms.clear();
+        g_perf_timer.calls.clear();
+    }
     return StatusCode::OK;
 }
 

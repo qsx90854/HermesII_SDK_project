@@ -135,6 +135,7 @@ StatusCode VisionSDK::VisionSDK::SetConfig(const void* config) {
             pImpl->config.opt_flow_frame_distance = c->opt_flow_frame_distance;
             pImpl->config.perspective_point_x = c->perspective_point_x;
             pImpl->config.perspective_point_y = c->perspective_point_y;
+            pImpl->config.min_trigger_area = c->min_trigger_area;
             break;
         }
         case ConfigType::BedExitDetection_v1: {

@@ -17,9 +17,12 @@
 
 #define STB_IMAGE_WRITE_IMPLEMENTATION
 #include "stb_image_write.h"
+#define STB_IMAGE_IMPLEMENTATION
+#include "stb_image.h"
 
-#define USE_FFMPEG_READER 1
+//#define USE_FFMPEG_READER 1
 #include "ffmpeg_precoss.h" // 加入這行
+#include <memory> // For std::unique_ptr
 
 
 using namespace VisionSDK;
@@ -556,6 +559,7 @@ int main(int argc, char** argv) {
     fallCfg.opt_flow_frame_distance = cfg.getInt("OpticalFlow.CompareFrameDistance", 3);
     fallCfg.perspective_point_x = cfg.getInt("OpticalFlow.PerspectivePointX", 416);
     fallCfg.perspective_point_y = cfg.getInt("OpticalFlow.PerspectivePointY", 474);
+    fallCfg.min_trigger_area = cfg.getInt("OpticalFlow.MinTriggerArea", 2000);
     float opt_flow_vel_threshold = cfg.getFloat("OpticalFlow.VelocityThreshold", 1.0f);
 
     sdk.SetConfig(&fallCfg);
@@ -629,28 +633,93 @@ int main(int argc, char** argv) {
     // Load Initial Background if specified
     std::string bg_file_path = appCfg.getString("Demo.Demo_Background_Image_Path", "");
     if (!bg_file_path.empty()) {
-        std::ifstream fbg(bg_file_path, std::ios::binary | std::ios::ate);
-        if (fbg) {
-            std::streamsize size = fbg.tellg();
-            fbg.seekg(0, std::ios::beg);
-            if (size == W * H * 3) {
-                bg_reference.resize(W * H * 3);
-                if (fbg.read((char*)bg_reference.data(), size)) {
-                    printf("[Demo] Loaded Background Image: %s\n", bg_file_path.c_str());
-                    sdk.SetBackground(bg_reference.data(), W, H, 3);
-                    bg_saved_flag = true;
-
-                    // NEW: Save loaded background for verification (as requested)
-                    char bg_save_name[256];
-                    snprintf(bg_save_name, sizeof(bg_save_name), "%s/background_init.jpg", save_dir.c_str());
-                    stbi_write_jpg(bg_save_name, W, H, 3, bg_reference.data(), 90);
-                    printf("[Demo] Saved raw background as %s\n", bg_save_name);
+        bool loaded = false;
+        printf("[Demo] Loading Background: %s\n", bg_file_path.c_str());
+        
+        // Try STB Loading for JPG/PNG/BMP
+        int iw, ih, ic;
+        unsigned char* data = stbi_load(bg_file_path.c_str(), &iw, &ih, &ic, 3);
+        if (data) {
+             printf("[Demo] STB Loaded Image: %dx%d channels: %d\n", iw, ih, ic);
+             if (iw == W && ih == H) {
+                 bg_reference.assign(data, data + W*H*3);
+                 sdk.SetBackground(bg_reference.data(), W, H, 3);
+                 bg_saved_flag = true;
+                 loaded = true;
+                 printf("[Demo] Success: Set Background from Image.\n");
+             } else {
+                 printf("[Demo] Warning: Resizing Image %dx%d -> %dx%d\n", iw, ih, W, H);
+                 bg_reference.resize(W * H * 3);
+                 for (int y = 0; y < H; ++y) {
+                     for (int x = 0; x < W; ++x) {
+                         int src_x = x * iw / W;
+                         int src_y = y * ih / H;
+                         int src_idx = (src_y * iw + src_x) * 3; 
+                         int dst_idx = (y * W + x) * 3;
+                         bg_reference[dst_idx] = data[src_idx];
+                         bg_reference[dst_idx+1] = data[src_idx+1];
+                         bg_reference[dst_idx+2] = data[src_idx+2];
+                     }
+                 }
+                 sdk.SetBackground(bg_reference.data(), W, H, 3);
+                 bg_saved_flag = true;
+                 loaded = true;
+                 printf("[Demo] Success: Set Resized Background from Image.\n");
+             }
+             stbi_image_free(data);
+        }
+        
+        if (!loaded) {
+            std::ifstream fbg(bg_file_path, std::ios::binary | std::ios::ate);
+            if (fbg) {
+                std::streamsize size = fbg.tellg();
+                fbg.seekg(0, std::ios::beg);
+                if (size == W * H * 3) {
+                    bg_reference.resize(W * H * 3);
+                    if (fbg.read((char*)bg_reference.data(), size)) {
+                        printf("[Demo] Loaded RAW Background Image: %s\n", bg_file_path.c_str());
+                        sdk.SetBackground(bg_reference.data(), W, H, 3);
+                        bg_saved_flag = true;
+                        
+                        // NEW: Save loaded background for verification (as requested)
+                        char bg_save_name[256];
+                        snprintf(bg_save_name, sizeof(bg_save_name), "%s/background_init_raw.jpg", save_dir.c_str());
+                        stbi_write_jpg(bg_save_name, W, H, 3, bg_reference.data(), 90);
+                        printf("[Demo] Saved raw background as %s\n", bg_save_name);
+                    }
+                } else {
+                    // Start of Manual Resize Logic for RAW
+                    int origW = appCfg.getInt("Demo.Demo_Original_Width", 1920);
+                    int origH = appCfg.getInt("Demo.Demo_Original_Height", 1080);
+                    long expected_orig_size = (long)origW * origH * 3;
+                    
+                    if (size == expected_orig_size) {
+                        printf("[Demo] RAW Image Size Mismatch (%ld vs %d). Attempting Resize %dx%d -> %dx%d\n", size, W*H*3, origW, origH, W, H);
+                        std::vector<uint8_t> raw_orig(size);
+                        if (fbg.read((char*)raw_orig.data(), size)) {
+                            bg_reference.resize(W * H * 3);
+                            for (int y = 0; y < H; ++y) {
+                                for (int x = 0; x < W; ++x) {
+                                    int src_x = x * origW / W;
+                                    int src_y = y * origH / H;
+                                    int src_idx = (src_y * origW + src_x) * 3; 
+                                    int dst_idx = (y * W + x) * 3;
+                                    bg_reference[dst_idx] = raw_orig[src_idx];
+                                    bg_reference[dst_idx+1] = raw_orig[src_idx+1];
+                                    bg_reference[dst_idx+2] = raw_orig[src_idx+2];
+                                }
+                            }
+                            sdk.SetBackground(bg_reference.data(), W, H, 3);
+                            bg_saved_flag = true;
+                            printf("[Demo] Success: Set Resized Background from RAW.\n");
+                        }
+                    } else {
+                         printf("[Demo] Warning: Background Image size mismatch! Expected %d or %ld, Got %ld. Ignoring.\n", W*H*3, expected_orig_size, size);
+                    }
                 }
             } else {
-                printf("[Demo] Warning: Background Image size mismatch! Expected %d, Got %ld. Ignoring.\n", W*H*3, size);
+                 printf("[Demo] Warning: Background Image path provided but file not found: %s\n", bg_file_path.c_str());
             }
-        } else {
-             printf("[Demo] Warning: Background Image path provided but file not found: %s\n", bg_file_path.c_str());
         }
     }
 
@@ -707,35 +776,59 @@ int main(int argc, char** argv) {
     std::vector<FallInterval> detected_intervals_vec;
 
 
-    #if USE_FFMPEG_READER
-    VideoReader reader(video_path, 800, 450);
-    #endif
+    // Check if input is MP4
+    std::unique_ptr<VideoReader> videoReader = nullptr;
+    if (imgFormat.size() > 4 && imgFormat.substr(imgFormat.size() - 4) == ".mp4") {
+        std::cout << "[Demo] MP4 Mode Detected: " << imgFormat << std::endl;
+        try {
+            videoReader = std::make_unique<VideoReader>(imgFormat, W, H);
+        } catch (const std::exception& e) {
+            std::cerr << "Error opening MP4: " << e.what() << std::endl;
+            return -1;
+        }
+    } else {
+        std::cout << "[Demo] Image Sequence Mode: " << imgFormat << std::endl;
+    }
 
     // Main processing loop
     int total_frames = start_frame + num_images; // Define total_frames based on existing variables
+    // Variables for Average Time Calculation
+    double total_process_time_ms = 0.0;
+    long frame_count_time = 0;
+
     for (int i = start_frame; i < total_frames; i += frame_step) {
         
         auto t_read_start = std::chrono::steady_clock::now();
-#ifndef USE_FFMPEG_READER
-        reader.readFrame(file_buffer);
-        
-        char raw_name[256];
-        snprintf(raw_name, sizeof(raw_name), pattern.c_str(), i);
-        
-        std::ifstream file(raw_name, std::ios::binary);
-        if (!file) {
-            if (i > 0) break; 
-            continue;
+
+        if (videoReader) {
+            // Apply Frame Step Skipping for MP4
+            // Since MP4 reader is sequential, we must consume and discard frames if step > 1
+            if (i > start_frame) { // Don't skip before the very first frame
+                for (int s = 0; s < frame_step - 1; ++s) {
+                    // Read into dummy buffer or same buffer to discard
+                    if (!videoReader->readFrame(file_buffer)) {
+                        break; // End of video during skip
+                    }
+                }
+            }
+
+             // 讀取 MP4 的下一幀到 file_buffer 中，並自動 Resize 轉 RGB
+            if (!videoReader->readFrame(file_buffer)) {
+                std::cout << "影片讀取完畢或發生錯誤，結束迴圈。" << std::endl;
+                break; // 影片結束就跳出迴圈
+            }
+        } else {
+            char raw_name[256];
+            snprintf(raw_name, sizeof(raw_name), pattern.c_str(), i);
+            
+            std::ifstream file(raw_name, std::ios::binary);
+            if (!file) {
+                if (i > 0) break; 
+                continue;
+            }
+            file.read(reinterpret_cast<char*>(file_buffer.data()), frame_size_rgb);
+            file.close();
         }
-        file.read(reinterpret_cast<char*>(file_buffer.data()), frame_size_rgb);
-        file.close();
-#else
-        // 讀取 MP4 的下一幀到 file_buffer 中，並自動 Resize 轉 RGB
-        if (!videoReader.readFrame(file_buffer)) {
-            std::cout << "影片讀取完畢或發生錯誤，結束迴圈。" << std::endl;
-            break; // 影片結束就跳出迴圈
-        }
-#endif
         // Timer End for Read
         auto t_read_end = std::chrono::steady_clock::now();
         double read_duration_ms = std::chrono::duration<double, std::milli>(t_read_end - t_read_start).count();
@@ -810,6 +903,10 @@ int main(int argc, char** argv) {
         if (i % 50 == 0) {
             std::cout << "Frame " << i << " Total Process Time: " << ms << " ms (" << (1000.0/ms) << " FPS)" << std::endl;
         }
+        
+        // Accumulate Average Time
+        total_process_time_ms += ms;
+        frame_count_time++;
         
 
         // 1. Get Objects (Deep Copy)
@@ -1994,6 +2091,15 @@ int main(int argc, char** argv) {
             report << "  [" << k << "] " << gt_intervals[k].first << "-" << gt_intervals[k].second << status << "\n";
             std::cout << "  [" << k << "] " << gt_intervals[k].first << "-" << gt_intervals[k].second << status << "\n";
         }
+        
+        // Save Average Time
+        if (frame_count_time > 0) {
+            double avg_ms = total_process_time_ms / frame_count_time;
+            double avg_fps = 1000.0 / avg_ms;
+            report << "AvgTime=" << avg_ms << "\n";
+            std::cout << "[Demo] Average Process Time: " << avg_ms << " ms (" << avg_fps << " FPS)" << std::endl;
+        }
+        
         report.close();
     }
 

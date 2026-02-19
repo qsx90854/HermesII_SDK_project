@@ -87,6 +87,9 @@ struct InternalConfig {
     int opt_flow_frame_distance = 3;
     int perspective_point_x = 416;
     int perspective_point_y = 474;
+
+    // Area Override Filter
+    int min_trigger_area = 2000; // Base min area (pixels) for mid-frame zone; scaled by Y position
 };
 
 class FallDetector {
