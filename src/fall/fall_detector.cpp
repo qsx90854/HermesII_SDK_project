@@ -2378,8 +2378,8 @@ public:
     int bg_accumulated_count = 0;
     bool background_initialized_externally = false; // NEW
     
-    void updateBackground(const ::Image& current, const InternalConfig& cfg, int frame_idx) {
-        printf("[Debug] updateBackground called for frame %d\n", frame_idx);
+    void updateBackground(const ::Image& current, const InternalConfig& cfg, int frame_idx, const std::vector<MotionObject>& objects) {
+        // printf("[Debug] updateBackground called for frame %d\n", frame_idx);
         if (backgroundFrame.width() != current.width() || backgroundFrame.height() != current.height()) {
             backgroundFrame = current.clone();
             // Reset accumulator if size changes
@@ -2427,15 +2427,92 @@ public:
         if (alpha_int > 256) alpha_int = 256;
         int inv_alpha = 256 - alpha_int;
         
-        int size = current.width() * current.height() * current.getChannels();
+        // NEW: Create efficient FG Block Map
+        // We only update background if the block is NOT occupied by an object
+        std::vector<bool> is_fg_block(cfg.grid_cols * cfg.grid_rows, false);
+        int total_fg_blocks = 0;
+        
+        for (const auto& obj : objects) {
+            for (int b : obj.blocks) {
+                if (b >= 0 && b < (int)is_fg_block.size()) {
+                    is_fg_block[b] = true;
+                    total_fg_blocks++;
+                }
+            }
+        }
+        
+        // Optimization: Pre-calculate block dimensions
+        int W = current.width();
+        int H = current.height();
+        int C = current.getChannels();
+        int bw = W / cfg.grid_cols;
+        int bh = H / cfg.grid_rows;
+        
         unsigned char* bg_ptr = backgroundFrame.getData();
         const unsigned char* curr_ptr = current.getData();  
         
-        for(int i=0; i<size; ++i) {
-            int val = (bg_ptr[i] * inv_alpha + curr_ptr[i] * alpha_int) >> 8;
-            bg_ptr[i] = (unsigned char)val;
+        int skipped_pixels = 0;
+        
+        // Iterate by Blocks to maximize check efficiency
+        for (int r = 0; r < cfg.grid_rows; ++r) {
+            for (int c = 0; c < cfg.grid_cols; ++c) {
+                int block_idx = r * cfg.grid_cols + c;
+                
+                // If FG Block -> Skip Update (Selective Update)
+                if (is_fg_block[block_idx]) {
+                    // Count skipped pixels for debug?
+                    skipped_pixels += (bw * bh * C);
+                    continue; 
+                }
+                
+                // Else -> Update this block's pixels
+                int y_start = r * bh;
+                int y_end = (r == cfg.grid_rows - 1) ? H : (r + 1) * bh;
+                int x_start = c * bw;
+                int x_end = (c == cfg.grid_cols - 1) ? W : (c + 1) * bw;
+                
+                // Use Bed Mask for Fast Update if available
+                const unsigned char* bed_ptr = hasBedMask ? bedMask.getData() : nullptr;
+                int bed_w = hasBedMask ? bedMask.width() : 0;
+                
+                for (int y = y_start; y < y_end; ++y) {
+                    int row_offset = y * W * C;
+                    int bed_row_offset = y * bed_w;
+                    
+                    for (int x = x_start; x < x_end; ++x) {
+                        int pix_idx = row_offset + x * C;
+                        
+                        // Default Alpha
+                        int current_alpha = alpha_int;
+                        int current_inv_alpha = inv_alpha;
+                        
+                        // Check Bed Region (Fast Update)
+                        if (bed_ptr) {
+                            // Map x,y to bedMask coordinates (assuming same size)
+                            if (x < bed_w && bed_ptr[bed_row_offset + x] == 0) {
+                                // 0 = Bed Region. 
+                                // Increase Alpha for Bed Region (Fast Update for Ghost Removal)
+                                // Multiplier = 4x
+                                int fast_alpha = alpha_int * 4; 
+                                if (fast_alpha > 256) fast_alpha = 256;
+                                current_alpha = fast_alpha; 
+                                current_inv_alpha = 256 - fast_alpha;
+                            }
+                        }
+
+                        for (int k = 0; k < C; ++k) {
+                            int idx = pix_idx + k;
+                            // Update
+                            int val = (bg_ptr[idx] * current_inv_alpha + curr_ptr[idx] * current_alpha) >> 8;
+                            bg_ptr[idx] = (unsigned char)val;
+                        }
+                    }
+                }
+            }
         }
-        printf("[Debug] updateBackground Periodic Update Complete.\n");
+        if (total_fg_blocks > 0) {
+            // printf("[Debug] updateBackground Selective: Skipped %d FG blocks.\n", total_fg_blocks);
+        }
     }
 };
 
@@ -3360,29 +3437,10 @@ StatusCode FallDetector::Detect(const Image& frame, bool& is_fall) {
     }
     } // End ImageConv Timer
 
-    // V3: Background Update Logic (Using Gray Image)
-    // Background Update
-    if (pImpl->config.bg_update_interval_frames > 0) {
-        pImpl->bg_update_counter++;
-        bool isInitPhase = (pImpl->frame_idx >= pImpl->config.bg_init_start_frame && pImpl->frame_idx <= pImpl->config.bg_init_end_frame);
-        
-        if (isInitPhase || (pImpl->bg_update_counter >= pImpl->config.bg_update_interval_frames)) {
-            // Only periodic update if NOT in init phase (init phase handled inside updateBackground)
-            // Wait, updateBackground logic handles check.
-    // 4. Background Update
-    {
-        TimerGuard t_bg(g_perf_timer, "1_BackgroundUpdate");
-        printf("[Debug] Calling updateBackground...\n");
-        pImpl->updateBackground(wrapper, pImpl->config, pImpl->frame_idx); 
-        printf("[Debug] updateBackground Done.\n");
-    }
-                                                                      // Internal frame_idx is usually 0 if not set?
-                                                                      // Wait, pImpl->frame_idx is 0. 
-                                                                      // Maybe we should pass absolute_frame_count?
-    printf("[Debug] updateBackground Done.\n");
-            if (!isInitPhase) pImpl->bg_update_counter = 0;
-        }
-    }
+    // 4. Background Update Logic (MOVED TO END OF FUNCTION)
+    // The selective update logic requires the detected objects, so we perform this
+    // AFTER object detection and tracking.
+    // See end of function.
 
     // --- raw_frame_history Management ---
     pImpl->raw_frame_history.push_back(wrapper.clone());
@@ -5489,6 +5547,33 @@ StatusCode FallDetector::Detect(const Image& frame, bool& is_fall) {
     } // End of FallLogic Timer
     printf("[Debug] FallDetector::Detect End Frame %lld\n", pImpl->absolute_frame_count);
 
+    // 8. Background Update (Selective)
+    // Runs here to use the latest pImpl->current_objects found in this frame
+    if (pImpl->config.bg_update_interval_frames > 0) {
+        
+        bool isInitPhase = (pImpl->frame_idx >= pImpl->config.bg_init_start_frame && pImpl->frame_idx <= pImpl->config.bg_init_end_frame);
+        
+        // Logic:
+        // 1. If Init Phase -> Always Run (Accumulation)
+        // 2. If Periodic Phase -> Run every N frames
+        
+        pImpl->bg_update_counter++;
+
+        if (isInitPhase || (pImpl->bg_update_counter >= pImpl->config.bg_update_interval_frames)) {
+             // TimerGuard t_bg(g_perf_timer, "1_BackgroundUpdate");
+             // printf("[Debug] Calling updateBackground (end-of-frame)...\n");
+             
+             // Pass CURRENT objects for selective update
+             pImpl->updateBackground(wrapper, pImpl->config, pImpl->frame_idx, pImpl->current_objects);
+             
+             
+             if (!isInitPhase) pImpl->bg_update_counter = 0;
+        }
+    }
+
+    // End of Frame
+    // printf("[Debug] FallDetector::Detect End Frame %d\n", pImpl->frame_idx);
+    
     if (pImpl->absolute_frame_count % 100 == 0) {
         printf("\n=== PERFORMANCE PROFILE (Avg over last 100 frames) ===\n");
         for (auto const& [name, total_ms] : g_perf_timer.total_ms) {
