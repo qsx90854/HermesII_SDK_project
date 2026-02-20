@@ -199,6 +199,12 @@ struct MotionObject {
     float safe_area_ratio = 0.0f;
     std::vector<std::pair<int, int>> trajectory; // Center point history
     
+    // NEW: Projection Points for Visualization 
+    float proj_top_x = 0.0f;
+    float proj_top_y = 0.0f;
+    float proj_bot_x = 0.0f;
+    float proj_bot_y = 0.0f;
+    bool has_projection = false;    
     // NEW for Pixel-Based Fall Detection
     int pixel_count = 0;
     float avg_brightness = 0.0f;

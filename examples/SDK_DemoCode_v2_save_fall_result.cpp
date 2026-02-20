@@ -925,6 +925,12 @@ int main(int argc, char** argv) {
         
 
         // --- PREPARE BG MASK IMG (User Request) ---
+        // Compute Diff for Object Bounding Boxes (to capture holes)
+        int grid_cols = cfg.getInt("Motion.Grid_Cols", 80);
+        int grid_rows = cfg.getInt("Motion.Grid_Rows", 45);
+        int bw = W / grid_cols;
+        int bh = H / grid_rows;
+
         std::vector<uint8_t> bg_mask_img;
         if (bg_saved_flag && !bg_reference.empty()) {
              printf("[Debug] Step 2: Entering BG Mask Gen (Frame %d)\n", i);
@@ -932,12 +938,6 @@ int main(int argc, char** argv) {
              double bg_diff_thr = (double)fallCfg.bg_diff_threshold; 
              if (bg_diff_thr < 1.0) bg_diff_thr = 30.0;
              
-             // Compute Diff for Object Bounding Boxes (to capture holes)
-             int grid_cols = cfg.getInt("Motion.Grid_Cols", 80);
-             int grid_rows = cfg.getInt("Motion.Grid_Rows", 45);
-             int bw = W / grid_cols;
-             int bh = H / grid_rows;
-
              printf("[Debug] BBox Scan Init. W=%d H=%d bw=%d bh=%d. bg_ref_sz=%zu\n", W, H, bw, bh, bg_reference.size());
 
              // Compute Global Diff (Moved OUTSIDE object loop)
@@ -1607,8 +1607,8 @@ int main(int argc, char** argv) {
                 if (i >= 300 && i <= 310) {
                     printf("[Demo-Loop-Check] F:%d ID:%d Obs:%d MatchID:%d\n", i, obj.id, obj.is_in_observation_mode, obj.matched_fg_obj_id);
                 }
-                if (i >= 300 && i <= 310 && obj.id == 1006) {
-                    printf("[Demo-Viz] F:%d ID:%d Obs:%d MatchID:%d\n", i, obj.id, obj.is_in_observation_mode, obj.matched_fg_obj_id);
+                if (i >= 300 && i <= 310) {
+                    printf("[Demo-Loop-Check] F:%d ID:%d Obs:%d MatchID:%d\n", i, obj.id, obj.is_in_observation_mode, obj.matched_fg_obj_id);
                 }
                 if (obj.is_in_observation_mode && obj.matched_fg_obj_id != -1) {
                     for (const auto& f_obj : full_objs) {
@@ -1625,6 +1625,46 @@ int main(int argc, char** argv) {
                             break; 
                         }
                     }
+                }
+
+                
+                
+                // NEW: Draw Projection Points on Mask (Red/Blue)
+                // NOTE: has_projection means proj_top_x are World Coords (-cm). We cannot draw them directly.
+                // We draw the SOURCE points (Image Coords) derived from blocks.
+                if (obj.has_projection && !obj.blocks.empty()) {
+                     int min_c=9999, max_c=-1, min_r=9999, max_r=-1;
+                     for(int b : obj.blocks) {
+                         int r = b / grid_cols;
+                         int c = b % grid_cols;
+                         if(r < min_r) min_r = r;
+                         if(r > max_r) max_r = r;
+                         if(c < min_c) min_c = c;
+                         if(c > max_c) max_c = c;
+                     }
+                     
+                     // Source Points (Image Space)
+                     int src_top_x = (int)((min_c + max_c + 1) / 2.0f * bw);
+                     int src_top_y = min_r * bh;
+                     
+                     int src_bot_x = (int)((min_c + max_c + 1) / 2.0f * bw);
+                     int src_bot_y = (max_r + 1) * bh;
+                     
+                     // Top (Red)
+                     drawRectRGB(final_mask, W, H, src_top_x-2, src_top_y-2, 5, 5, 255, 0, 0, 3);
+                     // Bot (Blue) 
+                     drawRectRGB(final_mask, W, H, src_bot_x-2, src_bot_y-2, 5, 5, 0, 0, 255, 3);
+                     
+                     // Helper Line
+                     drawLine(final_mask, W, H, src_top_x, src_top_y, src_bot_x, src_bot_y, 255, 255, 0, 1);
+                     
+                     // Draw Text Value (World Height)
+                     float pdx = obj.proj_top_x - obj.proj_bot_x;
+                     float pdy = obj.proj_top_y - obj.proj_bot_y;
+                     float dist = std::sqrt(pdx*pdx + pdy*pdy);
+                     char buf[32];
+                     snprintf(buf, 32, "H:%.0f", dist);
+                     drawString(final_mask, W, H, src_top_x+5, src_top_y, buf, 255, 255, 0, 2);
                 }
             }
 
@@ -1876,7 +1916,17 @@ int main(int argc, char** argv) {
                     snprintf(msg, sizeof(msg), "A:%.1f S:%.1f", obj.acceleration, obj.strength);
                     drawString(current_frame_rgb, W, H, pixelCenterX, pixelCenterY - 20, msg, 255, 0, 0, 2);
                     std::cout << "[FALL STATS] Frame " << i << " ObjID " << obj.id << " Acc: " << obj.acceleration << " Str: " << obj.strength << std::endl;
-                } 
+                         // Draw Projection Points (Visualization Request)
+                if (obj.has_projection) {
+                     // Top: Red Box (5x5)
+                     drawRectRGB(current_frame_rgb, W, H, (int)obj.proj_top_x-2, (int)obj.proj_top_y-2, 5, 5, 255, 0, 0, 2);
+                     // Bot: Blue Box (5x5)
+                     drawRectRGB(current_frame_rgb, W, H, (int)obj.proj_bot_x-2, (int)obj.proj_bot_y-2, 5, 5, 0, 0, 255, 2);
+                     
+                     // Helper Line (Yellow)
+                     drawArrow(current_frame_rgb, W, H, (int)obj.proj_top_x, (int)obj.proj_top_y, (int)obj.proj_bot_x, (int)obj.proj_bot_y, 255, 255, 0, 1);
+                }
+            } 
             }
         } // End of objects loop
 

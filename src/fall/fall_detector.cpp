@@ -97,123 +97,6 @@ void projectPoint(float u, float v, const float H[9], float& x, float& y) {
 // Visualization Utilities (RGB)
 // =========================================================
 
-// Save RGB buffer (3 bytes per pixel) to BMP
-bool saveBMP_RGB(const std::string& filename, const uint8_t* rgbData, int width, int height) {
-    FILE* f = fopen(filename.c_str(), "wb");
-    if (!f) return false;
-
-    int filesize = 54 + 3 * width * height;
-    uint8_t header[54] = {
-        0x42, 0x4D, 0,0,0,0, 0,0,0,0, 54,0,0,0, 40,0,0,0,
-        0,0,0,0, 0,0,0,0, 1,0, 24,0, 0,0,0,0, 0,0,0,0, 0,0,0,0, 0,0,0,0
-    };
-
-    header[2] = (uint8_t)(filesize);
-    header[3] = (uint8_t)(filesize >> 8);
-    header[4] = (uint8_t)(filesize >> 16);
-    header[5] = (uint8_t)(filesize >> 24);
-    header[18] = (uint8_t)(width);
-    header[19] = (uint8_t)(width >> 8);
-    header[20] = (uint8_t)(width >> 16);
-    header[21] = (uint8_t)(width >> 24);
-    header[22] = (uint8_t)(height);
-    header[23] = (uint8_t)(height >> 8);
-    header[24] = (uint8_t)(height >> 16);
-    header[25] = (uint8_t)(height >> 24);
-
-    fwrite(header, 1, 54, f);
-
-    int padSize = (4 - (width * 3) % 4) % 4;
-    uint8_t pad[3] = {0, 0, 0};
-
-    // BMP is stored bottom-to-top, BGR format
-    for (int y = height - 1; y >= 0; --y) {
-        for (int x = 0; x < width; ++x) {
-            int idx = (y * width + x) * 3;
-            uint8_t r = rgbData[idx];
-            uint8_t g = rgbData[idx + 1];
-            uint8_t b = rgbData[idx + 2];
-            uint8_t bgr[3] = {b, g, r}; // Swap for BMP
-            fwrite(bgr, 1, 3, f);
-        }
-        fwrite(pad, 1, padSize, f);
-    }
-    fclose(f);
-    return true;
-}
-
-void drawPixelRGB(std::vector<uint8_t>& img, int w, int h, int x, int y, uint8_t r, uint8_t g, uint8_t b) {
-    if (x >= 0 && x < w && y >= 0 && y < h) {
-        int idx = (y * w + x) * 3;
-        img[idx] = r;
-        img[idx + 1] = g;
-        img[idx + 2] = b;
-    }
-}
-
-void drawLineRGB(std::vector<uint8_t>& img, int w, int h, int x1, int y1, int x2, int y2, uint8_t r, uint8_t g, uint8_t b, int thickness = 1) {
-    int dx = std::abs(x2 - x1), sx = x1 < x2 ? 1 : -1;
-    int dy = -std::abs(y2 - y1), sy = y1 < y2 ? 1 : -1;
-    int err = dx + dy, e2; 
-    
-    // Helper to draw brush
-    auto drawBrush = [&](int cx, int cy) {
-        for (int ty = -thickness/2; ty <= thickness/2; ty++) {
-            for (int tx = -thickness/2; tx <= thickness/2; tx++) {
-                drawPixelRGB(img, w, h, cx + tx, cy + ty, r, g, b);
-            }
-        }
-    };
-
-    while (true) {
-        drawBrush(x1, y1);
-        if (x1 == x2 && y1 == y2) break;
-        e2 = 2 * err;
-        if (e2 >= dy) { err += dy; x1 += sx; }
-        if (e2 <= dx) { err += dx; y1 += sy; }
-    }
-}
-
-void drawRectRGB(std::vector<uint8_t>& img, int w, int h, int x, int y, int rw, int rh, uint8_t r, uint8_t g, uint8_t b, int thickness = 2) {
-    int x2 = x + rw - 1;
-    int y2 = y + rh - 1;
-    drawLineRGB(img, w, h, x, y, x2, y, r, g, b, thickness);
-    drawLineRGB(img, w, h, x2, y, x2, y2, r, g, b, thickness);
-    drawLineRGB(img, w, h, x2, y2, x, y2, r, g, b, thickness);
-    drawLineRGB(img, w, h, x, y2, x, y, r, g, b, thickness);
-}
-
-void drawFilledRectRGB(std::vector<uint8_t>& img, int w, int h, int x, int y, int rw, int rh, uint8_t r, uint8_t g, uint8_t b) {
-    for (int j = y; j < y + rh; j++) {
-        for (int i = x; i < x + rw; i++) {
-            drawPixelRGB(img, w, h, i, j, r, g, b);
-        }
-    }
-}
-
-void drawArrowRGB(std::vector<uint8_t>& img, int w, int h, int x, int y, int dx, int dy, uint8_t r, uint8_t g, uint8_t b, int thickness = 2) {
-    int x2 = x + dx;
-    int y2 = y + dy;
-    drawLineRGB(img, w, h, x, y, x2, y2, r, g, b, thickness);
-    
-    // Draw Arrow Head
-    // Simple 30 degree wings
-    if (std::abs(dx) + std::abs(dy) > 5) {
-        float angle = atan2((float)dy, (float)dx);
-        float headLen = 15.0f; // Longer head
-        float angle1 = angle + M_PI * 0.85; // Backwards angle
-        float angle2 = angle - M_PI * 0.85;
-
-        int x3 = x2 + (int)(cos(angle1) * headLen);
-        int y3 = y2 + (int)(sin(angle1) * headLen);
-        int x4 = x2 + (int)(cos(angle2) * headLen);
-        int y4 = y2 + (int)(sin(angle2) * headLen);
-
-        drawLineRGB(img, w, h, x2, y2, x3, y3, r, g, b, thickness);
-        drawLineRGB(img, w, h, x2, y2, x4, y4, r, g, b, thickness);
-    }
-}
-
 
 #if 0
 struct ObjectFeatures {
@@ -226,6 +109,11 @@ struct ObjectFeatures {
 // 假設 mask 已經是上面 NEON 算出來的 0/255 陣列
 // width, height: 影像尺寸
 // minArea: 過濾噪點用
+// Update Signature
+
+
+
+
 // Update Signature
 std::vector<::VisionSDK::ObjectFeatures> find_objects_optimized(const uint8_t* mask, int width, int height, int minArea, int merge_radius) {
     std::vector<::VisionSDK::ObjectFeatures> results;
@@ -373,153 +261,14 @@ std::vector<::VisionSDK::ObjectFeatures> find_objects_optimized(const uint8_t* m
     return results;
 }
 
+} // anonymous namespace
 
-// Minimal 5x7 bitmap font
-const uint8_t font5x7[] = {
-    // 0-9
-    0x1F,0x11,0x1F, 0x00,0x1F,0x00, 0x1D,0x15,0x17, 0x15,0x15,0x1F, 0x07,0x04,0x1F,
-    0x17,0x15,0x1D, 0x1F,0x15,0x1D, 0x01,0x01,0x1F, 0x1F,0x15,0x1F, 0x17,0x15,0x1F,
-    // .
-    0x10,0x00,0x00,
-    // F (11)
-    0x1F,0x05,0x00,
-    // A (12)
-    0x1F,0x05,0x1F, 
-    // L (13)
-    0x1F,0x10,0x10,
-    // T (14)
-    0x01,0x1F,0x01,
-    // R (15)
-    0x1F,0x05,0x1A,
-    // U (16)
-    0x1F,0x10,0x1F,
-    // E (17)
-    0x1F,0x15,0x11,
-    // S (18)
-    0x1D,0x15,0x17,
-     // M (19)
-    0x1F,0x02,0x1F,
-    // I (20)
-    0x00,0x1F,0x00,
-    // B (21)
-    0x1F,0x15,0x0A,
-    // D (22)
-    0x1F,0x11,0x0E,
-    // X (23)
-    0x11,0x04,0x11
-};
+// ==================================================================================
+//  Helpers & Profiler (from C_V2_EDGE.cpp)
+// ==================================================================================
 
-void drawCharRGB(std::vector<uint8_t>& img, int w, int h, int cx, int cy, int charArgs, uint8_t r, uint8_t g, uint8_t b, int scale = 1) {
-    if (charArgs < 0 || charArgs > 23) return;
-    const uint8_t* ptr = font5x7 + charArgs * 3;
-    for (int col = 0; col < 3; col++) {
-        uint8_t colData = ptr[col];
-        for (int row = 0; row < 5; row++) {
-            if ((colData >> row) & 1) { 
-                // Draw Scaled Pixel
-                for (int sy = 0; sy < scale; sy++) {
-                    for (int sx = 0; sx < scale; sx++) {
-                        int px = cx + (col * 2) * scale + sx;
-                        int py = cy + (row * 2) * scale + sy;
-                         drawPixelRGB(img, w, h, px, py, r, g, b);
-                    }
-                }
-            }
-        }
-    }
-}
 
-void drawStringRGB(std::vector<uint8_t>& img, int w, int h, int x, int y, const std::string& s, uint8_t r, uint8_t g, uint8_t b, int scale = 1) {
-    int cx = x;
-    for (char c : s) {
-        int idx = -1;
-        if (c >= '0' && c <= '9') idx = c - '0';
-        else if (c == '.') idx = 10;
-        else if (c == 'F') idx = 11;
-        else if (c == 'A') idx = 12;
-        else if (c == 'L') idx = 13;
-        else if (c == 'T') idx = 14;
-        else if (c == 'R') idx = 15;
-        else if (c == 'U') idx = 16;
-        else if (c == 'E') idx = 17;
-        else if (c == 'S') idx = 18;
-        else if (c == 'M') idx = 19;
-        else if (c == 'I') idx = 20;
-        else if (c == 'B') idx = 21;
-        else if (c == 'D') idx = 22;
-        else if (c == 'X') idx = 23;
-        
-        if (idx != -1) {
-            drawCharRGB(img, w, h, cx, y, idx, r, g, b, scale);
-            cx += 8 * scale; 
-        } else {
-             cx += 4 * scale; 
-        }
-    }
-}
-
-// Helper: Get Static Foreground BBox using Background Subtraction (Raw Data)
-static bool getStaticBoundingBoxRaw(const unsigned char* currData, int currW, int currH, int currC,
-                                    const unsigned char* bgData, int bgW, int bgH,
-                                    int center_x, int center_y, int search_radius, 
-                                    int& out_w, int& out_h) {
-     if (currW != bgW || currH != bgH) return false;
-     
-     int h = currH;
-     int w = currW;
-     int c = currC;
-     
-     int min_x = w, max_x = 0;
-     int min_y = h, max_y = 0;
-     int count = 0;
-     
-     int start_x = std::max(0, center_x - search_radius);
-     int end_x = std::min(w, center_x + search_radius);
-     int start_y = std::max(0, center_y - search_radius);
-     int end_y = std::min(h, center_y + search_radius);
-     
-     int thresh = 30; // FG Threshold
-     
-     for(int y=start_y; y<end_y; y+=2) { // Skip lines for speed
-         for(int x=start_x; x<end_x; x+=2) {
-             int idx = (y * w + x) * c;
-             int diff = 0;
-             if (c == 1) {
-                  diff = std::abs((int)currData[idx] - (int)bgData[idx]);
-             } else {
-                  diff = std::abs((int)currData[idx] - (int)bgData[idx]) +
-                         std::abs((int)currData[idx+1] - (int)bgData[idx+1]) + 
-                         std::abs((int)currData[idx+2] - (int)bgData[idx+2]);
-                  diff /= 3;
-             }
-             
-             if (diff > thresh) {
-                 if(x < min_x) min_x = x;
-                 if(x > max_x) max_x = x;
-                 if(y < min_y) min_y = y;
-                 if(y > max_y) max_y = y;
-                 count++;
-             }
-         }
-     }
-     
-     if (count < 50) return false; // Too small / noise
-     
-     out_w = max_x - min_x;
-     out_h = max_y - min_y;
-     return true;
- }
-
- static bool drawFloatRGB(std::vector<uint8_t>& img, int w, int h, int x, int y, float v, uint8_t r, uint8_t g, uint8_t b, int scale = 1) {
-    char buf[16];
-    sprintf(buf, "%.1f", v);
-    drawStringRGB(img, w, h, x, y, buf, r, g, b, scale);
-    return true;
-}
-
-// Calculate bounding box size (in pixels) from object's block list
-// Returns the width and height of the bounding box enclosing all blocks
-// block_width and block_height are the size of each block in pixels
+// Restore getObjectBoundingBoxPixels (Used for Logging)
 static void getObjectBoundingBoxPixels(const MotionObject& obj, int grid_cols, int grid_rows, 
                                        int frame_width, int frame_height,
                                        int& out_bbox_width, int& out_bbox_height, 
@@ -559,57 +308,6 @@ static void getObjectBoundingBoxPixels(const MotionObject& obj, int grid_cols, i
     out_bbox_width = out_max_x - out_min_x;
     out_bbox_height = out_max_y - out_min_y;
 }
-
-static float calculateBlockAngle(const MotionObject& obj, int grid_cols, int grid_rows, int width, int height) {
-    if (obj.blocks.empty()) return 0.0f;
-    
-    // Centers
-    float sum_x = 0, sum_y = 0;
-    int count = 0;
-    int blk_w = width / grid_cols;
-    int blk_h = height / grid_rows;
-    if (blk_w <= 0 || blk_h <= 0) return 0.0f; // Prevent div zero
-
-    std::vector<std::pair<float, float>> points;
-    points.reserve(obj.blocks.size());
-
-    for (int blk_idx : obj.blocks) {
-        int r = blk_idx / grid_cols;
-        int c = blk_idx % grid_cols;
-        float cx = c * blk_w + blk_w * 0.5f;
-        float cy = r * blk_h + blk_h * 0.5f;
-        
-        sum_x += cx;
-        sum_y += cy;
-        points.push_back({cx, cy});
-        count++;
-    }
-    
-    if (count == 0) return 0.0f;
-    float mean_x = sum_x / count;
-    float mean_y = sum_y / count;
-    
-    // Moments
-    float u20 = 0, u02 = 0, u11 = 0;
-    for (const auto& p : points) {
-        float dx = p.first - mean_x;
-        float dy = p.second - mean_y;
-        u20 += dx * dx;
-        u02 += dy * dy;
-        u11 += dx * dy;
-    }
-    
-    // Angle (-90 to 90 degrees)
-    float angle_rad = 0.5f * std::atan2(2 * u11, u20 - u02);
-    return angle_rad * 180.0f / 3.14159f;
-}
-
-
-} // anonymous namespace
-
-// ==================================================================================
-//  Helpers & Profiler (from C_V2_EDGE.cpp)
-// ==================================================================================
 
 struct FunctionTimer {
     std::map<std::string, double> total_ms;
@@ -3627,8 +3325,7 @@ StatusCode FallDetector::Detect(const Image& frame, bool& is_fall) {
     if (pImpl->config.grid_cols <= 0) pImpl->config.grid_cols = (W + bSize - 1) / bSize;
     if (pImpl->config.grid_rows <= 0) pImpl->config.grid_rows = (H + bSize - 1) / bSize;
     
-    int grid_cols = pImpl->config.grid_cols;
-    int grid_rows = pImpl->config.grid_rows;
+
     
     // Resize mask check
     if (pImpl->hasBedMask && (pImpl->bedMask.width() != W || pImpl->bedMask.height() != H)) {
@@ -3708,9 +3405,10 @@ StatusCode FallDetector::Detect(const Image& frame, bool& is_fall) {
         const uint8_t* bg = pImpl->backgroundFrame.getData();
         int diff_thr = pImpl->config.bg_diff_threshold;
         
-        const unsigned char* bed_data = (pImpl->hasBedMask) ? pImpl->bedMask.getData() : nullptr;
-        int bed_w = (pImpl->hasBedMask) ? pImpl->bedMask.width() : 0;
-        int bed_h = (pImpl->hasBedMask) ? pImpl->bedMask.height() : 0;
+        // const unsigned char* bed_data = (pImpl->hasBedMask) ? pImpl->bedMask.getData() : nullptr;
+
+        // int bed_w = (pImpl->hasBedMask) ? pImpl->bedMask.width() : 0;
+        // int bed_h = (pImpl->hasBedMask) ? pImpl->bedMask.height() : 0;
 
         {
         TimerGuard t_mask(g_perf_timer, "1_5_BGMask_FindObj");
@@ -3735,6 +3433,7 @@ StatusCode FallDetector::Detect(const Image& frame, bool& is_fall) {
     {
     TimerGuard t_lk(g_perf_timer, "1_6_SparseLK");
     if ((int)pImpl->raw_frame_history.size() >= max_history) {
+            /*
             // Sort objects by area descending
             std::vector<::VisionSDK::ObjectFeatures*> sorted_objs;
             for (auto& obj : pImpl->full_frame_objects) {
@@ -3762,6 +3461,7 @@ StatusCode FallDetector::Detect(const Image& frame, bool& is_fall) {
                 // pImpl->computeIntegerLK(prev_frame, curr_frame, sorted_objs[i]->pixels, sorted_objs[i]->pixel_dx, sorted_objs[i]->pixel_dy, sorted_objs[i]->pixel_dir);
 #endif
             }
+            */
         }
     } // End SparseLK Timer    
         // Optional: Save BG Mask if configured
@@ -3828,7 +3528,7 @@ StatusCode FallDetector::Detect(const Image& frame, bool& is_fall) {
     #endif
 
     #if ENABLE_PERF_PROFILING
-    long long t2 = pImpl->get_now_us(); // Motion Est (placeholder, actual ME is below blockBasedMotionEstimation)
+
     // Wait, blockBasedMotionEstimation is called later!
     // Moving t1, t2 logic...
     // The previous block was JUST image conversion.
@@ -4363,7 +4063,7 @@ StatusCode FallDetector::Detect(const Image& frame, bool& is_fall) {
                  int lower_len = hull.size();
                  for(int i=(int)blockPts.size()-2; i>=0; --i) {
                      const Point& p = blockPts[i];
-                     while(hull.size() > lower_len) {
+                     while(hull.size() > (size_t)lower_len && hull.size() >= 2) { // Fix: Cast lower_len to size_t for comparison, ensure hull has at least 2 points
                          const Point& o = hull[hull.size()-2];
                          const Point& a = hull.back();
                          double cp = (a.x - o.x) * (p.y - o.y) - (a.y - o.y) * (p.x - o.x);
@@ -4475,7 +4175,9 @@ StatusCode FallDetector::Detect(const Image& frame, bool& is_fall) {
         pImpl->fg_count_history_buffer.push_back((int)pImpl->active_blocks.size());
         if(pImpl->fg_count_history_buffer.size() > 100) pImpl->fg_count_history_buffer.pop_front();
 
-        // 3. Object Analysis
+
+
+    // 3. Object Analysis
         for (auto& curr : pImpl->current_objects) {
             // Reconstruct History for this object
             // User requirement: "Recently n frames... m frames momentum trend"
@@ -4557,7 +4259,12 @@ StatusCode FallDetector::Detect(const Image& frame, bool& is_fall) {
             int box_w = 0, box_h = 0, m1, m2, m3, m4;
             getObjectBoundingBoxPixels(curr, pImpl->config.grid_cols, pImpl->config.grid_rows, W, H, box_w, box_h, m1, m2, m3, m4);
 
-            printf("[DET_LOG] F:%lld ID:%d YDom:%d Up:%d Dy:%.1f StrH:%.2f StrL:%.2f (R:%.2f) FGH:%.0f FGL:%.0f (R:%.2f) Box:%dx%d\n",
+                if (sum_dy < -25) { // Threshold for significant upward (-Y) motion
+                    // printf("[UpwardCheck] F:%lld ID:%d Y_Dom:%d Up:%d SumDy:%.1f -> IGNORE\n", 
+                    //        pImpl->frame_idx, curr.id, (int)y_dominant, (int)is_upward, sum_dy);
+                    continue; // Skip processing this object for fall trigger
+                }
+            printf("[DET_LOG] F:%d ID:%d YDom:%d Up:%d Dy:%.1f StrH:%.2f StrL:%.2f (R:%.2f) FGH:%.0f FGL:%.0f (R:%.2f) Box:%dx%d\n",
                    pImpl->frame_idx, curr.id, (int)y_dominant, (int)is_upward, sum_dy, 
                    avg_h_str, avg_l_str, (avg_h_str > 0 ? avg_l_str/avg_h_str : 0.0f),
                    s_h_fg, s_l_fg, (s_h_fg > 0 ? s_l_fg/s_h_fg : 0.0f), box_w, box_h);
@@ -4590,9 +4297,10 @@ StatusCode FallDetector::Detect(const Image& frame, bool& is_fall) {
             };
 
             // Lower mom_high_thresh to 4.0
-            float mom_high_thresh = 4.0f; // Relaxed from 6.0
-            float mom_drop_ratio = 0.8f; // Relaxed from 0.5
-            float fg_drop_ratio = 0.8f; // Relaxed from 0.75
+            // Lower mom_high_thresh to 4.0
+            // float mom_high_thresh = 4.0f; // Relaxed from 6.0
+            // float mom_drop_ratio = 0.8f; // Relaxed from 0.5
+            // float fg_drop_ratio = 0.8f; // Relaxed from 0.75
             
             
             /* ============================================================
@@ -4815,7 +4523,7 @@ StatusCode FallDetector::Detect(const Image& frame, bool& is_fall) {
                             // ALSO check Projection Dist < 250cm (Lying)
                             float rt_proj_dist = 9999.0f;
                             if (box_h > 0) {
-                                float ar = (float)box_w / (float)box_h;
+                                float ar = (float)box_w / box_h;
                                 
                                 // Calc Projection
                                 float top_u = curr.centerX;
@@ -4828,6 +4536,13 @@ StatusCode FallDetector::Detect(const Image& frame, bool& is_fall) {
                                 float pdx = tx - bx;
                                 float pdy = ty - by;
                                 rt_proj_dist = std::sqrt(pdx*pdx + pdy*pdy);
+
+                                // NEW: Store for visualization
+                                curr.proj_top_x = tx;
+                                curr.proj_top_y = ty;
+                                curr.proj_bot_x = bx;
+                                curr.proj_bot_y = by;
+                                curr.has_projection = true;
 
                                 if ((ar > 1.2f || rt_proj_dist < 250.0f) && recent_mom_avg < 12.0f) {
                                     suppress_retrigger = true;
@@ -4948,11 +4663,37 @@ StatusCode FallDetector::Detect(const Image& frame, bool& is_fall) {
                         }
                     }
 
+                    // NEW: Calculate Projection Points for Visualization (Every Frame in Observation)
+                    {
+                         float blk_w = (float)frame.width / pImpl->config.grid_cols;
+                         
+                         // Use Center X (converted to pixels) and Top/Bottom Y (pixels)
+                         float top_u = curr.centerX * blk_w; 
+                         float top_v = (float)m2; // Min Y
+                         float bot_u = curr.centerX * blk_w;
+                         float bot_v = (float)m4; // Max Y
+                         
+                         float tx, ty, bx, by;
+                         projectPoint(top_u, top_v, pImpl->homography_matrix, tx, ty);
+                         projectPoint(bot_u, bot_v, pImpl->homography_matrix, bx, by);
+                         
+                         curr.proj_top_x = tx;
+                         curr.proj_top_y = ty;
+                         curr.proj_bot_x = bx;
+                         curr.proj_bot_y = by;
+                         curr.has_projection = true;
+                         
+                         // DEBUG: Verify Projection is set
+                         printf("[DEBUG-PROJ] F:%d ID:%d Set Proj: Top(%.1f, %.1f) Bot(%.1f, %.1f)\n", 
+                                pImpl->frame_idx, curr.id, tx, ty, bx, by);
+                    }
+
                     // Step 4.0b: Bed Ratio Accumulation
                     // Calculate ratio of blocks in bed
+                    // Match to valid FG object using Centroid Distance
                     if (pImpl->hasBedMask) {
                         int bed_blocks = 0;
-                        int blk_w = pImpl->config.block_size; // Assuming square blocks approx for center
+                        // int blk_w = pImpl->config.block_size; // Assuming square blocks approx for center
                         int cols = pImpl->config.grid_cols;
                         const unsigned char* bed_data = pImpl->bedMask.getData();
                         int W = pImpl->bedMask.width();
@@ -4983,9 +4724,10 @@ StatusCode FallDetector::Detect(const Image& frame, bool& is_fall) {
                     if (true) { // Run every frame to ensure matched_fg_obj_id is always fresh
                          // Every frame is fine, find_objects_optimized is already called.
                          
+                         // --- Matching Strategy: Find closest FullFrameObject ---
                          // Debug Print Number of Full Frame Objects (Moved outside check)
                          if (pImpl->frame_idx >= 300 && pImpl->frame_idx <= 310) {
-                             printf("[Match-Frame-Start] F:%lld TotalFG:%lu MotionObjs:%lu\n", 
+                             printf("[Match-Frame-Start] F:%d TotalFG:%lu MotionObjs:%lu\n", 
                                     pImpl->frame_idx, pImpl->full_frame_objects.size(), pImpl->current_objects.size());
                          }
 
@@ -5003,7 +4745,7 @@ StatusCode FallDetector::Detect(const Image& frame, bool& is_fall) {
 
                             // Debug Per-Object Info (Inside Loop)
                             if (pImpl->frame_idx >= 300 && pImpl->frame_idx <= 310) {
-                                printf("[Match-Loop-Start] F:%lld ID:%d Blk:%lu LastValid:%d LastPos(%.1f,%.1f) ObsMode:%d Active:%d Wait:%d\n", 
+                                printf("[Match-Loop-Start] F:%d ID:%d Blk:%lu LastValid:%d LastPos(%.1f,%.1f) ObsMode:%d Active:%d Wait:%d\n", 
                                        pImpl->frame_idx, curr.id, curr.blocks.size(), state.last_fg_valid, state.last_fg_cx, state.last_fg_cy,
                                        curr.is_in_observation_mode, state.is_active, state.waiting_for_deceleration);
                             }
@@ -5055,7 +4797,7 @@ StatusCode FallDetector::Detect(const Image& frame, bool& is_fall) {
                                 
                                 // DEBUG
                                 if (pImpl->frame_idx >= 300 && pImpl->frame_idx <= 310) {
-                                    printf("[Match-OK] F:%lld ID:%d Blk:%lu Dist:%.2f FG_ID:%d LastValid:%d\n", 
+                                    printf("[Match-OK] F:%d ID:%d Blk:%lu Dist:%.2f FG_ID:%d LastValid:%d\n", 
                                            pImpl->frame_idx, curr.id, curr.blocks.size(), min_dist, fg_obj.id, state.last_fg_valid);
                                 }
 
@@ -5243,8 +4985,8 @@ StatusCode FallDetector::Detect(const Image& frame, bool& is_fall) {
                                 
                                 // NEW: Projection, Shrinkage & Area Override Logic (Runs UNCONDITIONALLY to correct Angle Verdict)
                                 if (state.trigger_pixel_count > 0 && state.frames_observed > 0) {
-                                    float avg_obs_area = (float)state.accumulated_pixel_count / state.frames_observed;
-                                    float area_diff_ratio = std::abs((float)state.trigger_pixel_count - avg_obs_area) / state.trigger_pixel_count;
+                                    // float avg_obs_area = (float)state.accumulated_pixel_count / state.frames_observed;
+                                    // float area_diff_ratio = std::abs((float)state.trigger_pixel_count - avg_obs_area) / state.trigger_pixel_count;
                                     
                                     // 2. Position-based dynamic minimum area threshold
                                     int base_min_area = pImpl->config.min_trigger_area;
@@ -5254,8 +4996,33 @@ StatusCode FallDetector::Detect(const Image& frame, bool& is_fall) {
                                     else if (y_ratio < 0.66f) dynamic_min_area = base_min_area;
                                     else dynamic_min_area = (int)(base_min_area * 5.0f);
                                     
-                                    // 3. Final Decision Logic (Runs Unconditionally)
-                                    // REPLACED: Planar Projection Logic (Top-Bottom Distance)
+                                    // 3. Final Decision Logic (Planar Projection)
+                                    if (curr.has_projection) {
+                                        float pdx = curr.proj_top_x - curr.proj_bot_x;
+                                        float pdy = curr.proj_top_y - curr.proj_bot_y;
+                                        float p_dist = std::sqrt(pdx*pdx + pdy*pdy);
+                                        
+                                        // Thresholds:
+                                        // Standing > 250.0
+                                        // Noise < 100.0 (Ghost)
+                                        // Fall [100.0, 250.0]
+                                        
+                                        if (p_dist >= 100.0f && p_dist <= 250.0f) {
+                                            // Valid Fall Range -> OVERRIDE Angle Verdict
+                                            if (perspective_aligned) {
+                                                 printf("[Case5] ID:%d PROJECTION OVERRIDE: Dist=%.1f (In Range 100-250) -> Force Fall\n", curr.id, p_dist);
+                                                 pImpl->LogTrace(curr.id, pImpl->frame_idx, "PROJ_OVERRIDE", p_dist, "Force Fall (Range 100-250)");
+                                                 perspective_aligned = false; 
+                                            }
+                                        } else {
+                                            // Standing or Noise -> OVERRIDE Force Aligned (No Fall)
+                                            if (!perspective_aligned) {
+                                                 printf("[Case5] ID:%d PROJECTION FILTER: Dist=%.1f (Out Range 100-250) -> Suppress Fall\n", curr.id, p_dist);
+                                                 pImpl->LogTrace(curr.id, pImpl->frame_idx, "PROJ_FILTER", p_dist, "Suppress Fall (Out Range)");
+                                                 perspective_aligned = true;
+                                            }
+                                        }
+                                    }
                                     // User Request: Disable Area Shrinkage/Growth. Use Projection Error.
                                     
                                     bool is_standing_projection = false;
@@ -5328,8 +5095,13 @@ StatusCode FallDetector::Detect(const Image& frame, bool& is_fall) {
                                             if (proj_dist > 250.0f) {
                                                 is_standing_projection = true;
                                             }
-                                            printf("[Case5-Proj] ID:%d Top:(%.1f,%.1f) Bot:(%.1f,%.1f) ProjDist:%.1f cm (Thresh:250.0)\n", 
-                                                   curr.id, top_u, top_v, bot_u, bot_v, proj_dist);
+                                            // Store for Visualization
+                                            curr.proj_top_x = top_u;
+                                            curr.proj_top_y = top_v;
+                                            curr.proj_bot_x = bot_u;
+                                            curr.proj_bot_y = bot_v;
+                                            curr.has_projection = true;
+                                            
                                             }
                                         }
                                     }
@@ -5697,6 +5469,8 @@ StatusCode FallDetector::Detect(const Image& frame, bool& is_fall) {
         double avg_me = (double)pImpl->prof.motion_est_time / pImpl->prof.frame_count / 1000.0;
         double avg_face = (double)pImpl->prof.face_detect_time / pImpl->prof.frame_count / 1000.0;
         double avg_logic = (double)pImpl->prof.fall_logic_time / pImpl->prof.frame_count / 1000.0;
+
+
         
         printf("[FallDetector Profiling] Avg Time (ms) - Total: %.2f, ME: %.2f, Face: %.2f, Logic: %.2f\n", 
                avg_total, avg_me, avg_face, avg_logic);
