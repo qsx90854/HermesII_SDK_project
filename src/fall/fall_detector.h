@@ -82,6 +82,7 @@ struct InternalConfig {
     float bed_exit_min_outside_ratio = 0.6f;
     bool enable_bed_exit_verification = true; // NEW
     bool enable_block_shrink_verification = true; // NEW
+    float bed_update_alpha_multiplier = 4.0f; // NEW
 
     // Optical Flow
     int opt_flow_frame_distance = 3;
@@ -90,6 +91,8 @@ struct InternalConfig {
 
     // Area Override Filter
     int min_trigger_area = 2000; // Base min area (pixels) for mid-frame zone; scaled by Y position
+    float bed_pixel_ratio_threshold = 0.3f; // NEW
+    int momentum_calc_type = 0; // 0: Avg (Default), 1: Peak Block
 };
 
 class FallDetector {

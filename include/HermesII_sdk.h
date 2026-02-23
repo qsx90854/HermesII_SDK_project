@@ -99,6 +99,8 @@ struct FallDetection_v3 {
     int post_fall_check_frames = 5;
     bool enable_bed_exit_verification = true; // NEW
     bool enable_block_shrink_verification = true; // NEW
+    float bed_update_alpha_multiplier = 4.0f; // NEW: Fast Bed Update Multiplier
+
 
     // Optical Flow Params
     int opt_flow_frame_distance = 3;
@@ -107,6 +109,8 @@ struct FallDetection_v3 {
 
     // Area Override Filter
     int min_trigger_area = 2000; // Base min area (pixels) for mid-frame zone; scaled by Y position
+    float bed_pixel_ratio_threshold = 0.3f; // NEW
+    int momentum_calc_type = 0; // 0: Average (Default), 1: Max Block
 };
 
 struct BedExitDetection_v1 {

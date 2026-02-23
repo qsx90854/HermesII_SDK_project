@@ -136,6 +136,9 @@ StatusCode VisionSDK::VisionSDK::SetConfig(const void* config) {
             pImpl->config.perspective_point_x = c->perspective_point_x;
             pImpl->config.perspective_point_y = c->perspective_point_y;
             pImpl->config.min_trigger_area = c->min_trigger_area;
+            pImpl->config.bed_update_alpha_multiplier = c->bed_update_alpha_multiplier; // NEW
+            pImpl->config.bed_pixel_ratio_threshold = c->bed_pixel_ratio_threshold; // NEW
+            pImpl->config.momentum_calc_type = c->momentum_calc_type;
             break;
         }
         case ConfigType::BedExitDetection_v1: {
@@ -213,13 +216,7 @@ StatusCode VisionSDK::VisionSDK::SetInputMemory(unsigned char* buffer, int width
     pImpl->input_channels = channels;
 
     // Wrap buffer in Image struct
-    Image frame; 
-    frame.data = pImpl->input_buffer;
-    frame.width = pImpl->input_width;
-    frame.height = pImpl->input_height;
-    frame.channels = pImpl->input_channels;
-    frame.timestamp = 0; 
-    
+    // (Unused wrapper variable removed)
     // Debug Print
     // printf("[VisionSDK::SetInputMemory] Input buffer=%p, w=%d, h=%d, c=%d\n", buffer, width, height, channels);
 

@@ -34,35 +34,48 @@ using namespace VisionSDK;
 // TOGGLE: 1 = Use SDK Internal Logic, 0 = Use Demo Custom Logic (Peak-Valley)
 #define USE_SDK_FALL_RESULT 1
 
+#define SAVE_ALL_TEST_IMAGES 0
+#define SAVE_GRID_IMAGE 1
+
 // Drawing Helper
 void drawRectRGB(std::vector<uint8_t>& img, int w, int h, int x, int y, int rw, int rh, uint8_t r, uint8_t g, uint8_t b, int thickness=2) {
     if (x < 0) x = 0; if (y < 0) y = 0;
     
-    // Top & Bottom
-    for(int cx = x; cx < x + rw && cx < w; cx++) {
-        for(int t=0; t<thickness; ++t) {
-            if(y+t >= 0 && y+t < h) {
-                 int idx = ((y+t) * w + cx) * 3;
-                 img[idx] = r; img[idx+1] = g; img[idx+2] = b;
-            }
-            if(y + rh - 1 - t >= 0 && y + rh - 1 - t < h) {
-                 int idx = ((y + rh - 1 - t) * w + cx) * 3;
-                 img[idx] = r; img[idx+1] = g; img[idx+2] = b;
+    if (thickness < 0) {
+        // Filled Rectangle
+        for (int cy = y; cy < y + rh && cy < h; cy++) {
+            for (int cx = x; cx < x + rw && cx < w; cx++) {
+                int idx = (cy * w + cx) * 3;
+                img[idx] = r; img[idx+1] = g; img[idx+2] = b;
             }
         }
-    }
-    // Left & Right
-    for(int cy = y; cy < y + rh && cy < h; cy++) {
-         for(int t=0; t<thickness; ++t) {
-            if(x+t >= 0 && x+t < w) {
-                 int idx = (cy * w + (x+t)) * 3;
-                 img[idx] = r; img[idx+1] = g; img[idx+2] = b;
+    } else {
+        // Top & Bottom
+        for(int cx = x; cx < x + rw && cx < w; cx++) {
+            for(int t=0; t<thickness; ++t) {
+                if(y+t >= 0 && y+t < h) {
+                     int idx = ((y+t) * w + cx) * 3;
+                     img[idx] = r; img[idx+1] = g; img[idx+2] = b;
+                }
+                if(y + rh - 1 - t >= 0 && y + rh - 1 - t < h) {
+                     int idx = ((y + rh - 1 - t) * w + cx) * 3;
+                     img[idx] = r; img[idx+1] = g; img[idx+2] = b;
+                }
             }
-            if(x + rw - 1 - t >= 0 && x + rw - 1 - t < w) {
-                 int idx = (cy * w + (x + rw - 1 - t)) * 3;
-                 img[idx] = r; img[idx+1] = g; img[idx+2] = b;
-            }
-         }
+        }
+        // Left & Right
+        for(int cy = y; cy < y + rh && cy < h; cy++) {
+             for(int t=0; t<thickness; ++t) {
+                if(x+t >= 0 && x+t < w) {
+                     int idx = (cy * w + (x+t)) * 3;
+                     img[idx] = r; img[idx+1] = g; img[idx+2] = b;
+                }
+                if(x + rw - 1 - t >= 0 && x + rw - 1 - t < w) {
+                     int idx = (cy * w + (x + rw - 1 - t)) * 3;
+                     img[idx] = r; img[idx+1] = g; img[idx+2] = b;
+                }
+             }
+        }
     }
 }
 
@@ -250,6 +263,99 @@ void drawString(std::vector<uint8_t>& img, int w, int h, int x, int y, const std
             cx += 8 * scale; 
         } else {
              cx += 6 * scale; 
+        }
+    }
+}
+
+// ==========================================
+// Homography & Warping Utilities (Manual)
+// ==========================================
+
+bool solveLinearSystem(int N, const float* A, const float* b, float* x) {
+    std::vector<float> M(N * (N + 1));
+    for (int i = 0; i < N; ++i) {
+        for (int j = 0; j < N; ++j) M[i * (N + 1) + j] = A[i * N + j];
+        M[i * (N + 1) + N] = b[i];
+    }
+    for (int i = 0; i < N; ++i) {
+        int pivot = i;
+        for (int j = i + 1; j < N; ++j) {
+            if (std::abs(M[j * (N + 1) + i]) > std::abs(M[pivot * (N + 1) + i])) pivot = j;
+        }
+        if (std::abs(M[pivot * (N + 1) + i]) < 1e-6) return false;
+        if (pivot != i) {
+            for (int k = i; k <= N; ++k) std::swap(M[i * (N + 1) + k], M[pivot * (N + 1) + k]);
+        }
+        float div = M[i * (N + 1) + i];
+        for (int k = i; k <= N; ++k) M[i * (N + 1) + k] /= div;
+        for (int j = 0; j < N; ++j) {
+            if (i != j) {
+                float mul = M[j * (N + 1) + i];
+                for (int k = i; k <= N; ++k) M[j * (N + 1) + k] -= mul * M[i * (N + 1) + k];
+            }
+        }
+    }
+    for (int i = 0; i < N; ++i) x[i] = M[i * (N + 1) + N];
+    return true;
+}
+
+// Compute Homography Matrix H (3x3) using 4 point correspondences
+bool computeHomography(const std::vector<std::pair<int, int>>& src_points, 
+                        const std::vector<std::pair<float, float>>& dst_points, 
+                        float H[9]) {
+    if (src_points.size() != 4 || dst_points.size() != 4) return false;
+    float A[64] = {0};
+    float b[8] = {0};
+    for (int i = 0; i < 4; ++i) {
+        float sx = (float)src_points[i].first;
+        float sy = (float)src_points[i].second;
+        float dx = dst_points[i].first;
+        float dy = dst_points[i].second;
+        int r1 = 2 * i;
+        A[r1*8+0]=sx; A[r1*8+1]=sy; A[r1*8+2]=1.0f; A[r1*8+6]=-sx*dx; A[r1*8+7]=-sy*dx; b[r1]=dx;
+        int r2 = 2 * i + 1;
+        A[r2*8+3]=sx; A[r2*8+4]=sy; A[r2*8+5]=1.0f; A[r2*8+6]=-sx*dy; A[r2*8+7]=-sy*dy; b[r2]=dy;
+    }
+    float x[8];
+    if (!solveLinearSystem(8, A, b, x)) return false;
+    H[0]=x[0]; H[1]=x[1]; H[2]=x[2]; H[3]=x[3]; H[4]=x[4]; H[5]=x[5]; H[6]=x[6]; H[7]=x[7]; H[8]=1.0f;
+    return true;
+}
+
+// Wrapper for simple rectangle target
+bool computeHomographyRect(const std::vector<std::pair<int, int>>& src_points, float target_w, float target_h, float H[9]) {
+    std::vector<std::pair<float, float>> dst = {{0,0}, {target_w, 0}, {target_w, target_h}, {0, target_h}};
+    return computeHomography(src_points, dst, H);
+}
+
+void projectPoint(float u, float v, const float H[9], float& x, float& y) {
+    float z = H[6] * u + H[7] * v + H[8];
+    if (std::abs(z) > 1e-4) {
+        x = (H[0] * u + H[1] * v + H[2]) / z;
+        y = (H[3] * u + H[4] * v + H[5]) / z;
+    } else { x = 0; y = 0; }
+}
+
+// Inverse Warping for efficiency without gaps
+void warpPerspectiveDemo(const std::vector<uint8_t>& src, int sw, int sh, 
+                        std::vector<uint8_t>& dst, int dw, int dh, 
+                        const float H_inv[9]) {
+    dst.assign(dw * dh * 3, 0);
+    for (int dy = 0; dy < dh; ++dy) {
+        for (int dx = 0; dx < dw; ++dx) {
+            float sx, sy;
+            projectPoint((float)dx, (float)dy, H_inv, sx, sy);
+            
+            int isx = (int)(sx + 0.5f);
+            int isy = (int)(sy + 0.5f);
+            
+            if (isx >= 0 && isx < sw && isy >= 0 && isy < sh) {
+                int src_idx = (isy * sw + isx) * 3;
+                int dst_idx = (dy * dw + dx) * 3;
+                dst[dst_idx] = src[src_idx];
+                dst[dst_idx + 1] = src[src_idx + 1];
+                dst[dst_idx + 2] = src[src_idx + 2];
+            }
         }
     }
 }
@@ -534,11 +640,13 @@ int main(int argc, char** argv) {
     fallCfg.fall_acceleration_upper_threshold = (float)cfg.getFloat("FallDetect.Fall_Detect_Accel_Upper_Threshold", 2.0f);
     fallCfg.fall_acceleration_lower_threshold = (float)cfg.getFloat("FallDetect.Fall_Detect_Accel_Lower_Threshold", -2.0f);
     float bed_pixel_ratio_threshold = (float)cfg.getFloat("FallDetect.Fall_Detect_Bed_Pixel_Ratio_Threshold", 0.3f);
+    fallCfg.bed_pixel_ratio_threshold = bed_pixel_ratio_threshold; // NEW
     fallCfg.safe_area_ratio_threshold = (float)cfg.getFloat("FallDetect.Safe_Area_Ratio_Threshold", 0.5);
     fallCfg.fall_window_size = cfg.getInt("FallDetect.Fall_Detect_Frame_History_Length", 30);
     fallCfg.fall_duration = cfg.getInt("FallDetect.Fall_Detect_Frame_History_Threshold", 5);
     fallCfg.post_fall_distance_threshold = (float)cfg.getFloat("FallDetect.Fall_Detect_Post_Fall_Distance_Threshold", 10.0f);
     fallCfg.post_fall_check_frames = cfg.getInt("FallDetect.Fall_Detect_Post_Fall_Check_Frames", 5);
+    fallCfg.momentum_calc_type = cfg.getInt("FallDetect.Fall_Detect_Momentum_Calc_Type", 0);
     std::cout << "DEBUG: Loaded Window Size: " << fallCfg.fall_window_size << std::endl;
     std::cout << "DEBUG: Loaded Duration: " << fallCfg.fall_duration << std::endl;
     std::cout << "DEBUG: Loaded Duration: " << fallCfg.fall_duration << std::endl;
@@ -554,6 +662,7 @@ int main(int argc, char** argv) {
     fallCfg.bg_diff_threshold = cfg.getInt("FallDetect.BG_Diff_Threshold", 30);
     fallCfg.bg_update_interval_frames = cfg.getInt("FallDetect.BG_Update_Interval", 10);
     fallCfg.bg_update_alpha = cfg.getFloat("FallDetect.BG_Update_Alpha", 0.01f);
+    fallCfg.bed_update_alpha_multiplier = cfg.getFloat("FallDetect.Bed_Update_Alpha_Multiplier", 4.0f);
     
     // Optical Flow Params
     fallCfg.opt_flow_frame_distance = cfg.getInt("OpticalFlow.CompareFrameDistance", 3);
@@ -600,6 +709,26 @@ int main(int argc, char** argv) {
             bed_points_sorted = bed_points; // Store for drawing
             std::cout << "Bed region loaded from " << bedFile << std::endl;
         }
+    }
+
+    // --- BEV Matrix Calc ---
+    float H_bev[9] = {0};
+    float H_bev_inv[9] = {0};
+    bool has_bev = false;
+    if (bed_points_sorted.size() == 4) {
+        // H_bev: Image -> Ground (100x200cm)
+        bool ok1 = computeHomographyRect(bed_points_sorted, 100.0f, 200.0f, H_bev);
+        
+        // H_bev_inv: BEV_Pixels (1000x1000) -> Image
+        // We map a 100x200cm region in the middle of our 1000x1000cm canvas to the bed points.
+        // Target: Bed at X:450..550, Y:400..600
+        std::vector<std::pair<int, int>> bev_pixels = {{450, 400}, {550, 400}, {550, 600}, {450, 600}};
+        std::vector<std::pair<float, float>> img_points;
+        for(auto& p : bed_points_sorted) img_points.push_back({(float)p.first, (float)p.second});
+        bool ok2 = computeHomography(bev_pixels, img_points, H_bev_inv);
+        
+        has_bev = ok1 && ok2;
+        if (has_bev) std::cout << "[Demo] BEV Homography Computed (10x10m View)." << std::endl;
     }
 
     // 4. Processing Loop
@@ -1454,7 +1583,74 @@ int main(int argc, char** argv) {
         
         char fg_groups_filename[256];
         snprintf(fg_groups_filename, sizeof(fg_groups_filename), "%s/fg_groups_frame_%05d.jpg", save_dir.c_str(), i);
-        stbi_write_jpg(fg_groups_filename, W, H, 3, ff_viz_img.data(), 90);
+        if (SAVE_ALL_TEST_IMAGES) {
+            stbi_write_jpg(fg_groups_filename, W, H, 3, ff_viz_img.data(), 90);
+        }
+        
+        // --- BEV Debug Visualization (User Request) ---
+        // Declare bev_img_frame_sized outside so it's reusable for 2x2 composite later
+        std::vector<uint8_t> bev_img_frame_sized(W * H * 3, 0); // black if no BEV
+        if (has_bev) {
+            std::vector<uint8_t> bev_img;
+            int bev_w = 1000;
+            int bev_h = 1000;
+            warpPerspectiveDemo(clean_frame_rgb, W, H, bev_img, bev_w, bev_h, H_bev_inv);
+            
+            // Draw projected BBoxes on BEV
+            for (const auto& f_obj : ff_objs) {
+                if (f_obj.area < 100) continue; // Skip noise
+                
+                // Get Image BBox
+                int min_u = W, max_u = 0, min_v = H, max_v = 0;
+                for(int pix : f_obj.pixels) {
+                    int pu = pix % W;
+                    int pv = pix / W;
+                    min_u = std::min(min_u, pu); max_u = std::max(max_u, pu);
+                    min_v = std::min(min_v, pv); max_v = std::max(max_v, pv);
+                }
+                
+                // Project 4 Corners of BBox to Ground (cm)
+                float tx1, ty1, tx2, ty2, bx1, by1, bx2, by2;
+                projectPoint((float)min_u, (float)min_v, H_bev, tx1, ty1);
+                projectPoint((float)max_u, (float)min_v, H_bev, tx2, ty2);
+                projectPoint((float)min_u, (float)max_v, H_bev, bx1, by1);
+                projectPoint((float)max_u, (float)max_v, H_bev, bx2, by2);
+                
+                // Map Ground (cm) to BEV Pixels (Centered at 450, 400)
+                auto g_to_p = [](float gx, float gy) -> std::pair<int, int> {
+                    return {(int)(gx + 450.0f), (int)(gy + 400.0f)};
+                };
+                auto p1 = g_to_p(tx1, ty1); auto p2 = g_to_p(tx2, ty2);
+                auto p3 = g_to_p(bx2, by2); auto p4 = g_to_p(bx1, by1);
+                
+                uint8_t br=255, bg=255, bb=255;
+                if (f_obj.area > 2000) { br=0; bg=255; bb=0; } // Large = Green
+                
+                drawLine(bev_img, bev_w, bev_h, p1.first, p1.second, p2.first, p2.second, br, bg, bb, 1);
+                drawLine(bev_img, bev_w, bev_h, p2.first, p2.second, p3.first, p3.second, br, bg, bb, 1);
+                drawLine(bev_img, bev_w, bev_h, p3.first, p3.second, p4.first, p4.second, br, bg, bb, 1);
+                drawLine(bev_img, bev_w, bev_h, p4.first, p4.second, p1.first, p1.second, br, bg, bb, 1);
+            }
+            
+            char bev_filename[256];
+            snprintf(bev_filename, sizeof(bev_filename), "%s/bev_frame_%05i.jpg", save_dir.c_str(), i);
+            if (SAVE_ALL_TEST_IMAGES) {
+                stbi_write_jpg(bev_filename, bev_w, bev_h, 3, bev_img.data(), 80);
+            }
+            
+            // Resize BEV (1000x1000) -> W x H using nearest-neighbor for 2x2 composite
+            for (int dy = 0; dy < H; dy++) {
+                for (int dx = 0; dx < W; dx++) {
+                    int src_x = dx * bev_w / W;
+                    int src_y = dy * bev_h / H;
+                    int src_idx = (src_y * bev_w + src_x) * 3;
+                    int dst_idx = (dy * W + dx) * 3;
+                    bev_img_frame_sized[dst_idx + 0] = bev_img[src_idx + 0];
+                    bev_img_frame_sized[dst_idx + 1] = bev_img[src_idx + 1];
+                    bev_img_frame_sized[dst_idx + 2] = bev_img[src_idx + 2];
+                }
+            }
+        }
         
         
         // 3. Draw Changed Blocks (Green)
@@ -1470,7 +1666,7 @@ int main(int argc, char** argv) {
                          // Draw Green Rect
                          int x = (int)(c * bw);
                          int y = (int)(r * bh);
-                         drawRectRGB(current_frame_rgb, W, H, x, y, (int)bw, (int)bh, 0, 255, 0, 1);
+                         drawRectRGB(current_frame_rgb, W, H, x, y, (int)bw, (int)bh, 0, 255, 0, 2);
                      }
                  }
              }
@@ -1958,7 +2154,7 @@ int main(int argc, char** argv) {
              char mask_filename[256];
              snprintf(mask_filename, sizeof(mask_filename), "%s/bg_mask_frame_%05d.jpg", save_dir.c_str(), i);
              
-             if (!bg_mask_img.empty()) {
+             if (!bg_mask_img.empty() && SAVE_ALL_TEST_IMAGES) {
                   stbi_write_jpg(mask_filename, W, H, 3, bg_mask_img.data(), 90);
              } 
         }
@@ -2057,7 +2253,46 @@ int main(int argc, char** argv) {
         // Save Current Frame IMMEDIATELY
         char out_filename[256];
         snprintf(out_filename, sizeof(out_filename), "%s/frame_%05d.jpg", save_dir.c_str(), i);
-        stbi_write_jpg(out_filename, W, H, 3, current_frame_rgb.data(), 90);
+        if (SAVE_ALL_TEST_IMAGES) {
+            stbi_write_jpg(out_filename, W, H, 3, current_frame_rgb.data(), 90);
+        }
+
+        // === 2x2 COMPOSITE IMAGE ===
+        // Layout: [frame (top-left)] [fg_groups (top-right)]
+        //         [bev (bot-left)]   [bg_mask (bot-right)]
+        {
+            int CW = W * 2;  // composite width
+            int CH = H * 2;  // composite height
+            std::vector<uint8_t> composite(CW * CH * 3, 0);
+
+            // Helper: copy a W x H source image into composite at offset (ox, oy)
+            auto paste = [&](const std::vector<uint8_t>& src, int src_w, int src_h, int ox, int oy) {
+                // nearest-neighbor scale src to W x H then paste
+                for (int dy = 0; dy < H; dy++) {
+                    for (int dx = 0; dx < W; dx++) {
+                        int sx = dx * src_w / W;
+                        int sy = dy * src_h / H;
+                        int si = (sy * src_w + sx) * 3;
+                        int di = ((oy + dy) * CW + (ox + dx)) * 3;
+                        composite[di + 0] = src[si + 0];
+                        composite[di + 1] = src[si + 1];
+                        composite[di + 2] = src[si + 2];
+                    }
+                }
+            };
+
+            paste(current_frame_rgb, W, H, 0, 0);      // top-left:  main frame
+            paste(ff_viz_img, W, H, W, 0);              // top-right: FG groups
+            paste(bev_img_frame_sized, W, H, 0, H);    // bot-left:  BEV
+            // bg_mask might be empty if not enabled; fall back to black
+            if (!bg_mask_img.empty()) {
+                paste(bg_mask_img, W, H, W, H);         // bot-right: BG mask
+            }
+
+            char grid_filename[256];
+            snprintf(grid_filename, sizeof(grid_filename), "%s/grid_frame_%05d.jpg", save_dir.c_str(), i);
+            stbi_write_jpg(grid_filename, CW, CH, 3, composite.data(), 85);
+        }
         
     } // End of loop
     
