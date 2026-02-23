@@ -4353,11 +4353,11 @@ StatusCode FallDetector::Detect(const Image& frame, bool& is_fall) {
             int box_w = 0, box_h = 0, m1, m2, m3, m4;
             getObjectBoundingBoxPixels(curr, pImpl->config.grid_cols, pImpl->config.grid_rows, W, H, box_w, box_h, m1, m2, m3, m4);
 
-                if (sum_dy < -25) { // Threshold for significant upward (-Y) motion
-                    // printf("[UpwardCheck] F:%lld ID:%d Y_Dom:%d Up:%d SumDy:%.1f -> IGNORE\n", 
-                    //        pImpl->frame_idx, curr.id, (int)y_dominant, (int)is_upward, sum_dy);
-                    continue; // Skip processing this object for fall trigger
-                }
+                // if (sum_dy < -25) { // Threshold for significant upward (-Y) motion
+                //     // printf("[UpwardCheck] F:%lld ID:%d Y_Dom:%d Up:%d SumDy:%.1f -> IGNORE\n", 
+                //     //        pImpl->frame_idx, curr.id, (int)y_dominant, (int)is_upward, sum_dy);
+                //     continue; // Skip processing this object for fall trigger
+                // }
             printf("[DET_LOG] F:%d ID:%d YDom:%d Up:%d Dy:%.1f StrH:%.2f StrL:%.2f (R:%.2f) FGH:%.0f FGL:%.0f (R:%.2f) Box:%dx%d\n",
                    pImpl->frame_idx, curr.id, (int)y_dominant, (int)is_upward, sum_dy, 
                    avg_h_str, avg_l_str, (avg_h_str > 0 ? avg_l_str/avg_h_str : 0.0f),
