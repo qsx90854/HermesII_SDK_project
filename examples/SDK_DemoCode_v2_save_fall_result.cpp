@@ -36,7 +36,7 @@ using namespace VisionSDK;
 
 #define SAVE_ALL_TEST_IMAGES 0
 #define SAVE_GRID_IMAGE 0
-
+#define SAVE_FACE_IMAGES 1
 // Drawing Helper
 void drawRectRGB(std::vector<uint8_t>& img, int w, int h, int x, int y, int rw, int rh, uint8_t r, uint8_t g, uint8_t b, int thickness=2) {
     if (x < 0) x = 0; if (y < 0) y = 0;
@@ -438,6 +438,8 @@ bool is_strong_fall = false;
 bool custom_fall_signal = false;
 std::string current_frame_reasons = "";
 bool is_bed_exit_in_current_frame = false;
+bool is_face_in_current_frame = false;
+float current_face_x = 0, current_face_y = 0, current_face_w = 0, current_face_h = 0;
 int global_fall_event_id = 0;
 int fall_red_box_countdown = 0;
 
@@ -455,6 +457,11 @@ void onFallDetected(const VisionSDK::VisionSDKEvent& event) {
     is_fall_in_current_frame = event.is_fall_detected;
     is_strong_fall = event.is_strong;
     is_bed_exit_in_current_frame = event.is_bed_exit;
+    is_face_in_current_frame = event.is_face;
+    current_face_x = event.face_x;
+    current_face_y = event.face_y;
+    current_face_w = event.face_w;
+    current_face_h = event.face_h;
 
     if (event.is_fall_detected) {
         // Warning Logic
@@ -977,6 +984,7 @@ int main(int argc, char** argv) {
         current_frame_idx = i;
         is_fall_in_current_frame = false; // Reset
         is_bed_exit_in_current_frame = false;
+        is_face_in_current_frame = false;
 
         // Background Averaging Logic
         if (i >= bg_init_start_frame && i <= bg_init_end_frame) {
@@ -2155,8 +2163,16 @@ int main(int argc, char** argv) {
             // Optionally print text
              drawString(current_frame_rgb, W, H, W/2 - 50, 10, "BED EXIT", 255, 255, 0, 2);
         }
-#endif // SAVE_ALL_TEST_IMAGES || SAVE_GRID_IMAGE
 
+
+#endif // SAVE_ALL_TEST_IMAGES || SAVE_GRID_IMAGE
+#if SAVE_FACE_IMAGES
+        // 8. Face ROI
+        if (is_face_in_current_frame) {
+             drawRectRGB(current_frame_rgb, W, H, (int)current_face_x, (int)current_face_y, (int)current_face_w, (int)current_face_h, 255, 0, 255, 2);
+             drawString(current_frame_rgb, W, H, (int)current_face_x, (int)current_face_y - 20, "FACE", 255, 0, 255, 2);
+        }
+#endif
 #if SAVE_ALL_TEST_IMAGES
         // SAVE BG MASK (Post-Loop)
         if (fallCfg.enable_save_bg_mask) {
@@ -2255,7 +2271,7 @@ int main(int argc, char** argv) {
         }
 #endif // SAVE_ALL_TEST_IMAGES || SAVE_GRID_IMAGE
 
-#if SAVE_ALL_TEST_IMAGES
+#if (SAVE_ALL_TEST_IMAGES || SAVE_FACE_IMAGES)
         // Save Current Frame IMMEDIATELY
         {
             char out_filename[256];
