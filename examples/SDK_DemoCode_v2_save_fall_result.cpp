@@ -35,7 +35,7 @@ using namespace VisionSDK;
 #define USE_SDK_FALL_RESULT 1
 
 #define SAVE_ALL_TEST_IMAGES 0
-#define SAVE_GRID_IMAGE 1
+#define SAVE_GRID_IMAGE 0
 
 // Drawing Helper
 void drawRectRGB(std::vector<uint8_t>& img, int w, int h, int x, int y, int rw, int rh, uint8_t r, uint8_t g, uint8_t b, int thickness=2) {
@@ -428,7 +428,7 @@ public:
 std::vector<int> detected_frames;
 std::vector<uint8_t> current_frame_rgb; // Keep copy for drawing
 std::vector<uint8_t> clean_frame_rgb; // New: For saving original crops
-std::vector<uint8_t> current_frame_rgb_onlyBlock; // Keep copy for drawing
+// current_frame_rgb_onlyBlock removed (unused)
 int current_frame_idx = -1;
 int pW = 800;
 int pH = 450;
@@ -663,6 +663,8 @@ int main(int argc, char** argv) {
     fallCfg.bg_update_interval_frames = cfg.getInt("FallDetect.BG_Update_Interval", 10);
     fallCfg.bg_update_alpha = cfg.getFloat("FallDetect.BG_Update_Alpha", 0.01f);
     fallCfg.bed_update_alpha_multiplier = cfg.getFloat("FallDetect.Bed_Update_Alpha_Multiplier", 4.0f);
+    fallCfg.enable_post_bed_exit_threshold = (cfg.getInt("FallDetect.Enable_Post_BedExit_Threshold", 0) != 0);
+    fallCfg.post_bed_exit_threshold_multiplier = cfg.getFloat("FallDetect.Post_BedExit_Threshold_Multiplier", 0.7f);
     
     // Optical Flow Params
     fallCfg.opt_flow_frame_distance = cfg.getInt("OpticalFlow.CompareFrameDistance", 3);
@@ -737,7 +739,7 @@ int main(int argc, char** argv) {
     sdk.SetInputMemory(file_buffer.data(), W, H, 3);
     current_frame_rgb = std::vector<uint8_t>(frame_size_rgb);
     clean_frame_rgb = std::vector<uint8_t>(frame_size_rgb);
-    current_frame_rgb_onlyBlock = std::vector<uint8_t>(frame_size_rgb);
+    // current_frame_rgb_onlyBlock removed (unused)
 
     mkdir(save_dir.c_str(), 0777);
     mkdir("v2_object_crops", 0777);
@@ -971,7 +973,7 @@ int main(int argc, char** argv) {
         // Copy for drawing
         memcpy(current_frame_rgb.data(), file_buffer.data(), frame_size_rgb);
         memcpy(clean_frame_rgb.data(), file_buffer.data(), frame_size_rgb);
-        memset(current_frame_rgb_onlyBlock.data(), 0, frame_size_rgb);
+        // (current_frame_rgb_onlyBlock removed)
         current_frame_idx = i;
         is_fall_in_current_frame = false; // Reset
         is_bed_exit_in_current_frame = false;
@@ -1173,6 +1175,7 @@ int main(int argc, char** argv) {
          //printf("[Debug] Step 3: Morphology Disabled\n");
         // ------------------------------------------
 
+#if (SAVE_ALL_TEST_IMAGES || SAVE_GRID_IMAGE)
         // 2. Draw Bed (Blue)
         if (bed_points_sorted.size() == 4) {
             for(int k=0; k<4; k++) {
@@ -1190,10 +1193,16 @@ int main(int argc, char** argv) {
              //drawRectRGB(current_frame_rgb, W, H, 0, 0, W, H, 255, 0, 0, 3);
              fall_red_box_countdown--;
         }
+#endif // SAVE_ALL_TEST_IMAGES || SAVE_GRID_IMAGE
 
         // ------------------------------------------
         // NEW: Full Frame Group Visualization
         // ------------------------------------------
+        // Variables needed outside guard for logging
+        int largest_obj_pixel_count = 0;
+        int largest_obj_red_count = 0;
+
+#if (SAVE_ALL_TEST_IMAGES || SAVE_GRID_IMAGE)
         std::vector<ObjectFeatures> ff_objs = sdk.GetFullFrameObjects();
         std::vector<uint8_t> ff_viz_img(W * H * 3, 0); // Start with black
         
@@ -1205,9 +1214,6 @@ int main(int argc, char** argv) {
         bool custom_fall_signal = false;
         int perspective_x = fallCfg.perspective_point_x;
         int perspective_y = fallCfg.perspective_point_y;
-        
-        int largest_obj_pixel_count = 0;
-        int largest_obj_red_count = 0;
 
         // Detect Objects used in Case 5 Perspective Check
         std::set<int> highlight_fg_ids;
@@ -1533,6 +1539,7 @@ int main(int argc, char** argv) {
             }
             // ==========================================================
         }
+#endif // SAVE_ALL_TEST_IMAGES || SAVE_GRID_IMAGE
 
         // Override SDK fall signal
         static int custom_hold_frames = 0;
@@ -1581,15 +1588,18 @@ int main(int argc, char** argv) {
             }
         }
         
-        char fg_groups_filename[256];
-        snprintf(fg_groups_filename, sizeof(fg_groups_filename), "%s/fg_groups_frame_%05d.jpg", save_dir.c_str(), i);
-        if (SAVE_ALL_TEST_IMAGES) {
+#if SAVE_ALL_TEST_IMAGES
+        {
+            char fg_groups_filename[256];
+            snprintf(fg_groups_filename, sizeof(fg_groups_filename), "%s/fg_groups_frame_%05d.jpg", save_dir.c_str(), i);
             stbi_write_jpg(fg_groups_filename, W, H, 3, ff_viz_img.data(), 90);
         }
+#endif
         
         // --- BEV Debug Visualization (User Request) ---
         // Declare bev_img_frame_sized outside so it's reusable for 2x2 composite later
         std::vector<uint8_t> bev_img_frame_sized(W * H * 3, 0); // black if no BEV
+#if (SAVE_ALL_TEST_IMAGES || SAVE_GRID_IMAGE)
         if (has_bev) {
             std::vector<uint8_t> bev_img;
             int bev_w = 1000;
@@ -1632,11 +1642,13 @@ int main(int argc, char** argv) {
                 drawLine(bev_img, bev_w, bev_h, p4.first, p4.second, p1.first, p1.second, br, bg, bb, 1);
             }
             
-            char bev_filename[256];
-            snprintf(bev_filename, sizeof(bev_filename), "%s/bev_frame_%05i.jpg", save_dir.c_str(), i);
-            if (SAVE_ALL_TEST_IMAGES) {
+#if SAVE_ALL_TEST_IMAGES
+            {
+                char bev_filename[256];
+                snprintf(bev_filename, sizeof(bev_filename), "%s/bev_frame_%05i.jpg", save_dir.c_str(), i);
                 stbi_write_jpg(bev_filename, bev_w, bev_h, 3, bev_img.data(), 80);
             }
+#endif
             
             // Resize BEV (1000x1000) -> W x H using nearest-neighbor for 2x2 composite
             for (int dy = 0; dy < H; dy++) {
@@ -1651,11 +1663,13 @@ int main(int argc, char** argv) {
                 }
             }
         }
+#endif // SAVE_ALL_TEST_IMAGES || SAVE_GRID_IMAGE
         
         
         // 3. Draw Changed Blocks (Green)
         int cols = motionCfg.grid_cols;
         int rows = motionCfg.grid_rows;
+#if (SAVE_ALL_TEST_IMAGES || SAVE_GRID_IMAGE)
         if ((int)changed_blocks.size() == cols * rows) {
              float bw = (float)W / cols;
              float bh = (float)H / rows;
@@ -1671,6 +1685,7 @@ int main(int argc, char** argv) {
                  }
              }
         }
+#endif // SAVE_ALL_TEST_IMAGES || SAVE_GRID_IMAGE
 
         // 4. Draw Objects (Blocks + Arrows)
         // Find object with max strength to highlight as "Fall Object" if fall detected
@@ -1689,6 +1704,7 @@ int main(int argc, char** argv) {
         // NEW: Filter bg_mask_img using Convex Hull (Match SDK Logic)
         // MOVED HERE (Before Object Loop) to avoid N^2 complexity
         // -------------------------------------------------------------
+#if (SAVE_ALL_TEST_IMAGES || SAVE_GRID_IMAGE)
         printf("[Debug] Step 5: Start Hull/Draw Loop (Frame %d)\n", i); fflush(stdout);
         if (true && !bg_mask_img.empty() && !objects.empty()) { // RE-ENABLED
             
@@ -1867,11 +1883,12 @@ int main(int argc, char** argv) {
             bg_mask_img = final_mask; // Update Global Mask
             //printf("[Debug] Skipping Hull Filter (Before Loop). MaskSz=%zu ObjSz=%zu\n", bg_mask_img.size(), objects.size());
         }
+#endif // SAVE_ALL_TEST_IMAGES || SAVE_GRID_IMAGE
         
 
+#if (SAVE_ALL_TEST_IMAGES || SAVE_GRID_IMAGE)
         for(const auto& obj : objects) 
         {
-            
             
 
             if (std::isnan(obj.centerX) || std::isnan(obj.centerY)) {
@@ -2125,6 +2142,7 @@ int main(int argc, char** argv) {
             } 
             }
         } // End of objects loop
+#endif // SAVE_ALL_TEST_IMAGES || SAVE_GRID_IMAGE
 
         // Log Largest Object Stats (ID 0)
         if (f_log_fg.is_open())  f_log_fg  << i << " 0 " << largest_obj_pixel_count << "\n";
@@ -2133,6 +2151,7 @@ int main(int argc, char** argv) {
         // 5. Draw All Vectors (Optional, user asked for "each object vector")
         // "各個物件...還有各物件的向量" -> Handled above.
         
+#if (SAVE_ALL_TEST_IMAGES || SAVE_GRID_IMAGE)
         // 5. Draw Fall Box
         if (is_fall_in_current_frame) {
              printf("[Debug] Frame %d Fall Detected! Drawing Box.\n", i);
@@ -2143,21 +2162,6 @@ int main(int argc, char** argv) {
         } else {
              drawString(current_frame_rgb, W, H, 10, 10, "NORMAL", 0, 255, 0, 3);
         }
-        
-        // SAVE BG MASK (Post-Loop)
-        // Ensure bg_mask_img is initialized if empty but we want to save
-        if (bg_mask_img.empty() && fallCfg.enable_save_bg_mask) {
-             bg_mask_img.resize(W*H*3, 0); // Black mask if no object
-        }
-
-        if (fallCfg.enable_save_bg_mask) {
-             char mask_filename[256];
-             snprintf(mask_filename, sizeof(mask_filename), "%s/bg_mask_frame_%05d.jpg", save_dir.c_str(), i);
-             
-             if (!bg_mask_img.empty() && SAVE_ALL_TEST_IMAGES) {
-                  stbi_write_jpg(mask_filename, W, H, 3, bg_mask_img.data(), 90);
-             } 
-        }
 
         // 7. Bed Exit Status (Yellow Border)
         if (is_bed_exit_in_current_frame) {
@@ -2165,6 +2169,19 @@ int main(int argc, char** argv) {
             // Optionally print text
              drawString(current_frame_rgb, W, H, W/2 - 50, 10, "BED EXIT", 255, 255, 0, 2);
         }
+#endif // SAVE_ALL_TEST_IMAGES || SAVE_GRID_IMAGE
+
+#if SAVE_ALL_TEST_IMAGES
+        // SAVE BG MASK (Post-Loop)
+        if (fallCfg.enable_save_bg_mask) {
+             if (bg_mask_img.empty()) bg_mask_img.resize(W*H*3, 0);
+             char mask_filename[256];
+             snprintf(mask_filename, sizeof(mask_filename), "%s/bg_mask_frame_%05d.jpg", save_dir.c_str(), i);
+             if (!bg_mask_img.empty()) {
+                  stbi_write_jpg(mask_filename, W, H, 3, bg_mask_img.data(), 90);
+             } 
+        }
+#endif
 
         // -------------------------------------------------------------
         // DELAYED BUFFERING LOGIC (METADATA ONLY)
@@ -2243,20 +2260,25 @@ int main(int argc, char** argv) {
             frame_buffer.pop_front();
         }
         
+#if (SAVE_ALL_TEST_IMAGES || SAVE_GRID_IMAGE)
         // DRAW DELAYED FEEDBACK ON CURRENT FRAME
         if (!delayed_feedback.empty()) {
              // Draw prominent alert on current frame
              drawRectRGB(current_frame_rgb, W, H, 100, H-60, W-200, 50, 255, 0, 0, -1); // Filed Bar
              drawString(current_frame_rgb, W, H, 120, H-50, delayed_feedback, 255, 255, 255, 3);
         }
+#endif // SAVE_ALL_TEST_IMAGES || SAVE_GRID_IMAGE
 
+#if SAVE_ALL_TEST_IMAGES
         // Save Current Frame IMMEDIATELY
-        char out_filename[256];
-        snprintf(out_filename, sizeof(out_filename), "%s/frame_%05d.jpg", save_dir.c_str(), i);
-        if (SAVE_ALL_TEST_IMAGES) {
+        {
+            char out_filename[256];
+            snprintf(out_filename, sizeof(out_filename), "%s/frame_%05d.jpg", save_dir.c_str(), i);
             stbi_write_jpg(out_filename, W, H, 3, current_frame_rgb.data(), 90);
         }
+#endif
 
+#if SAVE_GRID_IMAGE
         // === 2x2 COMPOSITE IMAGE ===
         // Layout: [frame (top-left)] [fg_groups (top-right)]
         //         [bev (bot-left)]   [bg_mask (bot-right)]
@@ -2293,6 +2315,7 @@ int main(int argc, char** argv) {
             snprintf(grid_filename, sizeof(grid_filename), "%s/grid_frame_%05d.jpg", save_dir.c_str(), i);
             stbi_write_jpg(grid_filename, CW, CH, 3, composite.data(), 85);
         }
+#endif // SAVE_GRID_IMAGE
         
     } // End of loop
     

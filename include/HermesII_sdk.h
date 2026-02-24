@@ -111,6 +111,10 @@ struct FallDetection_v3 {
     int min_trigger_area = 2000; // Base min area (pixels) for mid-frame zone; scaled by Y position
     float bed_pixel_ratio_threshold = 0.3f; // NEW
     int momentum_calc_type = 0; // 0: Average (Default), 1: Max Block
+
+    // Post-Bed-Exit Threshold Adjustment
+    bool enable_post_bed_exit_threshold = false;
+    float post_bed_exit_threshold_multiplier = 0.7f;
 };
 
 struct BedExitDetection_v1 {

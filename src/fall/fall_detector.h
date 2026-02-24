@@ -84,6 +84,11 @@ struct InternalConfig {
     bool enable_block_shrink_verification = true; // NEW
     float bed_update_alpha_multiplier = 4.0f; // NEW
 
+    // Post-Bed-Exit Threshold Adjustment
+    bool enable_post_bed_exit_threshold = false;       // Enable the threshold multiplier after bed exit
+    float post_bed_exit_threshold_multiplier = 0.7f;  // Multiply threshold1 for 30 frames after bed exit
+    int post_bed_exit_window_frames = 30;              // Number of frames to apply the multiplier
+
     // Optical Flow
     int opt_flow_frame_distance = 3;
     int perspective_point_x = 416;

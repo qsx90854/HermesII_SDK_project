@@ -139,6 +139,8 @@ StatusCode VisionSDK::VisionSDK::SetConfig(const void* config) {
             pImpl->config.bed_update_alpha_multiplier = c->bed_update_alpha_multiplier; // NEW
             pImpl->config.bed_pixel_ratio_threshold = c->bed_pixel_ratio_threshold; // NEW
             pImpl->config.momentum_calc_type = c->momentum_calc_type;
+            pImpl->config.enable_post_bed_exit_threshold = c->enable_post_bed_exit_threshold;
+            pImpl->config.post_bed_exit_threshold_multiplier = c->post_bed_exit_threshold_multiplier;
             break;
         }
         case ConfigType::BedExitDetection_v1: {

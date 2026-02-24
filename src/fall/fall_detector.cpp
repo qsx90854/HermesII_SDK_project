@@ -2256,6 +2256,9 @@ public:
         float fall_snapshot_dx = 0.0f;
         float fall_snapshot_dy = 0.0f;
         float fall_snapshot_mom = 0.0f;
+
+        // Post-Bed-Exit Threshold Window
+        int post_bed_exit_counter = 0;  // Counts down for N frames after bed exit trigger
     };
     std::map<int, ObservationState> observation_states;
 
@@ -2320,7 +2323,7 @@ public:
     static constexpr int ENTRY_SUPPRESS_FRAMES = 30;
 
     // Optical Flow Frame History
-    std::deque<::Image> raw_frame_history;
+    //std::deque<::Image> raw_frame_history;
 
     // Simple 3x3 Box Blur for noise reduction
     void smoothImage(const ::Image& src, ::Image& dst) {
@@ -3468,11 +3471,11 @@ StatusCode FallDetector::Detect(const Image& frame, bool& is_fall) {
     // See end of function.
 
     // --- raw_frame_history Management ---
-    pImpl->raw_frame_history.push_back(wrapper.clone());
-    int max_history = pImpl->config.opt_flow_frame_distance + 1;
-    if ((int)pImpl->raw_frame_history.size() > max_history) {
-        pImpl->raw_frame_history.pop_front();
-    }
+    //pImpl->raw_frame_history.push_back(wrapper.clone());
+    //int max_history = pImpl->config.opt_flow_frame_distance + 1;
+    //if ((int)pImpl->raw_frame_history.size() > max_history) {
+    //    pImpl->raw_frame_history.pop_front();
+    //}
     
     // Generate and Save BG Mask
     int global_fg_count = 0;
@@ -3525,7 +3528,7 @@ StatusCode FallDetector::Detect(const Image& frame, bool& is_fall) {
         // --- NEW: Optical Flow (Integer-LK) for top 2 objects ---
     {
     TimerGuard t_lk(g_perf_timer, "1_6_SparseLK");
-    if ((int)pImpl->raw_frame_history.size() >= max_history) {
+    //if ((int)pImpl->raw_frame_history.size() >= max_history) {
             /*
             // Sort objects by area descending
             std::vector<::VisionSDK::ObjectFeatures*> sorted_objs;
@@ -3555,7 +3558,7 @@ StatusCode FallDetector::Detect(const Image& frame, bool& is_fall) {
 #endif
             }
             */
-        }
+       // }
     } // End SparseLK Timer    
         // Optional: Save BG Mask if configured
         if (pImpl->config.enable_save_bg_mask) {
@@ -3944,7 +3947,12 @@ StatusCode FallDetector::Detect(const Image& frame, bool& is_fall) {
                  
                  if (start_inside && end_outside) {
                      pImpl->object_bed_exit_status[obj.id] = true;
-                     // printf("[Debug] Obj %d Bed Exit Confirmed (Frame %lld)\n", obj.id, pImpl->absolute_frame_count);
+                     // Set post-bed-exit counter if feature enabled
+                     if (pImpl->config.enable_post_bed_exit_threshold) {
+                         pImpl->observation_states[obj.id].post_bed_exit_counter = pImpl->config.post_bed_exit_window_frames;
+                         printf("[Case5] ID:%d Post-BedExit counter set (%d frames, multiplier=%.2f)\n",
+                                obj.id, pImpl->config.post_bed_exit_window_frames, pImpl->config.post_bed_exit_threshold_multiplier);
+                     }
                  }
             }
         }
@@ -4553,13 +4561,28 @@ StatusCode FallDetector::Detect(const Image& frame, bool& is_fall) {
                 }
                 float recent_mom_avg = recent_mom_sum / recent_window;
 
-                const float threshold1 = 20.f;  // High momentum trigger (peak detection)
+                const float threshold1_base = 20.f;  // High momentum trigger (peak detection)
+                float threshold1 = threshold1_base;
                 const float decel_threshold = 4.0f;  // Deceleration complete threshold
                 const float threshold2 = 9.5f;  // Low momentum threshold - Balanced for ~90% TP retention
                 const int observation_frames = 75;  // Extended from 60 to 120 frames (4 seconds @ 30fps)
                 const int max_waiting_frames = 15;  // Max frames to wait for deceleration
+                
+                if (pImpl->config.enable_post_bed_exit_threshold)
+                {
+                    printf("[Case5] ID:%d Post-BedExit threshold enabled\n", curr.id);
+                }
 
                 auto& state = pImpl->observation_states[curr.id];
+
+                // Apply post-bed-exit multiplier if enabled and counter active
+                if (pImpl->config.enable_post_bed_exit_threshold && state.post_bed_exit_counter > 0) {
+                    threshold1 = threshold1_base * pImpl->config.post_bed_exit_threshold_multiplier;
+                    state.post_bed_exit_counter--;
+                    printf("[Case5] ID:%d Post-BedExit threshold=%.2f (counter=%d)\n",
+                           curr.id, threshold1, state.post_bed_exit_counter);
+                }
+
 
                 // Step 2: Trigger on high momentum peak
                 if (recent_mom_avg >= threshold1) {
