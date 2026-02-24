@@ -2537,6 +2537,7 @@ public:
         if (total_fg_blocks > 0) {
             // printf("[Debug] updateBackground Selective: Skipped %d FG blocks.\n", total_fg_blocks);
         }
+        printf("[BBBBBBBB] updateBackground.\n");
     }
 };
 
@@ -2606,8 +2607,6 @@ void FallDetector::SetBedRegion(const std::vector<std::pair<int, int>>& points) 
 
 
 void FallDetector::RegisterCallback(VisionSDKCallback cb) {
-    pImpl->frame_idx++;
-    
     // NEW: Save current full_frame_objects for Rescue Mode in next frame
     pImpl->previous_full_frame_objects = pImpl->full_frame_objects;
     pImpl->callback = cb;
@@ -3497,28 +3496,56 @@ StatusCode FallDetector::Detect(const Image& frame, bool& is_fall) {
 
         {
         TimerGuard t_mask(g_perf_timer, "1_5_BGMask_FindObj");
-        for(int y = 0; y < h; ++y) {
+
+        // NEON-accelerated BG diff → mask generation
+        // Process 16 grayscale pixels per iteration on ARM.
+        // vcgtq_u8 produces 0xFF for pixels where diff > threshold, 0x00 otherwise.
+        const int total_pixels = w * h;
+        uint8_t*       dst = maskData.data();
+        const uint8_t* psrc = curr;
+        const uint8_t* pbg  = bg;
+
+#if defined(__ARM_NEON) || defined(__ARM_NEON__)
+        const uint8x16_t vthr = vdupq_n_u8((uint8_t)diff_thr);
+        uint32x4_t vacc = vdupq_n_u32(0); // Accumulate FG count
+        int i = 0;
+        for (; i <= total_pixels - 16; i += 16) {
+            uint8x16_t va   = vld1q_u8(psrc + i);
+            uint8x16_t vb   = vld1q_u8(pbg  + i);
+            uint8x16_t vdif = vabdq_u8(va, vb);          // |curr - bg| per pixel
+            uint8x16_t vmsk = vcgtq_u8(vdif, vthr);      // 0xFF if diff > thr, else 0
+            vst1q_u8(dst + i, vmsk);                      // store mask
+            // Count FG: vcntq counts set bits (0xFF → 8 bits), ÷ 8 = 1 per FG pixel
+            uint8x16_t vbits = vcntq_u8(vmsk);
+            uint16x8_t vsum16 = vpaddlq_u8(vbits);
+            uint32x4_t vsum32 = vpaddlq_u16(vsum16);
+            vacc = vaddq_u32(vacc, vsum32);
+        }
+        // Reduce vacc → scalar
+        uint64x2_t vacc64 = vpaddlq_u32(vacc);
+        global_fg_count += (int)((vgetq_lane_u64(vacc64, 0) + vgetq_lane_u64(vacc64, 1)) / 8);
+        // Scalar tail
+        for (; i < total_pixels; ++i) {
+            int diff = std::abs((int)psrc[i] - (int)pbg[i]);
+            dst[i] = (diff > diff_thr) ? 0xFF : 0;
+            if (dst[i]) global_fg_count++;
+        }
+#else
+        // PC scalar fallback
+        for (int y = 0; y < h; ++y) {
             int row_offset = y * w;
-            int bed_row_offset = (bed_data && y < bed_h) ? y * bed_w : 0;
-            
             for (int x = 0; x < w; ++x) {
                 int i = row_offset + x;
-                int diff = std::abs((int)curr[i] - (int)bg[i]);
-                
-                // Apply Bed Mask filter immediately
+                int diff = std::abs((int)psrc[i] - (int)pbg[i]);
                 if (diff > diff_thr) {
-                    // NEW: Exclude bed region (where bedMask == 0)
-                    // if (bed_data && x < bed_w && bed_data[bed_row_offset + x] == 0) {
-                    //    maskData[i] = 0; // Ignore FG in Bed
-                    // } else {
-                        maskData[i] = 255;
-                        global_fg_count++;
-                    // }
+                    dst[i] = 0xFF;
+                    global_fg_count++;
                 } else {
-                    maskData[i] = 0;
+                    dst[i] = 0;
                 }
             }
         }
+#endif
 
         // Identify and store full-frame foreground objects
         // Identify and store full-frame foreground objects
@@ -3687,7 +3714,7 @@ StatusCode FallDetector::Detect(const Image& frame, bool& is_fall) {
     #endif
 
     // Run    // 2. Motion Estimation Execute
-    printf("[Debug] Estimator->blockBasedMotionEstimation Start\n");
+    // printf("[Debug] Estimator->blockBasedMotionEstimation Start\n");
     {
         TimerGuard t_me(g_perf_timer, "2_MotionEstimation");
         pImpl->estimator->blockBasedMotionEstimation(wrapper, 
@@ -5377,16 +5404,7 @@ StatusCode FallDetector::Detect(const Image& frame, bool& is_fall) {
     if ((int)pImpl->object_history.size() > limit) {
         pImpl->object_history.erase(pImpl->object_history.begin());
     }
-    // printf("[Detect] History Updated. Size=%zu\n", pImpl->object_history.size());
 
-    
-    // Debug print for bed exit
-    // Iterate all objects to see who is exiting
-    /*
-    for(auto const& [oid, status] : pImpl->object_bed_exit_status) {
-        if(status) printf("[Debug] Frame %lld Obj %d has Bed Exit Status.\n", pImpl->absolute_frame_count, oid);
-    }
-    */
 
     // Update Global Pixel History
     pImpl->global_pixel_history.push_back(global_fg_count);
@@ -5396,12 +5414,6 @@ StatusCode FallDetector::Detect(const Image& frame, bool& is_fall) {
     pImpl->fg_count_history_buffer.push_back(global_fg_count);
     if (pImpl->fg_count_history_buffer.size() > 120) pImpl->fg_count_history_buffer.pop_front();
 
-    // V17 Post-Trigger Logic Removed for V18 Experiment
-
-    // Note: is_fall may have been set to true by pending_falls confirmation above
-    // Only reset if we're also going to process new triggers
-    
-    // MERGE FIX: Add Slow Fall IDs to triggered list
     for(int sid : slow_fall_ids) {
         bool exists = false;
         for(int pid : triggered_objects) if(pid == sid) { exists = true; break; }
@@ -5417,10 +5429,6 @@ StatusCode FallDetector::Detect(const Image& frame, bool& is_fall) {
         }
     }
 
-#if 0 // V17 CANDIDATE VERIFICATION DISABLED
-    // V17 Logic Removed for Compilation
-#endif
-    
     // Maintain Pending Falls Cleanup (empty loop if commented out above)
     if (!pImpl->candidates.empty()) 
     {
@@ -5548,7 +5556,7 @@ StatusCode FallDetector::Detect(const Image& frame, bool& is_fall) {
     if (pImpl->callback) {
         VisionSDKEvent event;
         // event.timestamp = frame.timestamp; // NOT IN STRUCT
-        event.frame_index = pImpl->frame_idx++; // Use and increment frame_idx
+        event.frame_index = pImpl->frame_idx; // Use frame_idx
         event.is_fall_detected = is_fall;
         
         // Aggregate Bed Exit Status
@@ -5595,20 +5603,18 @@ StatusCode FallDetector::Detect(const Image& frame, bool& is_fall) {
     }
     #endif
 
-    if (pImpl->frame_idx >= 300 && pImpl->frame_idx <= 302) {
-        printf("[SDK-End-Detect] F:%d Size:%lu IDs:", pImpl->frame_idx, pImpl->current_objects.size());
-        for(const auto& o : pImpl->current_objects) printf(" %d(Obs:%d Match:%d)", o.id, o.is_in_observation_mode, o.matched_fg_obj_id);
-        printf("\n");
-        printf("[SDK-Struct] sizeof(MotionObject)=%lu offset(id)=%lu offset(Obs)=%lu\n", 
-               sizeof(MotionObject), offsetof(MotionObject, id), offsetof(MotionObject, is_in_observation_mode));
-    }
-    printf("[Debug] FallDetector::Detect End Frame %lld\n", pImpl->absolute_frame_count);
+    // printf("[Debug] FallDetector::Detect End Frame %lld\n", pImpl->absolute_frame_count);
 
     // 8. Background Update (Selective)
     // Runs here to use the latest pImpl->current_objects found in this frame
     if (pImpl->config.bg_update_interval_frames > 0) {
         
-        bool isInitPhase = (pImpl->frame_idx >= pImpl->config.bg_init_start_frame && pImpl->frame_idx <= pImpl->config.bg_init_end_frame);
+        // isInitPhase: Only applies when background is NOT externally set.
+        // If background_initialized_externally=true (e.g. edge board loads a BG image),
+        // there is no accumulation init phase, so always use Periodic Update counting.
+        bool isInitPhase = (!pImpl->background_initialized_externally) &&
+                           (pImpl->frame_idx >= pImpl->config.bg_init_start_frame &&
+                            pImpl->frame_idx <= pImpl->config.bg_init_end_frame);
         
         // Logic:
         // 1. If Init Phase -> Always Run (Accumulation)
@@ -5617,7 +5623,7 @@ StatusCode FallDetector::Detect(const Image& frame, bool& is_fall) {
         pImpl->bg_update_counter++;
 
         if (isInitPhase || (pImpl->bg_update_counter >= pImpl->config.bg_update_interval_frames)) {
-             // TimerGuard t_bg(g_perf_timer, "1_BackgroundUpdate");
+             TimerGuard t_bg(g_perf_timer, "5_BackgroundUpdate");
              // printf("[Debug] Calling updateBackground (end-of-frame)...\n");
              
              // Pass CURRENT objects for selective update
@@ -5627,6 +5633,7 @@ StatusCode FallDetector::Detect(const Image& frame, bool& is_fall) {
              if (!isInitPhase) pImpl->bg_update_counter = 0;
         }
     }
+
 
     // End of Frame
     // printf("[Debug] FallDetector::Detect End Frame %d\n", pImpl->frame_idx);
@@ -5643,6 +5650,10 @@ StatusCode FallDetector::Detect(const Image& frame, bool& is_fall) {
         g_perf_timer.total_ms.clear();
         g_perf_timer.calls.clear();
     }
+    
+    // Increment frame index for the next frame
+    pImpl->frame_idx++;
+    
     return StatusCode::OK;
 }
 }

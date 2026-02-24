@@ -1044,12 +1044,6 @@ int main(int argc, char** argv) {
         // std::vector<MotionObject> objects = sdk.GetMotionObjects();
         std::vector<MotionObject> objects;
         sdk.GetMotionObjects(objects);
-
-        if (i >= 300 && i <= 302) {
-             printf("[Demo-Size-Check] F:%d ObjsSize:%lu\n", i, objects.size());
-             printf("[Demo-Struct] sizeof(MotionObject)=%lu offset(id)=%lu offset(Obs)=%lu\n", 
-               sizeof(MotionObject), offsetof(MotionObject, id), offsetof(MotionObject, is_in_observation_mode));
-        }
         std::vector<VisionSDK::ObjectFeatures> full_objs = sdk.GetFullFrameObjects(); // NEW: Fetch for visualization
         std::vector<uint8_t> changed_blocks = sdk.GetChangedBlocks(); // Mask
         std::vector<MotionVector> vectors = sdk.GetMotionVectors();
@@ -1816,12 +1810,6 @@ int main(int argc, char** argv) {
             
             // NEW: Highlight Observed Object Foreground Points (After Hull Filling)
             for (const auto& obj : objects) {
-                if (i >= 300 && i <= 310) {
-                    printf("[Demo-Loop-Check] F:%d ID:%d Obs:%d MatchID:%d\n", i, obj.id, obj.is_in_observation_mode, obj.matched_fg_obj_id);
-                }
-                if (i >= 300 && i <= 310) {
-                    printf("[Demo-Loop-Check] F:%d ID:%d Obs:%d MatchID:%d\n", i, obj.id, obj.is_in_observation_mode, obj.matched_fg_obj_id);
-                }
                 if (obj.is_in_observation_mode && obj.matched_fg_obj_id != -1) {
                     for (const auto& f_obj : full_objs) {
                         if (f_obj.id == obj.matched_fg_obj_id) {
@@ -1889,8 +1877,6 @@ int main(int argc, char** argv) {
 #if (SAVE_ALL_TEST_IMAGES || SAVE_GRID_IMAGE)
         for(const auto& obj : objects) 
         {
-            
-
             if (std::isnan(obj.centerX) || std::isnan(obj.centerY)) {
                 printf("[ERROR] Obj %d has NaN coordinates!\n", obj.id);
                 continue;

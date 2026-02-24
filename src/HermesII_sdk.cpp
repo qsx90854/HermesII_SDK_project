@@ -165,7 +165,79 @@ StatusCode VisionSDK::VisionSDK::SetConfig(const void* config) {
 
     // Update FallDetector with new merged config
     pImpl->fall_detector.SetConfig(pImpl->config);
-    
+
+    // ---- [PARAM-DUMP] Print all config after each SetConfig call ----
+    const InternalConfig& cfg = pImpl->config;
+    printf("[PARAM-DUMP] ===== InternalConfig (type=%d) =====\n", (int)header->type);
+    // General
+    printf("[PARAM-DUMP]  model_path                        = %s\n", cfg.model_path.c_str());
+    printf("[PARAM-DUMP]  num_threads                       = %d\n", cfg.num_threads);
+    printf("[PARAM-DUMP]  confidence_threshold              = %.4f\n", cfg.confidence_threshold);
+    // Image Related
+    printf("[PARAM-DUMP]  expected_frame_interval_ms        = %d\n", cfg.expected_frame_interval_ms);
+    printf("[PARAM-DUMP]  frame_interval_tolerance_ms       = %d\n", cfg.frame_interval_tolerance_ms);
+    printf("[PARAM-DUMP]  enable_draw_bg_noise              = %d\n", (int)cfg.enable_draw_bg_noise);
+    printf("[PARAM-DUMP]  enable_save_images                = %d\n", (int)cfg.enable_save_images);
+    printf("[PARAM-DUMP]  save_image_path                   = %s\n", cfg.save_image_path.c_str());
+    // Motion Estimation
+    printf("[PARAM-DUMP]  grid_cols                         = %d\n", cfg.grid_cols);
+    printf("[PARAM-DUMP]  grid_rows                         = %d\n", cfg.grid_rows);
+    printf("[PARAM-DUMP]  block_size                        = %d\n", cfg.block_size);
+    printf("[PARAM-DUMP]  search_range                      = %d\n", cfg.search_range);
+    printf("[PARAM-DUMP]  history_size                      = %d\n", cfg.history_size);
+    printf("[PARAM-DUMP]  search_mode                       = %d\n", cfg.search_mode);
+    printf("[PARAM-DUMP]  block_change_threshold            = %.4f\n", cfg.block_change_threshold);
+    printf("[PARAM-DUMP]  enable_block_decay                = %d\n", (int)cfg.enable_block_decay);
+    printf("[PARAM-DUMP]  block_decay_frames                = %d\n", cfg.block_decay_frames);
+    printf("[PARAM-DUMP]  enable_block_dilation             = %d\n", (int)cfg.enable_block_dilation);
+    printf("[PARAM-DUMP]  block_dilation_threshold          = %d\n", cfg.block_dilation_threshold);
+    // Object Extraction
+    printf("[PARAM-DUMP]  object_extraction_threshold       = %.4f\n", cfg.object_extraction_threshold);
+    printf("[PARAM-DUMP]  object_merge_radius               = %d\n", cfg.object_merge_radius);
+    printf("[PARAM-DUMP]  foreground_merge_radius           = %d\n", cfg.foreground_merge_radius);
+    printf("[PARAM-DUMP]  tracking_overlap_threshold        = %.4f\n", cfg.tracking_overlap_threshold);
+    printf("[PARAM-DUMP]  tracking_mode                     = %d\n", cfg.tracking_mode);
+    // Fall Detection
+    printf("[PARAM-DUMP]  fall_movement_threshold           = %.4f\n", cfg.fall_movement_threshold);
+    printf("[PARAM-DUMP]  fall_strong_threshold             = %.4f\n", cfg.fall_strong_threshold);
+    printf("[PARAM-DUMP]  safe_area_ratio_threshold         = %.4f\n", cfg.safe_area_ratio_threshold);
+    printf("[PARAM-DUMP]  fall_acceleration_threshold       = %.4f\n", cfg.fall_acceleration_threshold);
+    printf("[PARAM-DUMP]  fall_acceleration_upper_threshold = %.4f\n", cfg.fall_acceleration_upper_threshold);
+    printf("[PARAM-DUMP]  fall_acceleration_lower_threshold = %.4f\n", cfg.fall_acceleration_lower_threshold);
+    printf("[PARAM-DUMP]  post_fall_distance_threshold      = %.4f\n", cfg.post_fall_distance_threshold);
+    printf("[PARAM-DUMP]  post_fall_check_frames            = %d\n", cfg.post_fall_check_frames);
+    printf("[PARAM-DUMP]  fall_window_size                  = %d\n", cfg.fall_window_size);
+    printf("[PARAM-DUMP]  fall_duration                     = %d\n", cfg.fall_duration);
+    printf("[PARAM-DUMP]  enable_face_detection             = %d\n", (int)cfg.enable_face_detection);
+    // Background Update
+    printf("[PARAM-DUMP]  bg_update_interval_frames         = %d\n", cfg.bg_update_interval_frames);
+    printf("[PARAM-DUMP]  bg_update_alpha                   = %.4f\n", cfg.bg_update_alpha);
+    printf("[PARAM-DUMP]  enable_save_bg_mask               = %d\n", (int)cfg.enable_save_bg_mask);
+    printf("[PARAM-DUMP]  bg_init_start_frame               = %d\n", cfg.bg_init_start_frame);
+    printf("[PARAM-DUMP]  bg_init_end_frame                 = %d\n", cfg.bg_init_end_frame);
+    printf("[PARAM-DUMP]  bg_diff_threshold                 = %d\n", cfg.bg_diff_threshold);
+    // Bed Exit Detection
+    printf("[PARAM-DUMP]  bed_exit_history_len              = %d\n", cfg.bed_exit_history_len);
+    printf("[PARAM-DUMP]  bed_exit_min_inside_ratio         = %.4f\n", cfg.bed_exit_min_inside_ratio);
+    printf("[PARAM-DUMP]  bed_exit_min_outside_ratio        = %.4f\n", cfg.bed_exit_min_outside_ratio);
+    printf("[PARAM-DUMP]  enable_bed_exit_verification      = %d\n", (int)cfg.enable_bed_exit_verification);
+    printf("[PARAM-DUMP]  enable_block_shrink_verification  = %d\n", (int)cfg.enable_block_shrink_verification);
+    printf("[PARAM-DUMP]  bed_update_alpha_multiplier       = %.4f\n", cfg.bed_update_alpha_multiplier);
+    printf("[PARAM-DUMP]  bed_pixel_ratio_threshold         = %.4f\n", cfg.bed_pixel_ratio_threshold);
+    // Post-Bed-Exit Threshold Adjustment
+    printf("[PARAM-DUMP]  enable_post_bed_exit_threshold    = %d\n", (int)cfg.enable_post_bed_exit_threshold);
+    printf("[PARAM-DUMP]  post_bed_exit_threshold_multiplier= %.4f\n", cfg.post_bed_exit_threshold_multiplier);
+    printf("[PARAM-DUMP]  post_bed_exit_window_frames       = %d\n", cfg.post_bed_exit_window_frames);
+    // Optical Flow / Perspective
+    printf("[PARAM-DUMP]  opt_flow_frame_distance           = %d\n", cfg.opt_flow_frame_distance);
+    printf("[PARAM-DUMP]  perspective_point_x               = %d\n", cfg.perspective_point_x);
+    printf("[PARAM-DUMP]  perspective_point_y               = %d\n", cfg.perspective_point_y);
+    // Area / Momentum
+    printf("[PARAM-DUMP]  min_trigger_area                  = %d\n", cfg.min_trigger_area);
+    printf("[PARAM-DUMP]  momentum_calc_type                = %d\n", cfg.momentum_calc_type);
+    printf("[PARAM-DUMP] ==========================================\n");
+    // ---- [PARAM-DUMP] end ----
+
     return StatusCode::OK;
 }
 
