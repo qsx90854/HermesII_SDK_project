@@ -115,6 +115,9 @@ struct FallDetection_v3 {
     // Post-Bed-Exit Threshold Adjustment
     bool enable_post_bed_exit_threshold = false;
     float post_bed_exit_threshold_multiplier = 0.7f;
+    
+    // Projection Point Selection
+    bool projection_use_foreground = false;
 };
 
 struct BedExitDetection_v1 {
@@ -213,6 +216,13 @@ struct MotionObject {
     float proj_bot_x = 0.0f;
     float proj_bot_y = 0.0f;
     bool has_projection = false;    
+    
+    // NEW: Source Image Points for Projection Validation
+    float img_top_x = 0.0f;
+    float img_top_y = 0.0f;
+    float img_bot_x = 0.0f;
+    float img_bot_y = 0.0f;
+    
     // NEW for Pixel-Based Fall Detection
     int pixel_count = 0;
     float avg_brightness = 0.0f;

@@ -141,6 +141,7 @@ StatusCode VisionSDK::VisionSDK::SetConfig(const void* config) {
             pImpl->config.momentum_calc_type = c->momentum_calc_type;
             pImpl->config.enable_post_bed_exit_threshold = c->enable_post_bed_exit_threshold;
             pImpl->config.post_bed_exit_threshold_multiplier = c->post_bed_exit_threshold_multiplier;
+            pImpl->config.projection_use_foreground = c->projection_use_foreground;
             break;
         }
         case ConfigType::BedExitDetection_v1: {
@@ -228,6 +229,7 @@ StatusCode VisionSDK::VisionSDK::SetConfig(const void* config) {
     printf("[PARAM-DUMP]  enable_post_bed_exit_threshold    = %d\n", (int)cfg.enable_post_bed_exit_threshold);
     printf("[PARAM-DUMP]  post_bed_exit_threshold_multiplier= %.4f\n", cfg.post_bed_exit_threshold_multiplier);
     printf("[PARAM-DUMP]  post_bed_exit_window_frames       = %d\n", cfg.post_bed_exit_window_frames);
+    printf("[PARAM-DUMP]  projection_use_foreground         = %d\n", (int)cfg.projection_use_foreground);
     // Optical Flow / Perspective
     printf("[PARAM-DUMP]  opt_flow_frame_distance           = %d\n", cfg.opt_flow_frame_distance);
     printf("[PARAM-DUMP]  perspective_point_x               = %d\n", cfg.perspective_point_x);

@@ -20,6 +20,17 @@
 #include <climits>
 #define ENABLE_PERF_PROFILING 1
 
+// Define this to 1 to enable debug prints in this file, or 0 to suppress them
+#ifndef ENABLE_DEBUG_PRINT
+#define ENABLE_DEBUG_PRINT 1
+#endif
+
+#if ENABLE_DEBUG_PRINT
+#define DEBUG_PRINT(...) printf(__VA_ARGS__)
+#else
+#define DEBUG_PRINT(...) do {} while (0)
+#endif
+
 using namespace std;
 
 #if defined(__ARM_NEON) || defined(__ARM_NEON__)
@@ -351,7 +362,7 @@ public:
     void setBlockDecay(bool enable, int frames) { 
         enable_block_decay = enable; 
         block_decay_max_frames = frames; 
-        printf("DEBUG: setBlockDecay enable=%d frames=%d\n", enable, frames);
+        DEBUG_PRINT("DEBUG: setBlockDecay enable=%d frames=%d\n", enable, frames);
     }
 
     void setBlockDilation(bool enable) {
@@ -402,7 +413,7 @@ public:
 
         // --- Block Decay Logic ---
         if (enable_block_decay) {
-            // printf("DEBUG: Applying Block Decay...\n");
+            // DEBUG_PRINT("DEBUG: Applying Block Decay...\n");
             if ((int)block_active_counters.size() != total_blocks) {
                 block_active_counters.assign(total_blocks, 0);
             }
@@ -456,9 +467,9 @@ public:
     FunctionTimer profiler;
 
     void PrintTimings() {
-         std::cout << "\n=== AVG TIMINGS ===\n";
+         if (ENABLE_DEBUG_PRINT) std::cout << "\n=== AVG TIMINGS ===\n";
          for(auto& kv : profiler.total_ms) {
-             std::cout << kv.first << ": " << kv.second << " ms\n";
+             if (ENABLE_DEBUG_PRINT) std::cout << kv.first << ": " << kv.second << " ms\n";
          }
     }
 
@@ -1087,7 +1098,7 @@ void detectObjectTemporalMotion(
 {
     if (!enable_block_shrink_verification || !enable_bed_exit_verification)
     {
-        //printf("[FallDetector] Block Shrink Verification and Bed Exit Verification are disabled.\n");
+        //DEBUG_PRINT("[FallDetector] Block Shrink Verification and Bed Exit Verification are disabled.\n");
     }
     int T = (int)history.size();
     if (T < N) return;
@@ -1099,7 +1110,7 @@ void detectObjectTemporalMotion(
     if (bed_region.size() == 4) {
         for(auto& p : bed_region) bed_poly.push_back({(float)p.first, (float)p.second});
         has_bed_poly = true;
-        //printf("has_bed_poly = True\n");
+        //DEBUG_PRINT("has_bed_poly = True\n");
     }
 
     // Track how many times each object triggers a "Fall Signal" in the window
@@ -1115,7 +1126,7 @@ void detectObjectTemporalMotion(
         {
             if (f == (T-1))
             {
-                printf("[Debug] actual_frame_num %d, obj.id %d, obj.strength %f \n", actual_frame_num, obj.id, obj.strength);
+                DEBUG_PRINT("[Debug] actual_frame_num %d, obj.id %d, obj.strength %f \n", actual_frame_num, obj.id, obj.strength);
             }
             // Basic Conditions
             bool is_strong_fall = (obj.strength >= strongThreshold && obj.blocks.size() > 0);
@@ -1152,7 +1163,7 @@ void detectObjectTemporalMotion(
                  if (!is_larger_safe_area) {
                      if (is_strong_fall || is_accel_fall || is_accel_change_fall) 
                      {
-                        //printf("frame id %d, obj.strength %f, obj.acceleration %f, obj.avgDy %f\n", actual_frame_num, obj.strength, obj.acceleration, obj.avgDy);
+                        //DEBUG_PRINT("frame id %d, obj.strength %f, obj.acceleration %f, obj.avgDy %f\n", actual_frame_num, obj.strength, obj.acceleration, obj.avgDy);
                         is_primary_signal = true;
                      }
                  }
@@ -1161,7 +1172,7 @@ void detectObjectTemporalMotion(
 
             if (is_primary_signal) {
                 object_signal_counts[obj.id]++;
-                // printf("DEBUG: Frame %lld Obj %d Signal Count %d\n", actual_frame_num, obj.id, object_signal_counts[obj.id]);
+                // DEBUG_PRINT("DEBUG: Frame %lld Obj %d Signal Count %d\n", actual_frame_num, obj.id, object_signal_counts[obj.id]);
             }
         }
     }
@@ -1177,7 +1188,7 @@ void detectObjectTemporalMotion(
             {
                 outTriggeredIds.push_back(id);
                 //outWarning += "Fall Confirmed: N/M + Verified. ";
-                //printf("[FallDetector] CONFIRMED FALL Obj %d (Count %d/%d). BedExit:%d Shrink:%d (Frame %lld)\n", 
+                //DEBUG_PRINT("[FallDetector] CONFIRMED FALL Obj %d (Count %d/%d). BedExit:%d Shrink:%d (Frame %lld)\n", 
                 //        id, count, N, condition_bed_exit, condition_block_shrink, currentFrameIdx);
                 continue;
             }
@@ -1205,7 +1216,7 @@ void detectObjectTemporalMotion(
                 long long actual_frame_num = currentFrameIdx - (T - 1 - f);
                  for(const auto& obj : history[f]) 
                  {
-                     printf("[Debug] Obj %d Strength %.2f Center (%.1f, %.1f) Size %zu\n", obj.id, obj.strength, obj.centerX, obj.centerY, obj.blocks.size());
+                     DEBUG_PRINT("[Debug] Obj %d Strength %.2f Center (%.1f, %.1f) Size %zu\n", obj.id, obj.strength, obj.centerX, obj.centerY, obj.blocks.size());
                      if (obj.id == id) 
                      {
                          // Track Max Dy (Downward is Positive)
@@ -1213,7 +1224,7 @@ void detectObjectTemporalMotion(
 
                          float px = (obj.centerX + 0.5f) * (frame_width / (float)grid_cols);
                          float py = (obj.centerY + 0.5f) * (frame_height / (float)grid_rows);
-                         //printf("[Algo] Frame %d, obj.id : %d, obj.Center(Blk): %.2f,%.2f -> (Pix): %.2f,%.2f\n", currentFrameIdx - (T-1-f), obj.id, obj.centerX, obj.centerY, px, py);
+                         //DEBUG_PRINT("[Algo] Frame %d, obj.id : %d, obj.Center(Blk): %.2f,%.2f -> (Pix): %.2f,%.2f\n", currentFrameIdx - (T-1-f), obj.id, obj.centerX, obj.centerY, px, py);
                          if (f==(T-1))
                          {
                             if (has_bed_poly) 
@@ -1226,7 +1237,7 @@ void detectObjectTemporalMotion(
                                 else 
                                 {
                                     is_outside_now = true;
-                                    //printf("[%d] is_outside_now: %d (Frame %lld)\n", f, is_outside_now, currentFrameIdx);
+                                    //DEBUG_PRINT("[%d] is_outside_now: %d (Frame %lld)\n", f, is_outside_now, currentFrameIdx);
                                 }
                             } 
                             else 
@@ -1244,7 +1255,7 @@ void detectObjectTemporalMotion(
                                 if (isPointInConvexQuad(bed_poly, px, py)) 
                                 {
                                     was_inside = true;
-                                    //printf("[%d] was_inside: %d (Frame %lld)\n", f, was_inside, currentFrameIdx);
+                                    //DEBUG_PRINT("[%d] was_inside: %d (Frame %lld)\n", f, was_inside, currentFrameIdx);
                                 } 
                                 else 
                                 {
@@ -1262,10 +1273,10 @@ void detectObjectTemporalMotion(
                         {
                             max_blocks = (float)obj.blocks.size();
                             max_blocks_frame = actual_frame_num;
-                            //printf("[Debug] max_blocks %f\n", max_blocks);
+                            //DEBUG_PRINT("[Debug] max_blocks %f\n", max_blocks);
                         }
                         current_blocks = (float)obj.blocks.size(); // Keeps updating to latest
-                        //printf("[Debug] current_blocks %f\n", current_blocks); 
+                        //DEBUG_PRINT("[Debug] current_blocks %f\n", current_blocks); 
                      }
                      
                  }
@@ -1283,14 +1294,14 @@ void detectObjectTemporalMotion(
                  if (enable_bed_exit_verification) {
                     if (max_avg_dy > 2.0f) {
                         confirmed = true;
-                        printf("[FallDetector] Bed Exit CONFIRMED for Obj %d (MaxDy: %.2f). Frame %lld\n", id, max_avg_dy, currentFrameIdx);
+                        DEBUG_PRINT("[FallDetector] Bed Exit CONFIRMED for Obj %d (MaxDy: %.2f). Frame %lld\n", id, max_avg_dy, currentFrameIdx);
                     } else {
-                        printf("[FallDetector] Bed Exit IGNORED for Obj %d (MaxDy: %.2f < 2.0). Frame %lld\n", id, max_avg_dy, currentFrameIdx);
+                        DEBUG_PRINT("[FallDetector] Bed Exit IGNORED for Obj %d (MaxDy: %.2f < 2.0). Frame %lld\n", id, max_avg_dy, currentFrameIdx);
                     }
                  } else {
                      // Verification Disabled: Trust the primary signal + region transition
                      confirmed = true;
-                     printf("[FallDetector] Bed Exit (No Verify) for Obj %d. Frame %lld\n", id, currentFrameIdx);
+                     DEBUG_PRINT("[FallDetector] Bed Exit (No Verify) for Obj %d. Frame %lld\n", id, currentFrameIdx);
                  }
                  
                  if (confirmed) condition_bed_exit = true;
@@ -1307,14 +1318,14 @@ void detectObjectTemporalMotion(
                     if (enable_block_shrink_verification) {
                         if (max_avg_dy > 2.0f) {
                             confirmed = true;
-                            printf("[FallDetector] Block Shrink CONFIRMED (Ratio %.2f, MaxDy %.2f)\n", ratio, max_avg_dy);
+                            DEBUG_PRINT("[FallDetector] Block Shrink CONFIRMED (Ratio %.2f, MaxDy %.2f)\n", ratio, max_avg_dy);
                         } else {
-                            printf("[FallDetector] Block Shrink IGNORED (Ratio %.2f, MaxDy %.2f < 2.0)\n", ratio, max_avg_dy);
+                            DEBUG_PRINT("[FallDetector] Block Shrink IGNORED (Ratio %.2f, MaxDy %.2f < 2.0)\n", ratio, max_avg_dy);
                         }
                     } else {
                         // Verification Disabled
                         confirmed = true;
-                        printf("[FallDetector] Block Shrink (No Verify) (Ratio %.2f)\n", ratio);
+                        DEBUG_PRINT("[FallDetector] Block Shrink (No Verify) (Ratio %.2f)\n", ratio);
                     }
                     if (confirmed) condition_block_shrink = true;
                  }
@@ -1324,7 +1335,7 @@ void detectObjectTemporalMotion(
              if (condition_bed_exit || condition_block_shrink) {
                  outTriggeredIds.push_back(id);
                  outWarning += "Fall Confirmed: N/M + Verified. ";
-                 printf("[FallDetector] CONFIRMED FALL Obj %d (Count %d/%d). BedExit:%d Shrink:%d (Frame %lld)\n", 
+                 DEBUG_PRINT("[FallDetector] CONFIRMED FALL Obj %d (Count %d/%d). BedExit:%d Shrink:%d (Frame %lld)\n", 
                         id, count, N, condition_bed_exit, condition_block_shrink, currentFrameIdx);
              }
         }
@@ -1358,10 +1369,10 @@ void detectFallPixelStats(
     std::map<int, bool> fall_phase_confirmed;
 
     // 1. Traverse Window (Old -> New) to find trends
-    printf("[Debug] detectFallPixelStats Loop Start T=%d\n", T);
+    DEBUG_PRINT("[Debug] detectFallPixelStats Loop Start T=%d\n", T);
     for (int f = start; f < T; f++) 
     {
-        printf("[Debug] detectFallPixelStats - Frame %d\n", f);
+        DEBUG_PRINT("[Debug] detectFallPixelStats - Frame %d\n", f);
         for (const auto& obj : history[f]) 
         {
             int id = obj.id;
@@ -1378,8 +1389,8 @@ void detectFallPixelStats(
             
             if ((f == T-1) && (obj.pixel_count > 1200))
             {
-                printf("[Debug] currentFrameIdx %lld, id %d, obj.pixel_count %d, obj.avg_brightness %f\n", currentFrameIdx, id, obj.pixel_count, obj.avg_brightness);
-                printf("[DDD] obj.acceleration %f, obj.strength %f, obj.centerX %f\n", obj.acceleration, obj.strength, obj.centerX);
+                DEBUG_PRINT("[Debug] currentFrameIdx %lld, id %d, obj.pixel_count %d, obj.avg_brightness %f\n", currentFrameIdx, id, obj.pixel_count, obj.avg_brightness);
+                DEBUG_PRINT("[DDD] obj.acceleration %f, obj.strength %f, obj.centerX %f\n", obj.acceleration, obj.strength, obj.centerX);
             }
 
             for (int k = 1; k <= win_pre; ++k) {
@@ -1423,7 +1434,7 @@ void detectFallPixelStats(
                 float post_avg_bri = post_sum_bri / post_count;
                 
                 // Debug Printing (Optional - Remove later)
-                //printf("currentFrameIdx %d, ID %d F %d: Pre(%.1f, %.1f) Post(%.1f, %.1f)\n", currentFrameIdx, id, f, pre_avg_pix, pre_avg_bri, post_avg_pix, post_avg_bri);
+                //DEBUG_PRINT("currentFrameIdx %d, ID %d F %d: Pre(%.1f, %.1f) Post(%.1f, %.1f)\n", currentFrameIdx, id, f, pre_avg_pix, pre_avg_bri, post_avg_pix, post_avg_bri);
 
                 if (pre_avg_pix > 50 && pre_avg_bri > 20.0f) {
                     if (post_avg_pix < (pre_avg_pix * 0.6f) 
@@ -1431,7 +1442,7 @@ void detectFallPixelStats(
                     ) 
                     {
                         is_drop = true;
-                        //printf("[FallDetector!!!] Trend Drop Detected ID %d Frame %lld, F %d, pre_avg_pix %.1f, post_avg_pix %.1f, pre_avg_bri %.1f, post_avg_bri %.1f\n", id, currentFrameIdx, f, pre_avg_pix, post_avg_pix, pre_avg_bri, post_avg_bri);
+                        //DEBUG_PRINT("[FallDetector!!!] Trend Drop Detected ID %d Frame %lld, F %d, pre_avg_pix %.1f, post_avg_pix %.1f, pre_avg_bri %.1f, post_avg_bri %.1f\n", id, currentFrameIdx, f, pre_avg_pix, post_avg_pix, pre_avg_bri, post_avg_bri);
                     }
                 }
             }
@@ -1449,7 +1460,7 @@ void detectFallPixelStats(
             // Confirm Fall Phase if drop persists ~10 frames
             if (drop_streak[id] >= 10) {
                 fall_phase_confirmed[id] = true;
-                printf("[Fall Detect!!!] Fall Phase Confirmed ID %d Frame %lld\n", id, currentFrameIdx);
+                DEBUG_PRINT("[Fall Detect!!!] Fall Phase Confirmed ID %d Frame %lld\n", id, currentFrameIdx);
             }
             
             // Check Static Phase (Post-Fall)
@@ -1465,7 +1476,7 @@ void detectFallPixelStats(
            // }
         }
     }
-    printf("[Debug] detectFallPixelStats Loop End.\n");
+    DEBUG_PRINT("[Debug] detectFallPixelStats Loop End.\n");
     
     // 2. Final Decision (Trigger if Static Phase persists > 10 frames)
     for (auto const& [id, count] : static_streak) {
@@ -1476,7 +1487,7 @@ void detectFallPixelStats(
              {
                 for(auto& o : history.back()) 
                 {
-                    printf("[Debug static_streak] Obj %d in history Frame %lld\n", o.id, currentFrameIdx);
+                    DEBUG_PRINT("[Debug static_streak] Obj %d in history Frame %lld\n", o.id, currentFrameIdx);
                     if(o.id == id) is_current = true;
                 }
              }
@@ -1484,7 +1495,7 @@ void detectFallPixelStats(
              if(is_current) {
                  outTriggeredIds.push_back(id);
                  outWarning += "Fall Confirmed (Pixel Stats: 10+10). ";
-                 printf("[FallDetector] CONFIRMED FALL (Pixel Stats 10+10) Obj %d. MaxPix:%.0f MaxBri:%.1f (Frame %lld)\n", 
+                 DEBUG_PRINT("[FallDetector] CONFIRMED FALL (Pixel Stats 10+10) Obj %d. MaxPix:%.0f MaxBri:%.1f (Frame %lld)\n", 
                         id, max_pixels[id], max_brightness[id], currentFrameIdx);
              }
         }
@@ -1575,7 +1586,7 @@ void detectFallPixelStats(
              if (is_decay && is_moving_shrink && not_at_edge && max_pix > 2000) {
                  outTriggeredIds.push_back(id);
                  outWarning += "Pixel Decay Detected (Structural Fall). ";
-                 printf("[FallDetector] CONFIRMED FALL (Structural Decay) Obj %d. Peak:%.0f Curr:%.0f IntSpd:%.3f (Frame %lld)\n", 
+                 DEBUG_PRINT("[FallDetector] CONFIRMED FALL (Structural Decay) Obj %d. Peak:%.0f Curr:%.0f IntSpd:%.3f (Frame %lld)\n", 
                         id, max_pix, curr_pix, interval_speed, currentFrameIdx);
              }
         }
@@ -2403,13 +2414,13 @@ public:
     bool background_initialized_externally = false; // NEW
     
     void updateBackground(const ::Image& current, const InternalConfig& cfg, int frame_idx, const std::vector<MotionObject>& objects) {
-        // printf("[Debug] updateBackground called for frame %d\n", frame_idx);
+        // DEBUG_PRINT("[Debug] updateBackground called for frame %d\n", frame_idx);
         if (backgroundFrame.width() != current.width() || backgroundFrame.height() != current.height()) {
             backgroundFrame = current.clone();
             // Reset accumulator if size changes
             bg_accumulator.assign(current.width() * current.height() * current.getChannels(), 0);
             bg_accumulated_count = 0;
-            printf("[Debug] updateBackground Reset Accumulator\n");
+            DEBUG_PRINT("[Debug] updateBackground Reset Accumulator\n");
             return;
         }
         
@@ -2434,12 +2445,12 @@ public:
                      // Clear accumulator
                      std::vector<int32_t>().swap(bg_accumulator);
                      bg_accumulated_count = 0;
-                     printf("[Debug] updateBackground Init Phase Complete.\n");
+                     DEBUG_PRINT("[Debug] updateBackground Init Phase Complete.\n");
                 }
                 return; // During init, don't run normal update
             }
         }
-        
+        DEBUG_PRINT("[AAAAA] updateBackground.\n");
         // 2. Periodic Update Phase
         float alpha = cfg.bg_update_alpha;
         if (alpha <= 0.0f) return;
@@ -2464,7 +2475,7 @@ public:
                 }
             }
         }
-        
+        DEBUG_PRINT("[BBBBBBBB] updateBackground.\n");
         // Optimization: Pre-calculate block dimensions
         int W = current.width();
         int H = current.height();
@@ -2535,9 +2546,9 @@ public:
             }
         }
         if (total_fg_blocks > 0) {
-            // printf("[Debug] updateBackground Selective: Skipped %d FG blocks.\n", total_fg_blocks);
+            // DEBUG_PRINT("[Debug] updateBackground Selective: Skipped %d FG blocks.\n", total_fg_blocks);
         }
-        printf("[BBBBBBBB] updateBackground.\n");
+        DEBUG_PRINT("[CCCCCCCC] updateBackground.\n");
     }
 };
 
@@ -2573,15 +2584,15 @@ void FallDetector::SetConfig(const InternalConfig& config) {
     // Update Verification Flags - Handled in HermesII_sdk.cpp via pImpl->config
 
     if (!pImpl->face_model_inited) {
-         std::cout << "[FallDetector::SetConfig] Initializing FaceDetector..." << std::endl;
+         if (ENABLE_DEBUG_PRINT) std::cout << "[FallDetector::SetConfig] Initializing FaceDetector..." << std::endl;
          StatusCode ret = pImpl->faceDetector.Init("res/blaze_face_detect_nnp310_128x128.ty");
          if (ret != StatusCode::OK) {
-             std::cout << "[FallDetector::SetConfig] FaceDetector Init Failed: " << (int)ret << std::endl;
+             if (ENABLE_DEBUG_PRINT) std::cout << "[FallDetector::SetConfig] FaceDetector Init Failed: " << (int)ret << std::endl;
              // Do NOT set true, allows retry on next Config call or manually? 
              // Actually, Config is usually called once. If it fails, maybe we should try in Detect too?
              // But let's stick to Config first.
          } else {
-             std::cout << "[FallDetector::SetConfig] FaceDetector Init OK" << std::endl;
+             if (ENABLE_DEBUG_PRINT) std::cout << "[FallDetector::SetConfig] FaceDetector Init OK" << std::endl;
              pImpl->face_model_inited = true;
          }
     }
@@ -2594,8 +2605,8 @@ void FallDetector::SetBedRegion(const std::vector<std::pair<int, int>>& points) 
         pImpl->hasBedMask = true; // Signal that we have a region
         if(points.size() == 4) {
              pImpl->has_homography = computeHomography(points, 100.0f, 200.0f, pImpl->homography_matrix);
-             if(pImpl->has_homography) printf("[FallDetector] Homography Computed Successfully.\n");
-             else printf("[FallDetector] Failed to compute Homography (Singular?).\n");
+             if(pImpl->has_homography) DEBUG_PRINT("[FallDetector] Homography Computed Successfully.\n");
+             else DEBUG_PRINT("[FallDetector] Failed to compute Homography (Singular?).\n");
         } else {
              pImpl->has_homography = false;
         }
@@ -2655,7 +2666,7 @@ void TrackObjects(std::vector<MotionObject>& current, const std::vector<MotionOb
                   std::map<int, std::vector<int>>& persistent_object_blocks,
                   int frame_idx) 
 {
-    printf("[Debug] TrackObjects Start. Current: %zu Previous: %zu\n", current.size(), previous.size());
+    DEBUG_PRINT("[Debug] TrackObjects Start. Current: %zu Previous: %zu\n", current.size(), previous.size());
     float threshold = config.tracking_overlap_threshold;
     int mode = config.tracking_mode; // 1=Original, 2=Hungarian, 3=Kalman, 4=SORT
     int grid_cols = config.grid_cols;
@@ -2682,7 +2693,7 @@ void TrackObjects(std::vector<MotionObject>& current, const std::vector<MotionOb
         object_is_new_entry[new_id] = touches_edge;
         
         if (touches_edge) {
-            printf("[EntryFilter] New object ID %d touches edge at frame %d\n", new_id, frame_idx);
+            DEBUG_PRINT("[EntryFilter] New object ID %d touches edge at frame %d\n", new_id, frame_idx);
         }
     };
 
@@ -2703,7 +2714,7 @@ void TrackObjects(std::vector<MotionObject>& current, const std::vector<MotionOb
                  kalmanFilters.insert({obj.id, kf});
              }
         }
-        printf("[Debug] TrackObjects End (No Previous Objects).\n");
+        DEBUG_PRINT("[Debug] TrackObjects End (No Previous Objects).\n");
         return;
     }
 
@@ -2764,7 +2775,7 @@ void TrackObjects(std::vector<MotionObject>& current, const std::vector<MotionOb
                     // If ME strength is suspiciously low but object moved, use centroid speed
                     // Threshold: 0.05 blocks (e.g. ~1-2 pixels)
                     // DEBUG: Print diff
-                    // printf("[TrackDebug] ID:%d Str:%.2f DistBlk:%.3f\n", current[objIdx].id, current[objIdx].strength, dist_blocks);
+                    // DEBUG_PRINT("[TrackDebug] ID:%d Str:%.2f DistBlk:%.3f\n", current[objIdx].id, current[objIdx].strength, dist_blocks);
                     
                     if (current[objIdx].strength < 0.5f && dist_blocks > 0.05f) {
                         float pixel_dist = dist_blocks * config.block_size;
@@ -2772,7 +2783,7 @@ void TrackObjects(std::vector<MotionObject>& current, const std::vector<MotionOb
                         // Also update avgDx/avgDy to reflect this?
                         current[objIdx].avgDx = (cx - px) * config.block_size;
                         current[objIdx].avgDy = (cy - py) * config.block_size;
-                        printf("[TrackFallback] ID %d Used Centroid Speed (Blocks: %.3f -> Pixels: %.1f)\n", current[objIdx].id, dist_blocks, pixel_dist);
+                        DEBUG_PRINT("[TrackFallback] ID %d Used Centroid Speed (Blocks: %.3f -> Pixels: %.1f)\n", current[objIdx].id, dist_blocks, pixel_dist);
                     }
                     
                     current[objIdx].acceleration = current[objIdx].strength - pObj.strength;
@@ -2826,7 +2837,7 @@ void TrackObjects(std::vector<MotionObject>& current, const std::vector<MotionOb
                          current[currIdx].strength = pixel_dist;
                          current[currIdx].avgDx = (cx - px) * config.block_size;
                          current[currIdx].avgDy = (cy - py) * config.block_size;
-                         printf("[TrackFallback] ID %d Used Centroid Speed (Blocks: %.3f -> Pixels: %.1f)\n", current[currIdx].id, dist_blocks, pixel_dist);
+                         DEBUG_PRINT("[TrackFallback] ID %d Used Centroid Speed (Blocks: %.3f -> Pixels: %.1f)\n", current[currIdx].id, dist_blocks, pixel_dist);
                      }
 
                      current[currIdx].trajectory.push_back({(int)cx, (int)cy});
@@ -2853,7 +2864,7 @@ void TrackObjects(std::vector<MotionObject>& current, const std::vector<MotionOb
                 float kx, ky;
                 kf.GetState(kx, ky); 
                 trackPositions.push_back({kx, ky});
-                //printf("[TrackDebug] TrackID %d (TTL %d) Pos (%.1f, %.1f)\n", kv.first, track_ttl[kv.first], kx, ky);
+                //DEBUG_PRINT("[TrackDebug] TrackID %d (TTL %d) Pos (%.1f, %.1f)\n", kv.first, track_ttl[kv.first], kx, ky);
             }
         } else {
             // Mode 2: Use Previous Frame Objects
@@ -2876,7 +2887,7 @@ void TrackObjects(std::vector<MotionObject>& current, const std::vector<MotionOb
                 float dy = current[j].centerY - ty;
                 cost = std::sqrt(dx*dx + dy*dy);
                 
-                //printf("[TrackDebug] Cost T%d -> Obj%d (%.1f, %.1f) vs (%.1f, %.1f) = Dist %.2f\n", 
+                //DEBUG_PRINT("[TrackDebug] Cost T%d -> Obj%d (%.1f, %.1f) vs (%.1f, %.1f) = Dist %.2f\n", 
                 //        trackIDs[i], j, tx, ty, current[j].centerX, current[j].centerY, cost);
                 
                 // Gating
@@ -2920,13 +2931,13 @@ void TrackObjects(std::vector<MotionObject>& current, const std::vector<MotionOb
             bool matched = false;
             
             if (j >= 0 && j < cols) {
-                //printf("[TrackDebug] Assignment T%d -> Obj%d. Cost %.2f\n", trackID, j, costMatrix[i][j]);
+                //DEBUG_PRINT("[TrackDebug] Assignment T%d -> Obj%d. Cost %.2f\n", trackID, j, costMatrix[i][j]);
                 if (costMatrix[i][j] <= 50.0f) {
                     matched = true;
                     currentMatched[j] = true;
                     
                     // Inherit ID
-                    //printf("[TrackDebug] MERGE: Obj %d inherits T%d\n", j, trackID);
+                    //DEBUG_PRINT("[TrackDebug] MERGE: Obj %d inherits T%d\n", j, trackID);
                     current[j].id = trackID;
                     
                     // Inherit Trajectory? 
@@ -3019,7 +3030,7 @@ void TrackObjects(std::vector<MotionObject>& current, const std::vector<MotionOb
                              // Prefer Older ID (Smaller)
                              if (otherID < assignedID) {
                                  // Swap! Inherit the older ID
-                                 printf("[TrackFix] Swap ID %d -> %d (Prefer Older). Kill %d.\n", assignedID, otherID, assignedID);
+                                 DEBUG_PRINT("[TrackFix] Swap ID %d -> %d (Prefer Older). Kill %d.\n", assignedID, otherID, assignedID);
                                  tracksToRemove.push_back(assignedID); // Kill the newer one we just assigned
                                  current[j].id = otherID; // Update object to older ID
                                  
@@ -3031,7 +3042,7 @@ void TrackObjects(std::vector<MotionObject>& current, const std::vector<MotionOb
                                  track_ttl[otherID] = 60; // Reset TTL for revived old track
                              } else {
                                  // Zombie is newer (or just duplicate). Kill it.
-                                 printf("[TrackFix] Kill Duplicate Track %d (Assigned %d is Older/Better)\n", otherID, assignedID);
+                                 DEBUG_PRINT("[TrackFix] Kill Duplicate Track %d (Assigned %d is Older/Better)\n", otherID, assignedID);
                                  tracksToRemove.push_back(otherID);
                              }
                         }
@@ -3113,7 +3124,7 @@ void TrackObjects(std::vector<MotionObject>& current, const std::vector<MotionOb
         }
     }
 
-    printf("[Debug] TrackObjects End.\n");
+    DEBUG_PRINT("[Debug] TrackObjects End.\n");
 }
 
 
@@ -3244,7 +3255,7 @@ void detectFallMomentumTrend(
 ) {
     int hist_size = history.size();
     if (hist_size < std::max(n_history, m_trend)) { 
-        // printf("[TrendTrace] Early Exit: HistSize %d  Req %d\n", hist_size, std::max(n_history, m_trend));
+        // DEBUG_PRINT("[TrendTrace] Early Exit: HistSize %d  Req %d\n", hist_size, std::max(n_history, m_trend));
         return; 
     }
     if (pixel_history.size() < (size_t)m_trend) {
@@ -3287,7 +3298,7 @@ void detectFallMomentumTrend(
         }
         
         if (!found_history || collected < m_trend) {
-             if (curr_obj.blocks.size() > 10) printf("[TrendTrace] Incomplete History for ID %d. Collected: %d\n", curr_obj.id, collected);
+             if (curr_obj.blocks.size() > 10) DEBUG_PRINT("[TrendTrace] Incomplete History for ID %d. Collected: %d\n", curr_obj.id, collected);
              continue;
         }
         
@@ -3317,7 +3328,7 @@ void detectFallMomentumTrend(
         /*
         if (curr_obj.blocks.size() > 10) {
              float avg_mag = 0; for(float m : mags) avg_mag += m; avg_mag /= mags.size();
-             printf("[Trend] ID %d Size %zu Mag %.2f Dy %.2f Dx %.2f YDom %d\n", 
+             DEBUG_PRINT("[Trend] ID %d Size %zu Mag %.2f Dy %.2f Dx %.2f YDom %d\n", 
                     curr_obj.id, curr_obj.blocks.size(), avg_mag, recent_avg_dy, recent_avg_dx, y_dominant);
         }
         */ 
@@ -3384,7 +3395,7 @@ void detectFallMomentumTrend(
                 bool is_entry = is_entry_it->second;
                 if (is_entry && age < entry_suppress_frames) {
                     suppress = true;
-                    printf("[EntryFilter] Suppressed trigger for ID %d (age=%d, entry=%d)\n", 
+                    DEBUG_PRINT("[EntryFilter] Suppressed trigger for ID %d (age=%d, entry=%d)\n", 
                            curr_obj.id, age, is_entry);
                 }
             }
@@ -3400,7 +3411,7 @@ void detectFallMomentumTrend(
 StatusCode FallDetector::Detect(const Image& frame, bool& is_fall) {
     is_fall = false;
     pImpl->absolute_frame_count++; // Increment frame counter
-    printf("[Debug] FallDetector::Detect Start Frame %lld\n", pImpl->absolute_frame_count);
+    DEBUG_PRINT("[Debug] FallDetector::Detect Start Frame %lld\n", pImpl->absolute_frame_count);
   
     // 0. Timestamp Validation
     if (pImpl->config.expected_frame_interval_ms > 0 && pImpl->last_timestamp > 0) {
@@ -3408,7 +3419,7 @@ StatusCode FallDetector::Detect(const Image& frame, bool& is_fall) {
         int error = std::abs((int)diff - pImpl->config.expected_frame_interval_ms);
         
         if (error > pImpl->config.frame_interval_tolerance_ms) {
-            printf("[FallDetector] Timestamp Discontinuity Error! Diff: %lu ms, Expected: %d ms\n", 
+            DEBUG_PRINT("[FallDetector] Timestamp Discontinuity Error! Diff: %lu ms, Expected: %d ms\n", 
                    diff, pImpl->config.expected_frame_interval_ms);
             pImpl->last_timestamp = frame.timestamp; 
             return StatusCode::ERROR_TIMESTAMP_DISCONTINUITY;
@@ -3436,6 +3447,8 @@ StatusCode FallDetector::Detect(const Image& frame, bool& is_fall) {
          pImpl->bedMask = createBedRegionMask(W, H, pImpl->bed_region);
     }
   
+    TimerGuard t_total(g_perf_timer, "00_Total_Detect");
+
     // 1. Motion Estimation
     #if ENABLE_PERF_PROFILING
     long long t0 = pImpl->get_now_us();
@@ -3485,6 +3498,7 @@ StatusCode FallDetector::Detect(const Image& frame, bool& is_fall) {
         int w = wrapper.width();
         int h = wrapper.height();
         
+        TimerGuard t_alloc(g_perf_timer, "1_4_MaskAllocAndPrep");
         std::vector<unsigned char> maskData(w * h);
         const uint8_t* curr = wrapper.getData();
         const uint8_t* bg = pImpl->backgroundFrame.getData();
@@ -3677,13 +3691,14 @@ StatusCode FallDetector::Detect(const Image& frame, bool& is_fall) {
          } else {
              // Print error every 100 frames to avoid spam?
              // Just print error
-             std::cout << "[FallDetector::Detect] FaceDetector not initialized (Retry Failed: " << (int)ret << ")" << std::endl;
+             if (ENABLE_DEBUG_PRINT) std::cout << "[FallDetector::Detect] FaceDetector not initialized (Retry Failed: " << (int)ret << ")" << std::endl;
          }
     }
 
     // Resize for Face Detection (Uses RGB frame)
     Image faceInput;
     {
+    //TimerGuard t_facecrop(g_perf_timer, "1_8_FaceCrop");
     TimerGuard t_face(g_perf_timer, "1_9_FaceDetect");
     if (pImpl->config.enable_face_detection) {
         // [CROP LOWER HALF OF BED REGION INTO A SQUARE]
@@ -3777,7 +3792,7 @@ StatusCode FallDetector::Detect(const Image& frame, bool& is_fall) {
     #endif
 
     // Run    // 2. Motion Estimation Execute
-    // printf("[Debug] Estimator->blockBasedMotionEstimation Start\n");
+    // DEBUG_PRINT("[Debug] Estimator->blockBasedMotionEstimation Start\n");
     {
         TimerGuard t_me(g_perf_timer, "2_MotionEstimation");
         pImpl->estimator->blockBasedMotionEstimation(wrapper, 
@@ -3864,7 +3879,8 @@ StatusCode FallDetector::Detect(const Image& frame, bool& is_fall) {
     std::set<int> current_ids;
     for(const auto& o : pImpl->current_objects) current_ids.insert(o.id);
     
-    for(const auto& kv : pImpl->kalmanFilters) {
+    for(const auto& kv : pImpl->kalmanFilters) 
+    {
         int id = kv.first;
         if(current_ids.find(id) == current_ids.end()) {
              // Lost Track - Inject Predicted
@@ -3904,20 +3920,13 @@ StatusCode FallDetector::Detect(const Image& frame, bool& is_fall) {
                       // CRITICAL: Propagate observation flag to the predicted object!
                       predObj.is_in_observation_mode = true; 
 
-                      if (id == 1018) {
-                          printf("[DebugInject] ID:1018 FoundState. FramesObs:%d PostFall:%d Blocks:%zu ShouldInject:%d\n", 
-                                 s.frames_observed, s.post_fall_counter, predObj.blocks.size(), should_inject);
-                      }
-                  } else {
-                      if (id == 1018) printf("[DebugInject] ID:1018 No State Found!\n");
+                      
                   }
 
                   if (should_inject) {
                       pImpl->current_objects.push_back(predObj);
-                      printf("[FallDetector] Injected Coasting Object %d (Str: %.2f, Blocks: %zu)\n", id, predObj.strength, predObj.blocks.size());
+                      DEBUG_PRINT("[FallDetector] Injected Coasting Object %d (Str: %.2f, Blocks: %zu)\n", id, predObj.strength, predObj.blocks.size());
                   }
-             } else {
-                 if (id == 1018) printf("[DebugInject] ID:1018 Blocks Empty!\n");
              }
         }
     }
@@ -4040,7 +4049,7 @@ StatusCode FallDetector::Detect(const Image& frame, bool& is_fall) {
                      // Set post-bed-exit counter if feature enabled
                      if (pImpl->config.enable_post_bed_exit_threshold) {
                          pImpl->observation_states[obj.id].post_bed_exit_counter = pImpl->config.post_bed_exit_window_frames;
-                         printf("[Case5] ID:%d Post-BedExit counter set (%d frames, multiplier=%.2f)\n",
+                         DEBUG_PRINT("[Case5] ID:%d Post-BedExit counter set (%d frames, multiplier=%.2f)\n",
                                 obj.id, pImpl->config.post_bed_exit_window_frames, pImpl->config.post_bed_exit_threshold_multiplier);
                      }
                  }
@@ -4083,7 +4092,7 @@ StatusCode FallDetector::Detect(const Image& frame, bool& is_fall) {
     int bg_thresh = pImpl->config.bg_diff_threshold;
     
     // DEBUG PRINT
-    // printf("[Detect] Frame %lld. W=%d H=%d. BG=%p\n", pImpl->absolute_frame_count, W, H, bgData);
+    // DEBUG_PRINT("[Detect] Frame %lld. W=%d H=%d. BG=%p\n", pImpl->absolute_frame_count, W, H, bgData);
 
     if (bgData) 
     {
@@ -4333,7 +4342,7 @@ StatusCode FallDetector::Detect(const Image& frame, bool& is_fall) {
             obj.avg_brightness = (count_pixels > 0) ? (float)sum_brightness / count_pixels : 0.0f;
         }
     }
-    // printf("[Detect] Pixel Stats Done.\n");
+    // DEBUG_PRINT("[Detect] Pixel Stats Done.\n");
 
     // Update object history
     pImpl->object_history.push_back(pImpl->current_objects);
@@ -4358,7 +4367,7 @@ StatusCode FallDetector::Detect(const Image& frame, bool& is_fall) {
     int total_grid_blocks = pImpl->config.grid_cols * pImpl->config.grid_rows;
     if (pImpl->active_blocks.size() > (size_t)(total_grid_blocks / 4)) {
         // Safe: Too much motion (Camera move / Light switch)
-        // printf("[FallDetector] Global Safety: Too much motion (%zu blocks)\n", pImpl->active_blocks.size());
+        // DEBUG_PRINT("[FallDetector] Global Safety: Too much motion (%zu blocks)\n", pImpl->active_blocks.size());
         triggered_objects.clear(); 
     } 
     else if (!pImpl->current_objects.empty()) 
@@ -4452,11 +4461,11 @@ StatusCode FallDetector::Detect(const Image& frame, bool& is_fall) {
             getObjectBoundingBoxPixels(curr, pImpl->config.grid_cols, pImpl->config.grid_rows, W, H, box_w, box_h, m1, m2, m3, m4);
 
                 // if (sum_dy < -25) { // Threshold for significant upward (-Y) motion
-                //     // printf("[UpwardCheck] F:%lld ID:%d Y_Dom:%d Up:%d SumDy:%.1f -> IGNORE\n", 
+                //     // DEBUG_PRINT("[UpwardCheck] F:%lld ID:%d Y_Dom:%d Up:%d SumDy:%.1f -> IGNORE\n", 
                 //     //        pImpl->frame_idx, curr.id, (int)y_dominant, (int)is_upward, sum_dy);
                 //     continue; // Skip processing this object for fall trigger
                 // }
-            printf("[DET_LOG] F:%d ID:%d YDom:%d Up:%d Dy:%.1f StrH:%.2f StrL:%.2f (R:%.2f) FGH:%.0f FGL:%.0f (R:%.2f) Box:%dx%d\n",
+            DEBUG_PRINT("[DET_LOG] F:%d ID:%d YDom:%d Up:%d Dy:%.1f StrH:%.2f StrL:%.2f (R:%.2f) FGH:%.0f FGL:%.0f (R:%.2f) Box:%dx%d\n",
                    pImpl->frame_idx, curr.id, (int)y_dominant, (int)is_upward, sum_dy, 
                    avg_h_str, avg_l_str, (avg_h_str > 0 ? avg_l_str/avg_h_str : 0.0f),
                    s_h_fg, s_l_fg, (s_h_fg > 0 ? s_l_fg/s_h_fg : 0.0f), box_w, box_h);
@@ -4504,7 +4513,7 @@ StatusCode FallDetector::Detect(const Image& frame, bool& is_fall) {
                 // Using Direction Variance from Object if available, or calc from history
                 float dir_var = curr.direction_variance; // Existing logic computes this
                 if (dir_var < 0.2f) { // Consistent -> Walking Away
-                    // printf("[NewLogic] ID %d Rejected: Upward Consistent (Var %.2f)\n", curr.id, dir_var);
+                    // DEBUG_PRINT("[NewLogic] ID %d Rejected: Upward Consistent (Var %.2f)\n", curr.id, dir_var);
                     continue; 
                 }
                 
@@ -4517,7 +4526,7 @@ StatusCode FallDetector::Detect(const Image& frame, bool& is_fall) {
                      int bbox_w, bbox_h, min_x, min_y, max_x, max_y;
                      getObjectBoundingBoxPixels(curr, pImpl->config.grid_cols, pImpl->config.grid_rows, 
                                                 W, H, bbox_w, bbox_h, min_x, min_y, max_x, max_y);
-                     printf("[Case1 BBox] ID %d: %dx%d pixels (min=%d,%d max=%d,%d)\n", 
+                     DEBUG_PRINT("[Case1 BBox] ID %d: %dx%d pixels (min=%d,%d max=%d,%d)\n", 
                             curr.id, bbox_w, bbox_h, min_x, min_y, max_x, max_y);
 
                     if (bbox_w < 240 && bbox_h < 240) {
@@ -4565,7 +4574,7 @@ StatusCode FallDetector::Detect(const Image& frame, bool& is_fall) {
                             potential_fall = true;
                             fall_type = "Pixel_Collapse";
                             case_num = 3;
-                             printf("[NewLogic] Pixel-Dominant Trigger! ID %d. FG Drop Confirmed. (SumDy: %.1f)\n", curr.id, sum_dy);
+                             DEBUG_PRINT("[NewLogic] Pixel-Dominant Trigger! ID %d. FG Drop Confirmed. (SumDy: %.1f)\n", curr.id, sum_dy);
                         }
                     }
                 }
@@ -4574,9 +4583,9 @@ StatusCode FallDetector::Detect(const Image& frame, bool& is_fall) {
                 // Data3 pattern: FG gradually declines over extended period
                 // Strategy: Within 20-frame window, check if current FG dropped significantly from peak
                 if (!potential_fall) {
-                    printf("[C4_ENTRY] ID:%d entering Case 4 check\n", curr.id);
+                    DEBUG_PRINT("[C4_ENTRY] ID:%d entering Case 4 check\n", curr.id);
                     int len = hist_fg.size();
-                    printf("[C4_DEBUG] ID:%d hist_fg.size=%d (need>=10)\n", curr.id, len);
+                    DEBUG_PRINT("[C4_DEBUG] ID:%d hist_fg.size=%d (need>=10)\n", curr.id, len);
                     if (len >= 10) {  // Need sufficient history
                         // Find peak in first 60% of window and current minimum in last 40%
                         int peak_search_end = (int)(len * 0.6f);
@@ -4608,10 +4617,10 @@ StatusCode FallDetector::Detect(const Image& frame, bool& is_fall) {
                         bool avg_ok = (recent_avg_fg > 2000);
                         
                         if (peak_ok && !drop_ok) {
-                            printf("[C4_FAIL] ID:%d peak:%.0f avg:%.0f drop:%.1f%% (need>=45%%) FAILED DROP\\n", 
+                            DEBUG_PRINT("[C4_FAIL] ID:%d peak:%.0f avg:%.0f drop:%.1f%% (need>=45%%) FAILED DROP\\n", 
                                    curr.id, peak_fg, recent_avg_fg, drop_ratio * 100);
                         } else if (peak_ok && drop_ok && !avg_ok) {
-                            printf("[C4_FAIL] ID:%d peak:%.0f avg:%.0f drop:%.1f%% FAILED AVG (need>2000)\\n", 
+                            DEBUG_PRINT("[C4_FAIL] ID:%d peak:%.0f avg:%.0f drop:%.1f%% FAILED AVG (need>2000)\\n", 
                                    curr.id, peak_fg, recent_avg_fg, drop_ratio * 100);
                         }
                         
@@ -4629,7 +4638,7 @@ StatusCode FallDetector::Detect(const Image& frame, bool& is_fall) {
                                 potential_fall = true;
                                 fall_type = "Sustained_Decline";
                                 case_num = 4;
-                                printf("[NewLogic] Peak-to-Current FG Decline! ID %d peak:%.0f avg:%.0f drop:%.1f%%\n", 
+                                DEBUG_PRINT("[NewLogic] Peak-to-Current FG Decline! ID %d peak:%.0f avg:%.0f drop:%.1f%%\n", 
                                        curr.id, peak_fg, recent_avg_fg, drop_ratio * 100);
                             }
                         }
@@ -4660,7 +4669,7 @@ StatusCode FallDetector::Detect(const Image& frame, bool& is_fall) {
                 
                 if (pImpl->config.enable_post_bed_exit_threshold)
                 {
-                    printf("[Case5] ID:%d Post-BedExit threshold enabled\n", curr.id);
+                    DEBUG_PRINT("[Case5] ID:%d Post-BedExit threshold enabled\n", curr.id);
                 }
 
                 auto& state = pImpl->observation_states[curr.id];
@@ -4669,7 +4678,7 @@ StatusCode FallDetector::Detect(const Image& frame, bool& is_fall) {
                 if (pImpl->config.enable_post_bed_exit_threshold && state.post_bed_exit_counter > 0) {
                     threshold1 = threshold1_base * pImpl->config.post_bed_exit_threshold_multiplier;
                     state.post_bed_exit_counter--;
-                    printf("[Case5] ID:%d Post-BedExit threshold=%.2f (counter=%d)\n",
+                    DEBUG_PRINT("[Case5] ID:%d Post-BedExit threshold=%.2f (counter=%d)\n",
                            curr.id, threshold1, state.post_bed_exit_counter);
                 }
 
@@ -4689,14 +4698,14 @@ StatusCode FallDetector::Detect(const Image& frame, bool& is_fall) {
                          curr.centerY < 2.0f || curr.centerY >= (g_rows - 2.0f))) {
                         
                         suppress_trigger = true;
-                        printf("[Case5] IGNORED Edge Trigger: ID:%d Area:%d Pos:(%.1f, %.1f) Mom:%.2f\n", 
+                        DEBUG_PRINT("[Case5] IGNORED Edge Trigger: ID:%d Area:%d Pos:(%.1f, %.1f) Mom:%.2f\n", 
                                curr.id, curr.pixel_count, curr.centerX, curr.centerY, recent_mom_avg);
                         
                         // NEW: Abort if already waiting (e.g. jumped to edge)
                         if (state.waiting_for_deceleration) {
                             state.waiting_for_deceleration = false;
                             state.is_active = false; // Reset
-                             printf("[Case5] ABORTED Trigger: ID:%d Moved to Edge during Wait\n", curr.id);
+                             DEBUG_PRINT("[Case5] ABORTED Trigger: ID:%d Moved to Edge during Wait\n", curr.id);
                         }
                         // Don't start trigger
                     }
@@ -4744,11 +4753,14 @@ StatusCode FallDetector::Detect(const Image& frame, bool& is_fall) {
                                 float pdy = ty - by;
                                 rt_proj_dist = std::sqrt(pdx*pdx + pdy*pdy);
 
-                                // NEW: Store for visualization
                                 curr.proj_top_x = tx;
                                 curr.proj_top_y = ty;
                                 curr.proj_bot_x = bx;
                                 curr.proj_bot_y = by;
+                                curr.img_top_x = top_u;
+                                curr.img_top_y = top_v;
+                                curr.img_bot_x = bot_u;
+                                curr.img_bot_y = bot_v;
                                 curr.has_projection = true;
 
                                 if ((ar > 1.2f || rt_proj_dist < 250.0f) && recent_mom_avg < 12.0f) {
@@ -4757,10 +4769,10 @@ StatusCode FallDetector::Detect(const Image& frame, bool& is_fall) {
                             }
                             
                             if (suppress_retrigger) {
-                                printf("[Case5] ID:%d Re-Trigger IGNORED (Post-Fall Struggle? Obs:%d Flat:%d Mom:%.2f AR:%.2f Proj:%.1f)\n", 
+                                DEBUG_PRINT("[Case5] ID:%d Re-Trigger IGNORED (Post-Fall Struggle? Obs:%d Flat:%d Mom:%.2f AR:%.2f Proj:%.1f)\n", 
                                        curr.id, state.frames_observed, state.flat_posture_frames, recent_mom_avg, (box_h>0?(float)box_w/box_h:0), rt_proj_dist);
                             } else {
-                                printf("[Case5] ID:%d RE-TRIGGER detected during observation (new peak=%.2f) - restarting logic.\n", 
+                                DEBUG_PRINT("[Case5] ID:%d RE-TRIGGER detected during observation (new peak=%.2f) - restarting logic.\n", 
                                        curr.id, recent_mom_avg);
                                 pImpl->LogTrace(curr.id, pImpl->frame_idx, "RE-TRIGGER", recent_mom_avg, "New Impact during Obs");
                                 start_new_trigger = true;
@@ -4790,7 +4802,7 @@ StatusCode FallDetector::Detect(const Image& frame, bool& is_fall) {
                         state.trigger_pixel_count = curr.pixel_count; // NEW: Store Trigger Area
                         state.accumulated_pixel_count = 0;
                         
-                        printf("[Case5] ID:%d PEAK detected at frame %d (peak_mom=%.2f >= %.2f Area:%d) - waiting for deceleration\n", 
+                        DEBUG_PRINT("[Case5] ID:%d PEAK detected at frame %d (peak_mom=%.2f >= %.2f Area:%d) - waiting for deceleration\n", 
                                curr.id, pImpl->frame_idx, recent_mom_avg, threshold1, curr.pixel_count);
                         pImpl->LogTrace(curr.id, pImpl->frame_idx, "TRIGGER", recent_mom_avg, "Peak Momentum > 5.5");
                     }
@@ -4836,7 +4848,7 @@ StatusCode FallDetector::Detect(const Image& frame, bool& is_fall) {
                          // Threshold: > 45 degrees rotation AND > 70% consistency
                          if (std::abs(total_delta) > 45.0f && consistency > 0.70f) {
                              state.rotation_detected = true;
-                             printf("[Case5] ID:%d ROTATION DETECTED! Delta=%.1f Consistency=%.2f. (Head-First Fall Candidate)\n", 
+                             DEBUG_PRINT("[Case5] ID:%d ROTATION DETECTED! Delta=%.1f Consistency=%.2f. (Head-First Fall Candidate)\n", 
                                     curr.id, total_delta, consistency);
                              pImpl->LogTrace(curr.id, pImpl->frame_idx, "ROTATION_DETECT", total_delta, "Rapid Consistent Rotation");
                          }
@@ -4853,7 +4865,7 @@ StatusCode FallDetector::Detect(const Image& frame, bool& is_fall) {
                         state.proj_widths.clear();
                         state.proj_heights.clear();
                         state.proj_areas.clear();
-                        printf("[Case5] ID:%d DECELERATION complete at frame %d (curr_mom=%.2f < %.2f) - starting observation\n",  
+                        DEBUG_PRINT("[Case5] ID:%d DECELERATION complete at frame %d (curr_mom=%.2f < %.2f) - starting observation\n",  
                                curr.id, pImpl->frame_idx, curr.strength, decel_threshold);
                     }
 
@@ -4929,15 +4941,18 @@ StatusCode FallDetector::Detect(const Image& frame, bool& is_fall) {
                          float tx, ty, bx, by;
                          projectPoint(top_u, top_v, pImpl->homography_matrix, tx, ty);
                          projectPoint(bot_u, bot_v, pImpl->homography_matrix, bx, by);
-                         
                          curr.proj_top_x = tx;
                          curr.proj_top_y = ty;
                          curr.proj_bot_x = bx;
                          curr.proj_bot_y = by;
+                         curr.img_top_x = top_u;
+                         curr.img_top_y = top_v;
+                         curr.img_bot_x = bot_u;
+                         curr.img_bot_y = bot_v;
                          curr.has_projection = true;
                          
                          // DEBUG: Verify Projection is set
-                         printf("[DEBUG-PROJ] F:%d ID:%d Set Proj: Top(%.1f, %.1f) Bot(%.1f, %.1f)\n", 
+                         DEBUG_PRINT("[DEBUG-PROJ] F:%d ID:%d Set Proj: Top(%.1f, %.1f) Bot(%.1f, %.1f)\n", 
                                 pImpl->frame_idx, curr.id, tx, ty, bx, by);
                     }
 
@@ -5035,7 +5050,7 @@ StatusCode FallDetector::Detect(const Image& frame, bool& is_fall) {
                             // if (best_idx == -1 && !pImpl->full_frame_objects.empty()) {
                             // }
                             
-                            // printf("[Case5-DEBUG] ID:%d F:%lld best_idx=%d min_dist=%.2f\n", curr.id, pImpl->frame_idx, best_idx, min_dist);
+                            // DEBUG_PRINT("[Case5-DEBUG] ID:%d F:%lld best_idx=%d min_dist=%.2f\n", curr.id, pImpl->frame_idx, best_idx, min_dist);
 
                             // Relaxed distance threshold: 10 blocks (100.0)
                             int matched_full_frame_idx = -1;
@@ -5058,7 +5073,7 @@ StatusCode FallDetector::Detect(const Image& frame, bool& is_fall) {
                                 
                                 // DEBUG
                                 if (pImpl->frame_idx >= 300 && pImpl->frame_idx <= 310) {
-                                    printf("[Match-OK] F:%d ID:%d Blk:%lu Dist:%.2f FG_ID:%d LastValid:%d\n", 
+                                    DEBUG_PRINT("[Match-OK] F:%d ID:%d Blk:%lu Dist:%.2f FG_ID:%d LastValid:%d\n", 
                                            pImpl->frame_idx, curr.id, curr.blocks.size(), min_dist, fg_obj.id, state.last_fg_valid);
                                 }
 
@@ -5086,7 +5101,7 @@ StatusCode FallDetector::Detect(const Image& frame, bool& is_fall) {
                                 
                                 // DEBUG FAIL INFO
                                 if (pImpl->frame_idx >= 300 && pImpl->frame_idx <= 310) {
-                                     printf("[Match-Fail-Rescue] F:%d ID:%d Blk:%lu StdDist:%.2f LastValid:%d RecDist:%.2f\n",
+                                     DEBUG_PRINT("[Match-Fail-Rescue] F:%d ID:%d Blk:%lu StdDist:%.2f LastValid:%d RecDist:%.2f\n",
                                             pImpl->frame_idx, curr.id, curr.blocks.size(), min_dist, state.last_fg_valid, rec_min_dist);
                                 }
 
@@ -5102,7 +5117,7 @@ StatusCode FallDetector::Detect(const Image& frame, bool& is_fall) {
                                     
                                     curr.matched_fg_obj_id = fg_obj.id;
                                     
-                                    printf("[Case5-Recover] ID:%d Recovered FG Object %d via LastPos (Dist: %.2f)\n", curr.id, fg_obj.id, rec_min_dist);
+                                    DEBUG_PRINT("[Case5-Recover] ID:%d Recovered FG Object %d via LastPos (Dist: %.2f)\n", curr.id, fg_obj.id, rec_min_dist);
                                 }
                             }
 
@@ -5139,6 +5154,18 @@ StatusCode FallDetector::Detect(const Image& frame, bool& is_fall) {
                                         projectPoint(bot_u, bot_v, pImpl->homography_matrix, bx, by);
                                         p_height = std::sqrt((tx-bx)*(tx-bx) + (ty-by)*(ty-by));
                                         
+                                        if (pImpl->config.projection_use_foreground) {
+                                            curr.proj_top_x = tx;
+                                            curr.proj_top_y = ty;
+                                            curr.proj_bot_x = bx;
+                                            curr.proj_bot_y = by;
+                                            curr.img_top_x = top_u;
+                                            curr.img_top_y = top_v;
+                                            curr.img_bot_x = bot_u;
+                                            curr.img_bot_y = bot_v;
+                                            curr.has_projection = true;
+                                        }
+                                        
                                         // Project Left-Center and Right-Center
                                         float left_u = fmin_x; float left_v = fg_obj.cy;
                                         float right_u = fmax_x; float right_v = fg_obj.cy;
@@ -5158,7 +5185,7 @@ StatusCode FallDetector::Detect(const Image& frame, bool& is_fall) {
 
                                 // DEBUG PRINT
                                 if (state.frames_observed % 10 == 0) {
-                                     printf("[Case5-Size] ID:%d Proj_W:%.1f Proj_H:%.1f Area:%.1f (Pixels:%zu)\n", 
+                                     DEBUG_PRINT("[Case5-Size] ID:%d Proj_W:%.1f Proj_H:%.1f Area:%.1f (Pixels:%zu)\n", 
                                             curr.id, p_width, p_height, p_area, fg_obj.pixels.size());
                                 }
                             }
@@ -5184,7 +5211,7 @@ StatusCode FallDetector::Detect(const Image& frame, bool& is_fall) {
                         
                         if (is_flat_posture) {
                             current_threshold2 = 11.0f; // Relaxed threshold for struggling/seizure (high momentum but lying down)
-                            printf("[Case5-DEBUG] ID:%d ADAPTIVE THRESHOLD: Flat Ratio=%.2f (>0.5) (Flat: %d/%d) -> Threshold=11.0\n",
+                            DEBUG_PRINT("[Case5-DEBUG] ID:%d ADAPTIVE THRESHOLD: Flat Ratio=%.2f (>0.5) (Flat: %d/%d) -> Threshold=11.0\n",
                                    curr.id, (float)state.flat_posture_frames/state.frames_observed, state.flat_posture_frames, state.frames_observed);
                         }
                         
@@ -5199,7 +5226,7 @@ StatusCode FallDetector::Detect(const Image& frame, bool& is_fall) {
                                 float avg_obs = state.frames_observed > 0 ? state.accumulated_bed_ratio / state.frames_observed : 0.0f;
                                 float avg_wait = state.frames_observed_wait > 0 ? state.accumulated_bed_ratio_wait / state.frames_observed_wait : 0.0f;
                                 
-                                printf("[Case5-BED-DEBUG] ID:%d F:%d EverInBed:%d AvgObs:%.3f AvgWait:%.3f PeakWait:%.3f\n", 
+                                DEBUG_PRINT("[Case5-BED-DEBUG] ID:%d F:%d EverInBed:%d AvgObs:%.3f AvgWait:%.3f PeakWait:%.3f\n", 
                                        curr.id, pImpl->frame_idx, state.center_ever_in_bed, avg_obs, avg_wait, state.peak_bed_ratio_wait);
                                 
                                 // Check Center
@@ -5239,7 +5266,7 @@ StatusCode FallDetector::Detect(const Image& frame, bool& is_fall) {
                                     
                                     if (confirm_bed) {
                                         is_bed_event = true;
-                                        printf("[Case5] ID:%d Rejected: Bed Event (Center:%d, Ever:%d, AvgObs:%.2f, AvgWait:%.2f, PeakWait:%.2f, Thresh:%.2f)\n", 
+                                        DEBUG_PRINT("[Case5] ID:%d Rejected: Bed Event (Center:%d, Ever:%d, AvgObs:%.2f, AvgWait:%.2f, PeakWait:%.2f, Thresh:%.2f)\n", 
                                                 curr.id, center_in_bed_flag, state.center_ever_in_bed, avg_obs, avg_wait, state.peak_bed_ratio_wait, pImpl->config.bed_pixel_ratio_threshold);
                                         pImpl->LogTrace(curr.id, pImpl->frame_idx, "FILTER_BED", avg_obs, "Bed Region Reject");
                                     }
@@ -5263,7 +5290,7 @@ StatusCode FallDetector::Detect(const Image& frame, bool& is_fall) {
                                 float med_area = get_median(state.proj_areas);
                                 float med_ratio = (med_h > 0.001f) ? (med_w / med_h) : 0.0f;
                                 
-                                printf("[Case5-EVAL] ID:%d Median W:%.1f H:%.1f Ratio:%.2f Area:%.1f\n", curr.id, med_w, med_h, med_ratio, med_area);
+                                DEBUG_PRINT("[Case5-EVAL] ID:%d Median W:%.1f H:%.1f Ratio:%.2f Area:%.1f\n", curr.id, med_w, med_h, med_ratio, med_area);
                                 
                                 // Physical Dimensions Check
                                 // Thresholds:
@@ -5284,19 +5311,19 @@ StatusCode FallDetector::Detect(const Image& frame, bool& is_fall) {
                                 if (med_area >= MIN_FALL_AREA && med_area <= MAX_FALL_AREA) {
                                     // Area in "lying down" range -> Fall
                                     is_fall_case5 = true;
-                                    printf("[Case5] ID:%d DETECTED FALL (Area:%.1f in [%.0f, %.0f])\n",
+                                    DEBUG_PRINT("[Case5] ID:%d DETECTED FALL (Area:%.1f in [%.0f, %.0f])\n",
                                            curr.id, med_area, MIN_FALL_AREA, MAX_FALL_AREA);
                                     pImpl->LogTrace(curr.id, pImpl->frame_idx, "PROJ_FALL", med_area, "Area in Fall Range");
                                 } else if (med_area > EXTREME_FALL_AREA && med_ratio > 0.45f) {
                                     // Extreme fall towards camera (wide shape, very large area)
                                     is_fall = true;
-                                    printf("[Case5] ID:%d DETECTED FALL (Extreme Area:%.1f Ratio:%.2f)\n",
+                                    DEBUG_PRINT("[Case5] ID:%d DETECTED FALL (Extreme Area:%.1f Ratio:%.2f)\n",
                                            curr.id, med_area, med_ratio);
                                     pImpl->LogTrace(curr.id, pImpl->frame_idx, "PROJ_FALL_AREA", med_area, "Extreme Fall Towards Camera");
                                 } else {
                                     // Area too large (walking projection) or too small (noise)
                                     is_fall = false;
-                                    printf("[Case5] ID:%d REJECTED FALL (Area:%.1f outside range, Ratio:%.2f H:%.1f)\n",
+                                    DEBUG_PRINT("[Case5] ID:%d REJECTED FALL (Area:%.1f outside range, Ratio:%.2f H:%.1f)\n",
                                            curr.id, med_area, med_ratio, med_h);
                                     pImpl->LogTrace(curr.id, pImpl->frame_idx, "PROJ_REJECT", med_area, "Area Out of Range");
                                 }
@@ -5312,7 +5339,7 @@ StatusCode FallDetector::Detect(const Image& frame, bool& is_fall) {
                                 potential_fall = true;
                                 fall_type = "Momentum_Transition";
                                 case_num = 5;
-                                printf("[Case5] FALL DETECTED ID:%d obs_avg=%.2f (min=%.2f, max=%.2f) < %.2f (Adaptive: %s, Flat: %d/%d) (triggered at F:%d, observed %d frames)\n", 
+                                DEBUG_PRINT("[Case5] FALL DETECTED ID:%d obs_avg=%.2f (min=%.2f, max=%.2f) < %.2f (Adaptive: %s, Flat: %d/%d) (triggered at F:%d, observed %d frames)\n", 
                                        curr.id, obs_mom_avg, obs_min_mom, obs_max_mom, current_threshold2, (is_flat_posture?"YES":"NO"), state.flat_posture_frames, state.frames_observed, state.trigger_frame, state.frames_observed);
                                 
                                 pImpl->LogTrace(curr.id, pImpl->frame_idx, "DETECTED", obs_mom_avg, (is_flat_posture ? "Adaptive Threshold Passed" : "Normal Threshold Passed"));
@@ -5324,11 +5351,11 @@ StatusCode FallDetector::Detect(const Image& frame, bool& is_fall) {
                                 state.fall_snapshot_mom = std::sqrt(curr.avgDx*curr.avgDx + curr.avgDy*curr.avgDy);
 
                             } else {
-                                printf("[Case5] ID:%d observation ENDED - PERSPECTIVE ALIGNED (obs_avg=%.2f, min=%.2f, max=%.2f) < %.2f but NOT a fall (Flat: %d/%d)\n", 
+                                DEBUG_PRINT("[Case5] ID:%d observation ENDED - PERSPECTIVE ALIGNED (obs_avg=%.2f, min=%.2f, max=%.2f) < %.2f but NOT a fall (Flat: %d/%d)\n", 
                                        curr.id, obs_mom_avg, obs_min_mom, obs_max_mom, current_threshold2, state.flat_posture_frames, state.frames_observed);
                             }
                         } else {
-                            printf("[Case5] ID:%d observation ENDED - NO FALL (obs_avg=%.2f, min=%.2f, max=%.2f) >= %.2f (Adaptive: %s, Flat: %d/%d)\n", 
+                            DEBUG_PRINT("[Case5] ID:%d observation ENDED - NO FALL (obs_avg=%.2f, min=%.2f, max=%.2f) >= %.2f (Adaptive: %s, Flat: %d/%d)\n", 
                                    curr.id, obs_mom_avg, obs_min_mom, obs_max_mom, current_threshold2, (is_flat_posture?"YES":"NO"), state.flat_posture_frames, state.frames_observed);
                             pImpl->LogTrace(curr.id, pImpl->frame_idx, "FILTER_MOMENTUM", obs_mom_avg, "Observation Avg > Threshold");
                         }
@@ -5387,7 +5414,7 @@ StatusCode FallDetector::Detect(const Image& frame, bool& is_fall) {
                     }
                     
                     if (in_bed) {
-                        // printf("[NewLogic] ID %d Rejected: In Bed Region\n", curr.id);
+                        // DEBUG_PRINT("[NewLogic] ID %d Rejected: In Bed Region\n", curr.id);
                         // continue; // DISABLED FOR DEBUG
                     }
                     
@@ -5413,18 +5440,18 @@ StatusCode FallDetector::Detect(const Image& frame, bool& is_fall) {
                          if (cy > h_g - 2.0f && vy > 0.1f) leaving = true; // Bottom border usually floor
                          
                          if (leaving) {
-                             printf("[NewLogic] ID %d Rejected: Leaving Scene\n", curr.id);
+                             DEBUG_PRINT("[NewLogic] ID %d Rejected: Leaving Scene\n", curr.id);
                              // continue;
                          } else {
                              // Trigger
-                             printf("[NewLogic] FALL DETECTED ID %d Type: %s. StrTrend: High->Low. FGTrend: High->Low.\n", curr.id, fall_type.c_str());
+                             DEBUG_PRINT("[NewLogic] FALL DETECTED ID %d Type: %s. StrTrend: High->Low. FGTrend: High->Low.\n", curr.id, fall_type.c_str());
                              detected_id = curr.id;
                              triggered_objects.push_back(curr.id);
                              warningMsg = fall_type;
                          }
                     } else {
                         // Trigger
-                        printf("[NewLogic] FALL DETECTED ID %d Type: %s. StrTrend: High->Low. FGTrend: High->Low.\n", curr.id, fall_type.c_str());
+                        DEBUG_PRINT("[NewLogic] FALL DETECTED ID %d Type: %s. StrTrend: High->Low. FGTrend: High->Low.\n", curr.id, fall_type.c_str());
                         detected_id = curr.id;
                         triggered_objects.push_back(curr.id);
                         warningMsg = fall_type;
@@ -5452,12 +5479,14 @@ StatusCode FallDetector::Detect(const Image& frame, bool& is_fall) {
                 }
     } // END OF TimerGuard LOGIC BLOCK
 
+    TimerGuard t_post(g_perf_timer, "6_PostLogic_Callback");
+
     
     if (slow_triggered > 0 && detected_id != -1) {
          bool exists = false;
          for(int tid : triggered_objects) if(tid == detected_id) exists = true;
          if(!exists) {
-             // printf("[DEBUG] PUSH BACK SLOW for ID %d\n", detected_id);
+             // DEBUG_PRINT("[DEBUG] PUSH BACK SLOW for ID %d\n", detected_id);
              triggered_objects.push_back(detected_id);
          }
     }
@@ -5488,7 +5517,7 @@ StatusCode FallDetector::Detect(const Image& frame, bool& is_fall) {
         is_fall = true;
         // warning = "V18_Fall"; // Optional: pass reason
         for(int pid : triggered_objects) {
-            printf("[V18] *** FALL CONFIRMED *** ID %d (Direct V18 Trigger)\n", pid);
+            DEBUG_PRINT("[V18] *** FALL CONFIRMED *** ID %d (Direct V18 Trigger)\n", pid);
         }
     }
 
@@ -5517,7 +5546,7 @@ StatusCode FallDetector::Detect(const Image& frame, bool& is_fall) {
                  // Debug: Track Candidate Movement
                  float motion_speed = std::sqrt(pow(vx, 2) + pow(vy, 2));
                  
-                 printf("DEBUG: Cand %d (Frame %d/%d) Start(%.1f,%.1f) Curr(%.1f,%.1f) Dist: %.2f (Thresh: %.1f) Speed: %.2f\n", 
+                 DEBUG_PRINT("DEBUG: Cand %d (Frame %d/%d) Start(%.1f,%.1f) Curr(%.1f,%.1f) Dist: %.2f (Thresh: %.1f) Speed: %.2f\n", 
                         c.id, c.frames_monitored + 1, pImpl->config.post_fall_check_frames, 
                         c.startX, c.startY, cx, cy, dist, pImpl->config.post_fall_distance_threshold, motion_speed);
 
@@ -5525,14 +5554,14 @@ StatusCode FallDetector::Detect(const Image& frame, bool& is_fall) {
                  bool rejected = false;
                  // 1. Distance from Start (Legacy)
                  if (dist > pImpl->config.post_fall_distance_threshold) {
-                     printf("[FallDetector] Fall Candidate %d REJECTED (Dist: %.2f > %.2f)\n", c.id, dist, pImpl->config.post_fall_distance_threshold);
+                     DEBUG_PRINT("[FallDetector] Fall Candidate %d REJECTED (Dist: %.2f > %.2f)\n", c.id, dist, pImpl->config.post_fall_distance_threshold);
                      rejected = true;
                  }
                  // 2. Instant Motion Speed (New fix for "observing center movement")
                  // If object is still moving significantly (e.g. walking), reject.
                  // Threshold 2.5?
                  else if (motion_speed > 2.5f) {
-                      printf("[FallDetector] Fall Candidate %d REJECTED (Speed: %.2f > 2.5)\n", c.id, motion_speed);
+                      DEBUG_PRINT("[FallDetector] Fall Candidate %d REJECTED (Speed: %.2f > 2.5)\n", c.id, motion_speed);
                       rejected = true;
                  }
 
@@ -5545,13 +5574,13 @@ StatusCode FallDetector::Detect(const Image& frame, bool& is_fall) {
                      // Confirmed
                      // is_fall = true; // DISABLED LEGACY CONFIRMATION
                      warning = "FALL DETECTED (Confirmed)! Obj " + std::to_string(c.id);
-                     printf("[FallDetector] Fall Candidate %d CONFIRMED.\n", c.id);
+                     DEBUG_PRINT("[FallDetector] Fall Candidate %d CONFIRMED.\n", c.id);
                      kept_candidates.push_back(c); 
                  } else {
                      kept_candidates.push_back(c);
                  }
             } else {
-                 printf("[FallDetector] Fall Candidate %d LOST.\n", c.id);
+                 DEBUG_PRINT("[FallDetector] Fall Candidate %d LOST.\n", c.id);
             }
         }
         pImpl->candidates = kept_candidates;
@@ -5562,7 +5591,7 @@ StatusCode FallDetector::Detect(const Image& frame, bool& is_fall) {
     // warning = warningMsg; // Don't use raw warningMsg anymore, only confirmed warning. 
     // Is this correct? Yes. But I should probably log warningMsg.
     if (!warningMsg.empty()) {
-        // printf("[FallDetector] Instant Trigger: %s\n", warningMsg.c_str());
+        // DEBUG_PRINT("[FallDetector] Instant Trigger: %s\n", warningMsg.c_str());
     }
 
     // Find max strength for callback, even if not a fall
@@ -5582,7 +5611,7 @@ StatusCode FallDetector::Detect(const Image& frame, bool& is_fall) {
          // Keep is_fall = true
     } else {
          //is_fall = false;
-         //printf("!!!!!!!!!!!!!!??????\n");
+         //DEBUG_PRINT("!!!!!!!!!!!!!!??????\n");
     }
 
     // 3. Visualization and Saving
@@ -5595,18 +5624,18 @@ StatusCode FallDetector::Detect(const Image& frame, bool& is_fall) {
 
     if(is_fall) 
     {
-        printf("[FallDetector] frame %d detect True Fall!!, Case %d, type=%s\n", pImpl->frame_idx, case_num, fall_type.c_str());
+        DEBUG_PRINT("[FallDetector] frame %d detect True Fall!!, Case %d, type=%s\n", pImpl->frame_idx, case_num, fall_type.c_str());
         
         // Print bounding box info for all detected objects
         for(const auto& obj : pImpl->current_objects) {
             int bbox_w, bbox_h, min_x, min_y, max_x, max_y;
             getObjectBoundingBoxPixels(obj, pImpl->config.grid_cols, pImpl->config.grid_rows,
                                        W, H, bbox_w, bbox_h, min_x, min_y, max_x, max_y);
-            printf("[FallConfirm BBox] ID %d: %dx%d pixels (min=%d,%d max=%d,%d)\n",
+            DEBUG_PRINT("[FallConfirm BBox] ID %d: %dx%d pixels (min=%d,%d max=%d,%d)\n",
                    obj.id, bbox_w, bbox_h, min_x, min_y, max_x, max_y);
         }
         
-        std::cout << "[FallDetector] " << warning << std::endl;
+        if (ENABLE_DEBUG_PRINT) std::cout << "[FallDetector] " << warning << std::endl;
     }
 
     // SAFETY OVERRIDE: Removed - FG Verification may confirm falls without new triggers
@@ -5659,14 +5688,14 @@ StatusCode FallDetector::Detect(const Image& frame, bool& is_fall) {
 
 
         
-        printf("[FallDetector Profiling] Avg Time (ms) - Total: %.2f, ME: %.2f, Face: %.2f, Logic: %.2f\n", 
+        DEBUG_PRINT("[FallDetector Profiling] Avg Time (ms) - Total: %.2f, ME: %.2f, Face: %.2f, Logic: %.2f\n", 
                avg_total, avg_me, avg_face, avg_logic);
         
         pImpl->prof.Reset();
     }
     #endif
 
-    // printf("[Debug] FallDetector::Detect End Frame %lld\n", pImpl->absolute_frame_count);
+    // DEBUG_PRINT("[Debug] FallDetector::Detect End Frame %lld\n", pImpl->absolute_frame_count);
 
     // 8. Background Update (Selective)
     // Runs here to use the latest pImpl->current_objects found in this frame
@@ -5687,7 +5716,7 @@ StatusCode FallDetector::Detect(const Image& frame, bool& is_fall) {
 
         if (isInitPhase || (pImpl->bg_update_counter >= pImpl->config.bg_update_interval_frames)) {
              TimerGuard t_bg(g_perf_timer, "5_BackgroundUpdate");
-             // printf("[Debug] Calling updateBackground (end-of-frame)...\n");
+             // DEBUG_PRINT("[Debug] Calling updateBackground (end-of-frame)...\n");
              
              // Pass CURRENT objects for selective update
              pImpl->updateBackground(wrapper, pImpl->config, pImpl->frame_idx, pImpl->current_objects);
@@ -5699,15 +5728,15 @@ StatusCode FallDetector::Detect(const Image& frame, bool& is_fall) {
 
 
     // End of Frame
-    // printf("[Debug] FallDetector::Detect End Frame %d\n", pImpl->frame_idx);
+    // DEBUG_PRINT("[Debug] FallDetector::Detect End Frame %d\n", pImpl->frame_idx);
     
     if (pImpl->absolute_frame_count % 100 == 0) {
-        printf("\n=== PERFORMANCE PROFILE (Avg over last 100 frames) ===\n");
+        DEBUG_PRINT("\n=== PERFORMANCE PROFILE (Avg over last 100 frames) ===\n");
         for (auto const& [name, total_ms] : g_perf_timer.total_ms) {
              double avg = total_ms / (double)g_perf_timer.calls[name];
-             printf("  Step [%s]: %.3f ms\n", name.c_str(), avg);
+             DEBUG_PRINT("  Step [%s]: %.3f ms\n", name.c_str(), avg);
         }
-        printf("======================================================\n\n");
+        DEBUG_PRINT("======================================================\n\n");
         // Optional: Reset? No, let's keep running average or reset. 
         // Resetting helps see spikes.
         g_perf_timer.total_ms.clear();
@@ -5723,9 +5752,9 @@ StatusCode FallDetector::Detect(const Image& frame, bool& is_fall) {
 
 const std::vector<MotionObject>& FallDetector::GetMotionObjects() const {
     if (!pImpl->current_objects.empty() && pImpl->frame_idx >= 300 && pImpl->frame_idx <= 302) {
-        printf("[SDK-FD-Get] F:%d Size:%lu IDs:", pImpl->frame_idx, pImpl->current_objects.size());
-        for(const auto& o : pImpl->current_objects) printf(" %d", o.id);
-        printf("\n");
+        DEBUG_PRINT("[SDK-FD-Get] F:%d Size:%lu IDs:", pImpl->frame_idx, pImpl->current_objects.size());
+        for(const auto& o : pImpl->current_objects) DEBUG_PRINT(" %d", o.id);
+        DEBUG_PRINT("\n");
     }
     return pImpl->current_objects;
 }
@@ -5760,17 +5789,17 @@ void FallDetector::SetBackground(const Image& frame) {
             int b = p_src[i * 3 + 2];
             p_dst[i] = (uint8_t)((r * 77 + g * 150 + b * 29) >> 8);
         }
-        printf("[FallDetector] Converted RGB Background to Grayscale (%dx%d)\n", f_w, f_h);
+        DEBUG_PRINT("[FallDetector] Converted RGB Background to Grayscale (%dx%d)\n", f_w, f_h);
     } else if (f_c == 1) {
         wrapper.setData(const_cast<unsigned char*>(p_frame_data), f_w * f_h);
     } else {
-        printf("[FallDetector] Unsupported background channels: %d\n", f_c);
+        DEBUG_PRINT("[FallDetector] Unsupported background channels: %d\n", f_c);
         return;
     }
 
     pImpl->backgroundFrame = wrapper;
     pImpl->background_initialized_externally = true; 
-    printf("[FallDetector] Background Explicitly Set.\n");
+    DEBUG_PRINT("[FallDetector] Background Explicitly Set.\n");
 }
 
 std::vector<uint8_t> FallDetector::GetChangedBlocks() const {

@@ -88,6 +88,9 @@ struct InternalConfig {
     bool enable_post_bed_exit_threshold = false;       // Enable the threshold multiplier after bed exit
     float post_bed_exit_threshold_multiplier = 0.7f;  // Multiply threshold1 for 30 frames after bed exit
     int post_bed_exit_window_frames = 30;              // Number of frames to apply the multiplier
+    
+    // Projection selection
+    bool projection_use_foreground = false;
 
     // Optical Flow
     int opt_flow_frame_distance = 3;

@@ -35,7 +35,7 @@ using namespace VisionSDK;
 #define USE_SDK_FALL_RESULT 1
 
 #define SAVE_ALL_TEST_IMAGES 0
-#define SAVE_GRID_IMAGE 0
+#define SAVE_GRID_IMAGE 1
 #define SAVE_FACE_IMAGES 1
 // Drawing Helper
 void drawRectRGB(std::vector<uint8_t>& img, int w, int h, int x, int y, int rw, int rh, uint8_t r, uint8_t g, uint8_t b, int thickness=2) {
@@ -672,6 +672,7 @@ int main(int argc, char** argv) {
     fallCfg.bed_update_alpha_multiplier = cfg.getFloat("FallDetect.Bed_Update_Alpha_Multiplier", 4.0f);
     fallCfg.enable_post_bed_exit_threshold = (cfg.getInt("FallDetect.Enable_Post_BedExit_Threshold", 0) != 0);
     fallCfg.post_bed_exit_threshold_multiplier = cfg.getFloat("FallDetect.Post_BedExit_Threshold_Multiplier", 0.7f);
+    fallCfg.projection_use_foreground = (cfg.getInt("FallDetect.Projection_Use_Foreground", 0) != 0);
     
     // Optical Flow Params
     fallCfg.opt_flow_frame_distance = cfg.getInt("OpticalFlow.CompareFrameDistance", 3);
@@ -1034,12 +1035,14 @@ int main(int argc, char** argv) {
 
         auto t1 = std::chrono::steady_clock::now();
         sdk.SetInputMemory(file_buffer.data(), W, H, 3);
+        
         is_fall_in_current_frame = false; // Reset for custom logic
         sdk.ProcessNextFrame();
 
         auto t2 = std::chrono::steady_clock::now();
         double ms = std::chrono::duration<double, std::milli>(t2 - t1).count();
-        if (i % 50 == 0) {
+        //if (i % 50 == 0) 
+        {
             std::cout << "Frame " << i << " Total Process Time: " << ms << " ms (" << (1000.0/ms) << " FPS)" << std::endl;
         }
         
@@ -1852,11 +1855,19 @@ int main(int argc, char** argv) {
                      }
                      
                      // Source Points (Image Space)
-                     int src_top_x = (int)((min_c + max_c + 1) / 2.0f * bw);
-                     int src_top_y = min_r * bh;
+                     int src_top_x = (int)obj.img_top_x;
+                     int src_top_y = (int)obj.img_top_y;
                      
-                     int src_bot_x = (int)((min_c + max_c + 1) / 2.0f * bw);
-                     int src_bot_y = (max_r + 1) * bh;
+                     int src_bot_x = (int)obj.img_bot_x;
+                     int src_bot_y = (int)obj.img_bot_y;
+                     
+                     // Fallback to blocks if img coords are zero (e.g. from older SDK or missing data)
+                     if (src_top_x == 0 && src_top_y == 0 && src_bot_x == 0 && src_bot_y == 0) {
+                         src_top_x = (int)((min_c + max_c + 1) / 2.0f * bw);
+                         src_top_y = min_r * bh;
+                         src_bot_x = (int)((min_c + max_c + 1) / 2.0f * bw);
+                         src_bot_y = (max_r + 1) * bh;
+                     }
                      
                      // Top (Red)
                      drawRectRGB(final_mask, W, H, src_top_x-2, src_top_y-2, 5, 5, 255, 0, 0, 3);
