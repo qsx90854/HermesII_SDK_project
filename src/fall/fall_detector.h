@@ -117,6 +117,9 @@ public:
     // Set Background explicitely
     void SetBackground(const Image& frame);
 
+    // Get the internal background image as a flattened buffer
+    void GetBackgroundImage(std::vector<uint8_t>& out_bg) const;
+
     // Set the number of previous frames to check for block changes (default 5)
     // Set the number of previous frames to check for block changes (default 5)
     void SetHistorySize(int n);

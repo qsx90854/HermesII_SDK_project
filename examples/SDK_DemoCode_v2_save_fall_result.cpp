@@ -36,7 +36,8 @@ using namespace VisionSDK;
 
 #define SAVE_ALL_TEST_IMAGES 0
 #define SAVE_GRID_IMAGE 1
-#define SAVE_FACE_IMAGES 1
+#define SAVE_FACE_IMAGES 0
+#define DRAW_PERSPECTIVE_AND_AXIS 0
 // Drawing Helper
 void drawRectRGB(std::vector<uint8_t>& img, int w, int h, int x, int y, int rw, int rh, uint8_t r, uint8_t g, uint8_t b, int thickness=2) {
     if (x < 0) x = 0; if (y < 0) y = 0;
@@ -544,6 +545,10 @@ struct ObjStatsHistory {
     std::deque<int> red_hist_long;
     std::deque<int> area_hist_long;
     
+    // NEW: Centroid History for Trajectory Drawing (30 frames)
+    std::deque<float> cx_hist;
+    std::deque<float> cy_hist;
+    
     // NEW: Peak-valley tracking
     int red_peak_value = 0;           // Recorded peak value
     int red_peak_frame_offset = -1;   // Frames since peak
@@ -746,7 +751,9 @@ int main(int argc, char** argv) {
     std::vector<uint8_t> file_buffer(frame_size_rgb);
     sdk.SetInputMemory(file_buffer.data(), W, H, 3);
     current_frame_rgb = std::vector<uint8_t>(frame_size_rgb);
+#if (SAVE_ALL_TEST_IMAGES || SAVE_GRID_IMAGE)
     clean_frame_rgb = std::vector<uint8_t>(frame_size_rgb);
+#endif
     // current_frame_rgb_onlyBlock removed (unused)
 
     mkdir(save_dir.c_str(), 0777);
@@ -833,7 +840,7 @@ int main(int argc, char** argv) {
                     long expected_orig_size = (long)origW * origH * 3;
                     
                     if (size == expected_orig_size) {
-                        printf("[Demo] RAW Image Size Mismatch (%ld vs %d). Attempting Resize %dx%d -> %dx%d\n", size, W*H*3, origW, origH, W, H);
+                        printf("[Demo] RAW Image Size Mismatch (%ld vs %d). Attempting Resize %dx%d -> %dx%d\n", (long)size, W*H*3, origW, origH, W, H);
                         std::vector<uint8_t> raw_orig(size);
                         if (fbg.read((char*)raw_orig.data(), size)) {
                             bg_reference.resize(W * H * 3);
@@ -853,7 +860,7 @@ int main(int argc, char** argv) {
                             printf("[Demo] Success: Set Resized Background from RAW.\n");
                         }
                     } else {
-                         printf("[Demo] Warning: Background Image size mismatch! Expected %d or %ld, Got %ld. Ignoring.\n", W*H*3, expected_orig_size, size);
+                         printf("[Demo] Warning: Background Image size mismatch! Expected %d or %ld, Got %ld. Ignoring.\n", W*H*3, (long)expected_orig_size, (long)size);
                     }
                 }
             } else {
@@ -980,7 +987,9 @@ int main(int argc, char** argv) {
 
         // Copy for drawing
         memcpy(current_frame_rgb.data(), file_buffer.data(), frame_size_rgb);
+#if (SAVE_ALL_TEST_IMAGES || SAVE_GRID_IMAGE)
         memcpy(clean_frame_rgb.data(), file_buffer.data(), frame_size_rgb);
+#endif
         // (current_frame_rgb_onlyBlock removed)
         current_frame_idx = i;
         is_fall_in_current_frame = false; // Reset
@@ -1062,19 +1071,18 @@ int main(int argc, char** argv) {
 
         // --- PREPARE BG MASK IMG (User Request) ---
         // Compute Diff for Object Bounding Boxes (to capture holes)
+        
+        std::vector<uint8_t> bg_mask_img;
+#if (SAVE_ALL_TEST_IMAGES || SAVE_GRID_IMAGE)
         int grid_cols = cfg.getInt("Motion.Grid_Cols", 80);
         int grid_rows = cfg.getInt("Motion.Grid_Rows", 45);
-        int bw = W / grid_cols;
-        int bh = H / grid_rows;
-
-        std::vector<uint8_t> bg_mask_img;
         if (bg_saved_flag && !bg_reference.empty()) {
              printf("[Debug] Step 2: Entering BG Mask Gen (Frame %d)\n", i);
              bg_mask_img.resize(W*H*3, 0); // Black
              double bg_diff_thr = (double)fallCfg.bg_diff_threshold; 
              if (bg_diff_thr < 1.0) bg_diff_thr = 30.0;
              
-             printf("[Debug] BBox Scan Init. W=%d H=%d bw=%d bh=%d. bg_ref_sz=%zu\n", W, H, bw, bh, bg_reference.size());
+             printf("[Debug] BBox Scan Init. W=%d H=%d bw=%d bh=%d. bg_ref_sz=%zu\n", W, H, W/grid_cols, H/grid_rows, bg_reference.size());
 
              // Compute Global Diff (Moved OUTSIDE object loop)
              int startX = 0;
@@ -1116,7 +1124,10 @@ int main(int argc, char** argv) {
                      }
                  }
              }
+        }
+#endif
 
+#if (SAVE_ALL_TEST_IMAGES || SAVE_GRID_IMAGE)
              for (const auto& obj : objects) {
                  // 1. Find Bounding Box of Blocks (Keep logic for Hull/Stats if needed, but not for mask filling)
                  int min_c = grid_cols, max_c = 0;
@@ -1132,6 +1143,7 @@ int main(int argc, char** argv) {
                  
                  // 2. Scan Bounding Box - REMOVED MASK FILLING FROM HERE
              }
+#endif
  
              // --- MORPHOLOGY (Erosion -> Dilation) [User Request: Fix Noise] ---
              // DISABLED to match SDK internal logic (which uses raw diff count inside hull)
@@ -1176,7 +1188,6 @@ int main(int argc, char** argv) {
              }
              bg_mask_img = result_mask; // Final Morph Result
              */
-         }
          //printf("[Debug] Step 3: Morphology Disabled\n");
         // ------------------------------------------
 
@@ -1184,12 +1195,10 @@ int main(int argc, char** argv) {
         // 2. Draw Bed (Blue)
         if (bed_points_sorted.size() == 4) {
             for(int k=0; k<4; k++) {
-            for(int k=0; k<4; k++) {
                 drawLine(current_frame_rgb, W, H, 
                          bed_points_sorted[k].first, bed_points_sorted[k].second, 
                          bed_points_sorted[(k+1)%4].first, bed_points_sorted[(k+1)%4].second, 
                          0, 0, 255);
-            }
             }
         }
         
@@ -1207,9 +1216,11 @@ int main(int argc, char** argv) {
         int largest_obj_pixel_count = 0;
         int largest_obj_red_count = 0;
 
-#if (SAVE_ALL_TEST_IMAGES || SAVE_GRID_IMAGE)
         std::vector<ObjectFeatures> ff_objs = sdk.GetFullFrameObjects();
+
+#if (SAVE_ALL_TEST_IMAGES || SAVE_GRID_IMAGE)
         std::vector<uint8_t> ff_viz_img(W * H * 3, 0); // Start with black
+#endif
         
         // Sort to get top 2
         std::sort(ff_objs.begin(), ff_objs.end(), [](const ObjectFeatures& a, const ObjectFeatures& b) {
@@ -1244,10 +1255,7 @@ int main(int argc, char** argv) {
             for (size_t i_pix = 0; i_pix < f_obj.pixels.size(); ++i_pix) {
                 int pix_idx = f_obj.pixels[i_pix];
                 if (pix_idx >= 0 && pix_idx < W * H) {
-                    int py = pix_idx / W;
-                    int px = pix_idx % W;
-
-                    uint8_t r, g, b;
+                    uint8_t r = 0, g = 0, b = 0;
                     if (is_highlighted) {
                          r = 255; g = 255; b = 0; // Yellow for Perspective-Checked Object
                     } else if (i_obj == 0) {
@@ -1280,9 +1288,11 @@ int main(int argc, char** argv) {
                         }
                     }
 
+#if (SAVE_ALL_TEST_IMAGES || SAVE_GRID_IMAGE)
                     ff_viz_img[pix_idx * 3] = r;
                     ff_viz_img[pix_idx * 3 + 1] = g;
                     ff_viz_img[pix_idx * 3 + 2] = b;
+#endif
                 }
             }
             if (i_obj == 0) {
@@ -1310,7 +1320,10 @@ int main(int argc, char** argv) {
             }
 
             // Strict match: 80 pixels (Confirmed scale is correct)
-            if (min_dist > 80.0f) persistent_id = (f_obj.id + 5000); 
+            static int unmatched_counter = 5000;
+            if (min_dist > 80.0f) {
+                persistent_id = unmatched_counter++;
+            }
 
             int obj_id = persistent_id;
             auto& hist = obj_histories[obj_id];
@@ -1324,6 +1337,10 @@ int main(int argc, char** argv) {
                 hist.red_hist_long.push_back(red_count);
                 hist.area_hist_long.push_back(f_obj.area);
                 
+                // NEW: Track Centroid History
+                hist.cx_hist.push_back(f_obj.cx);
+                hist.cy_hist.push_back(f_obj.cy);
+                
                 float current_lk_s = (lk_pix_count > 0) ? (lk_sum_speed / lk_pix_count) : 0.0f;
                 hist.current_lk_accel = 0.0f;
                 if (!hist.lk_strength_hist.empty()) {
@@ -1336,6 +1353,8 @@ int main(int argc, char** argv) {
                 if (hist.area_hist.size() > 30) hist.area_hist.pop_front();
                 if (hist.red_hist.size() > 30) hist.red_hist.pop_front();
                 if (hist.lk_strength_hist.size() > 30) hist.lk_strength_hist.pop_front();
+                if (hist.cx_hist.size() > 30) hist.cx_hist.pop_front();
+                if (hist.cy_hist.size() > 30) hist.cy_hist.pop_front();
                 
                 // NEW: Maintain long-term buffer size (120 frames)
                 if (hist.red_hist_long.size() > 120) hist.red_hist_long.pop_front();
@@ -1347,155 +1366,40 @@ int main(int argc, char** argv) {
                 if (f_obj.area > hist.area_hist.back()) {
                     hist.area_hist.back() = f_obj.area;
                     hist.red_hist.back() = red_count;
+                    hist.cx_hist.back() = f_obj.cx;
+                    hist.cy_hist.back() = f_obj.cy;
                 }
             }
 
+            // ==========================================================
+            // NEW: Draw Trajectory (Last 30 Frames Centroid Path)
+            // ==========================================================
+#if (SAVE_ALL_TEST_IMAGES || SAVE_GRID_IMAGE)
+            if (hist.cx_hist.size() >= 2) {
+                for (size_t k = 1; k < hist.cx_hist.size(); ++k) {
+                    int px1 = (int)hist.cx_hist[k - 1];
+                    int py1 = (int)hist.cy_hist[k - 1];
+                    int px2 = (int)hist.cx_hist[k];
+                    int py2 = (int)hist.cy_hist[k];
+                    
+                    // Draw Trajectory Line (Green)
+                    drawLine(ff_viz_img, W, H, px1, py1, px2, py2, 0, 255, 0, 2);
+                    printf("draw trajectory: %d %d %d %d\n", px1, py1, px2, py2);
+                }
+            }
+#endif
+            // ==========================================================
 
             // ========== NEW: Peak-Valley Detection Algorithm ==========
             bool fall_detected = false;
-            int peak_red = 0;
-            int peak_idx = -1;
-            float decline_ratio = 0.0f;
-            float recent_avg_red = 0.0f;
-            bool area_declined = false;
-            
-            // Need at least 60 frames of history for peak detection
-            if (hist.red_hist_long.size() >= 60) {
-                
-                // Step 1: Find peak in past 60-120 frames
-                int history_size = hist.red_hist_long.size();
-                
-                // Search from at least 30 frames ago, up to 90 frames ago
-                int search_start = std::max(30, history_size - 90);
-                int search_end = history_size - 5; // Leave 5-frame buffer
-                
-                for (int idx = search_start; idx < search_end; ++idx) {
-                    int val = hist.red_hist_long[idx];
-                    
-                    // Check if this is a local peak (higher than +/- 10 frames around it)
-                    bool is_peak = true;
-                    for (int offset = -10; offset <= 10; ++offset) {
-                        if (offset == 0) continue;
-                        int check_idx = idx + offset;
-                        if (check_idx >= 0 && check_idx < history_size) {
-                            if (hist.red_hist_long[check_idx] > val) {
-                                is_peak = false;
-                                break;
-                            }
-                        }
-                    }
-                    
-                    if (is_peak && val > peak_red) {
-                        peak_red = val;
-                        peak_idx = idx;
-                    }
-                }
-                
-                // Step 2: Check for significant decline from peak  
-                // FILTER: 提高peak閾值,過濾低峰值誤判(FP1: peak=372)
-                if (peak_red > 400) { // Raised from 300 to 400
-                    int current_red = hist.red_hist_long.back();
-                    decline_ratio = (float)(peak_red - current_red) / peak_red;
-                    
-                    // Decline must be > 60%
-                    if (decline_ratio > 0.6f) {
-                        
-                        // Step 3: Verify sustained low value
-                        // Check average of recent 30 frames
-                        int recent_sum = 0;
-                        int recent_count = std::min(30, (int)hist.red_hist_long.size());
-                        for (int j = history_size - recent_count; j < history_size; ++j) {
-                            recent_sum += hist.red_hist_long[j];
-                        }
-                        recent_avg_red = (float)recent_sum / recent_count;
-                        
-                        // NEW FILTER: RecentAvg下限 - 過濾物體消失的情況
-                        // Data4 FP: RecentAvg=0-43 (物體離開視野)
-                        // Real falls: RecentAvg=187-345 (人倒在地上仍可見)
-                        if (recent_avg_red < 80.0f) {
-                            // Recent avg太低,可能是物體已離開視野或太小
-                            fall_detected = false;
-                            break; // Exit the peak-valley check
-                        }
-                        
-                        // Recent average must be < 30% of peak (strictened from 40%)
-                        // Real falls: <6.3%, FP1: 32-40%
-                        if (recent_avg_red < peak_red * 0.30f) {
-                            
-                            // Step 4: Check foreground area decline
-                            if (hist.area_hist_long.size() >= 60 && peak_idx >= 0) {
-                                int peak_area = hist.area_hist_long[peak_idx];
-                                int current_area = hist.area_hist_long.back();
-                                
-                                // Area decline > 40%
-                                if (peak_area > 500 && current_area < peak_area * 0.6f) {
-                                    area_declined = true;
-                                }
-                            }
-                            
-                            // Mark as fall detected if area declined
-                            fall_detected = area_declined;
-                        }
-                    }
-                }
-            }
-
-            // Axial Inconsistency Check (unchanged)
-            float dx_p = f_obj.cx - (float)perspective_x;
-            float dy_p = f_obj.cy - (float)perspective_y;
-            float p_angle = std::atan2(dy_p, dx_p);
-            float diff = std::abs(f_obj.angle - p_angle);
-            while (diff > M_PI/2.0f) diff = std::abs(diff - (float)M_PI);
-            bool inconsistent = (diff > 0.785f); // > 45 deg
-
-            // Complete the fall detection by combining with angle inconsistency
-            if (fall_detected || (inconsistent && hist.red_hist_long.size() >= 60 && peak_red > 400)) {
-                fall_detected = true;
-            } else {
-                fall_detected = false;
-            }
-
+ 
             // Final Custom Signal Decision
             // Logic: Peak-Valley Decline detected AND (Area declined OR Angle inconsistent)
-            if (fall_detected) {
-                
-                // Human-size guard: Real falls are usually > 300 pixels
-                bool size_ok = (f_obj.area > 300 && f_obj.area < 30000);
-
-                // --- Bed Region Filtering ---
-                int in_bed_count = 0;
-                if (!bed_points_sorted.empty()) {
-                    std::vector<std::pair<float, float>> poly;
-                    for(auto& p : bed_points_sorted) poly.push_back({(float)p.first, (float)p.second});
-                    for(int pix_idx : f_obj.pixels) {
-                        int py = pix_idx / W;
-                        int px = pix_idx % W;
-                        if (isPointInConvexQuad(poly, (float)px, (float)py)) {
-                            in_bed_count++;
-                        }
-                    }
-                }
-                float bed_ratio = (f_obj.pixels.size() > 0) ? (float)in_bed_count / f_obj.pixels.size() : 0.0f;
-                bool not_in_bed = (bed_ratio < bed_pixel_ratio_threshold);
-
-                if (size_ok && not_in_bed) {
-                    custom_fall_signal = true;
-                    
-                    // Detailed Trigger Logging: Peak-Valley Detection
-                    current_frame_reasons += "PeakDecline;";
-                    
-                    std::cout << "[CUSTOM_FALL] Frame:" << i << " ID:" << obj_id 
-                              << " Trigger:PeakDecline"
-                              << " Peak:" << peak_red << " Current:" << hist.red_hist_long.back()
-                              << " Decline:" << (int)(decline_ratio*100) << "%"
-                              << " RecentAvg:" << (int)recent_avg_red
-                              << " BedRatio:" << bed_ratio
-                              << " Area:" << f_obj.area 
-                              << " Inconsistent:" << inconsistent << std::endl;
-                }
-            }
+            
 
             // Draw Major Axis for top 2
+#if (SAVE_ALL_TEST_IMAGES || SAVE_GRID_IMAGE)
+#if DRAW_PERSPECTIVE_AND_AXIS
             float major = f_obj.major;
             float angle_pca = f_obj.angle;
             float cx = f_obj.cx;
@@ -1543,9 +1447,10 @@ int main(int argc, char** argv) {
                  drawArrow(ff_viz_img, W, H, (int)cx, (int)cy, p_x2, p_y2, 0, 255, 255, 2);
             }
             // ==========================================================
+#endif // DRAW_PERSPECTIVE_AND_AXIS
+#endif
         }
-#endif // SAVE_ALL_TEST_IMAGES || SAVE_GRID_IMAGE
-
+        
         // Override SDK fall signal
         static int custom_hold_frames = 0;
         if (custom_fall_signal) custom_hold_frames = 30; // Hold for 1 second at 30fps
@@ -1587,7 +1492,11 @@ int main(int argc, char** argv) {
                      std::string combined_reasons = "";
                      for(const auto& r : current_interval_reasons_set) combined_reasons += r + " ";
                      
-                     detected_intervals_vec.push_back({fall_start_frame, (int)(i - 1), combined_reasons});
+                     FallInterval new_interval;
+                     new_interval.start = fall_start_frame;
+                     new_interval.end = i - 1;
+                     new_interval.reasons = combined_reasons;
+                     detected_intervals_vec.push_back(new_interval);
                      total_fall_events++;
                 }
             }
@@ -1671,10 +1580,10 @@ int main(int argc, char** argv) {
 #endif // SAVE_ALL_TEST_IMAGES || SAVE_GRID_IMAGE
         
         
+#if (SAVE_ALL_TEST_IMAGES || SAVE_GRID_IMAGE)
         // 3. Draw Changed Blocks (Green)
         int cols = motionCfg.grid_cols;
         int rows = motionCfg.grid_rows;
-#if (SAVE_ALL_TEST_IMAGES || SAVE_GRID_IMAGE)
         if ((int)changed_blocks.size() == cols * rows) {
              float bw = (float)W / cols;
              float bh = (float)H / rows;
@@ -1692,6 +1601,7 @@ int main(int argc, char** argv) {
         }
 #endif // SAVE_ALL_TEST_IMAGES || SAVE_GRID_IMAGE
 
+#if (SAVE_ALL_TEST_IMAGES || SAVE_GRID_IMAGE)
         // 4. Draw Objects (Blocks + Arrows)
         // Find object with max strength to highlight as "Fall Object" if fall detected
         int max_strength_id = -1;
@@ -1704,6 +1614,7 @@ int main(int argc, char** argv) {
                 }
             }
         }
+#endif
 
         // -------------------------------------------------------------
         // NEW: Filter bg_mask_img using Convex Hull (Match SDK Logic)
@@ -2150,8 +2061,10 @@ int main(int argc, char** argv) {
 #endif // SAVE_ALL_TEST_IMAGES || SAVE_GRID_IMAGE
 
         // Log Largest Object Stats (ID 0)
+#if (SAVE_ALL_TEST_IMAGES || SAVE_GRID_IMAGE)
         if (f_log_fg.is_open())  f_log_fg  << i << " 0 " << largest_obj_pixel_count << "\n";
         if (f_log_bri.is_open()) f_log_bri << i << " 0 " << largest_obj_red_count << "\n";
+#endif
         
         // 5. Draw All Vectors (Optional, user asked for "each object vector")
         // "各個物件...還有各物件的向量" -> Handled above.
@@ -2319,9 +2232,20 @@ int main(int argc, char** argv) {
             paste(current_frame_rgb, W, H, 0, 0);      // top-left:  main frame
             paste(ff_viz_img, W, H, W, 0);              // top-right: FG groups
             paste(bev_img_frame_sized, W, H, 0, H);    // bot-left:  BEV
-            // bg_mask might be empty if not enabled; fall back to black
-            if (!bg_mask_img.empty()) {
-                paste(bg_mask_img, W, H, W, H);         // bot-right: BG mask
+            // Extract Background from SDK
+            std::vector<uint8_t> sdk_bg_gray;
+            sdk.GetBackgroundImage(sdk_bg_gray);
+            
+            if (!sdk_bg_gray.empty()) {
+                std::vector<uint8_t> sdk_bg_rgb(W * H * 3, 0);
+                for (int p = 0; p < W * H; ++p) {
+                    sdk_bg_rgb[p*3] = sdk_bg_gray[p];
+                    sdk_bg_rgb[p*3+1] = sdk_bg_gray[p];
+                    sdk_bg_rgb[p*3+2] = sdk_bg_gray[p];
+                }
+                paste(sdk_bg_rgb, W, H, W, H);          // bot-right: SDK Background
+            } else if (!bg_mask_img.empty()) {
+                paste(bg_mask_img, W, H, W, H);         // bot-right: Fallback to BG mask
             }
 
             char grid_filename[256];
@@ -2340,7 +2264,11 @@ int main(int argc, char** argv) {
         // reuse static set? No, it's outside main loop now. 
         // We'll just put "Unknown/AtEnd" or similar if we didn't capture.
         // But better to just close it.
-        detected_intervals_vec.push_back({fall_start_frame, (int)(total_frames - 1), "AtEnd"});
+        FallInterval new_interval;
+        new_interval.start = fall_start_frame;
+        new_interval.end = (int)(total_frames - 1);
+        new_interval.reasons = "AtEnd";
+        detected_intervals_vec.push_back(new_interval);
         total_fall_events++;
     }
     

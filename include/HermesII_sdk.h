@@ -346,6 +346,12 @@ public:
     StatusCode SetBackground(const unsigned char* buffer, int width, int height, int channels);
 
     /**
+     * @brief Get the internal background image as a flattened buffer.
+     * The output will be a 1-channel grayscale image data array (width * height).
+     */
+    void GetBackgroundImage(std::vector<uint8_t>& out_bg) const;
+
+    /**
      * @brief Trigger the SDK to process the current frame in the shared buffer.
      * The result will be reported via the registered FallCallback.
      * 

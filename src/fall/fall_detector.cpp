@@ -22,7 +22,7 @@
 
 // Define this to 1 to enable debug prints in this file, or 0 to suppress them
 #ifndef ENABLE_DEBUG_PRINT
-#define ENABLE_DEBUG_PRINT 1
+#define ENABLE_DEBUG_PRINT 0
 #endif
 
 #if ENABLE_DEBUG_PRINT
@@ -2450,7 +2450,6 @@ public:
                 return; // During init, don't run normal update
             }
         }
-        DEBUG_PRINT("[AAAAA] updateBackground.\n");
         // 2. Periodic Update Phase
         float alpha = cfg.bg_update_alpha;
         if (alpha <= 0.0f) return;
@@ -2475,7 +2474,6 @@ public:
                 }
             }
         }
-        DEBUG_PRINT("[BBBBBBBB] updateBackground.\n");
         // Optimization: Pre-calculate block dimensions
         int W = current.width();
         int H = current.height();
@@ -2548,7 +2546,6 @@ public:
         if (total_fg_blocks > 0) {
             // DEBUG_PRINT("[Debug] updateBackground Selective: Skipped %d FG blocks.\n", total_fg_blocks);
         }
-        DEBUG_PRINT("[CCCCCCCC] updateBackground.\n");
     }
 };
 
@@ -5800,6 +5797,23 @@ void FallDetector::SetBackground(const Image& frame) {
     pImpl->backgroundFrame = wrapper;
     pImpl->background_initialized_externally = true; 
     DEBUG_PRINT("[FallDetector] Background Explicitly Set.\n");
+}
+
+void FallDetector::GetBackgroundImage(std::vector<uint8_t>& out_bg) const {
+    if (!pImpl || pImpl->backgroundFrame.empty()) {
+        out_bg.clear();
+        return;
+    }
+    
+    int size = pImpl->backgroundFrame.width() * pImpl->backgroundFrame.height();
+    if (size <= 0) {
+        out_bg.clear();
+        return;
+    }
+    
+    out_bg.resize(size);
+    // Assuming backgroundFrame is 1-channel Grayscale as set in SetBackground and updateBackground
+    std::memcpy(out_bg.data(), pImpl->backgroundFrame.getData(), size);
 }
 
 std::vector<uint8_t> FallDetector::GetChangedBlocks() const {

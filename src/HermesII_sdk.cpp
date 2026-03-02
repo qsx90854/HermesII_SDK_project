@@ -314,6 +314,10 @@ StatusCode VisionSDK::VisionSDK::SetBackground(const unsigned char* buffer, int 
     return StatusCode::OK;
 }
 
+void VisionSDK::VisionSDK::GetBackgroundImage(std::vector<uint8_t>& out_bg) const {
+    pImpl->fall_detector.GetBackgroundImage(out_bg);
+}
+
 StatusCode VisionSDK::VisionSDK::ProcessNextFrame() {
     if (!pImpl->input_buffer) return StatusCode::ERROR_INVALID_INPUT;
 
