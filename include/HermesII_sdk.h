@@ -85,6 +85,7 @@ struct FallDetection_v3 {
     int fall_window_size = 0;
     int fall_duration = 0;
     bool enable_face_detection = true;
+    int face_detect_interval_frames = 1; // NEW: Control face detection frequency
     bool enable_save_bg_mask = false;
     int bg_init_start_frame = 0;
     int bg_init_end_frame = 0;

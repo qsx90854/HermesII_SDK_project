@@ -120,6 +120,7 @@ StatusCode VisionSDK::VisionSDK::SetConfig(const void* config) {
             pImpl->config.fall_window_size = c->fall_window_size;
             pImpl->config.fall_duration = c->fall_duration;
             pImpl->config.enable_face_detection = c->enable_face_detection;
+            pImpl->config.face_detect_interval_frames = c->face_detect_interval_frames;
             pImpl->config.bg_update_interval_frames = c->bg_update_interval_frames;
             pImpl->config.bg_update_alpha = c->bg_update_alpha;
             pImpl->config.enable_save_bg_mask = c->enable_save_bg_mask;

@@ -22,7 +22,7 @@
 
 // Define this to 1 to enable debug prints in this file, or 0 to suppress them
 #ifndef ENABLE_DEBUG_PRINT
-#define ENABLE_DEBUG_PRINT 0
+#define ENABLE_DEBUG_PRINT 1
 #endif
 
 #if ENABLE_DEBUG_PRINT
@@ -469,7 +469,8 @@ public:
     void PrintTimings() {
          if (ENABLE_DEBUG_PRINT) std::cout << "\n=== AVG TIMINGS ===\n";
          for(auto& kv : profiler.total_ms) {
-             if (ENABLE_DEBUG_PRINT) std::cout << kv.first << ": " << kv.second << " ms\n";
+             uint64_t count = profiler.calls[kv.first];
+             if (ENABLE_DEBUG_PRINT) std::cout << kv.first << ": " << kv.second << " ms (Calls: " << count << ")\n";
          }
     }
 
@@ -2275,6 +2276,8 @@ public:
 
     // Face Model Init State
     bool face_model_inited = false;
+    bool last_has_face = false;
+    FaceROI last_face_roi = {0,0,0,0,0.0f};
     
     // Tracking
     std::map<int, KalmanFilter> kalmanFilters;
@@ -2512,32 +2515,97 @@ public:
                     int row_offset = y * W * C;
                     int bed_row_offset = y * bed_w;
                     
-                    for (int x = x_start; x < x_end; ++x) {
-                        int pix_idx = row_offset + x * C;
+                    int x = x_start;
+                    
+                    if (bed_ptr == nullptr) {
+                        // NO BED MASK: Fast NEON Path
+#if defined(__ARM_NEON) || defined(__ARM_NEON__)
+                        int vec_len = x_end - x;
+                        uint16x8_t valpha = vdupq_n_u16(alpha_int);
+                        uint16x8_t vinv_alpha = vdupq_n_u16(inv_alpha);
                         
-                        // Default Alpha
-                        int current_alpha = alpha_int;
-                        int current_inv_alpha = inv_alpha;
-                        
-                        // Check Bed Region (Fast Update)
-                        if (bed_ptr) {
-                            // Map x,y to bedMask coordinates (assuming same size)
-                            if (x < bed_w && bed_ptr[bed_row_offset + x] == 0) {
-                                // 0 = Bed Region. 
-                                // Increase Alpha for Bed Region (Fast Update for Ghost Removal)
-                                // Multiplier from Config (Default 4.0)
-                                int fast_alpha = (int)(alpha_int * cfg.bed_update_alpha_multiplier); 
-                                if (fast_alpha > 256) fast_alpha = 256;
-                                current_alpha = fast_alpha; 
-                                current_inv_alpha = 256 - fast_alpha;
+                        while (vec_len >= 16) {
+                            int pix_idx = row_offset + x * C;
+                            
+                            if (C == 3) {
+                                // Load 16 RGB pixels (48 bytes)
+                                uint8x16x3_t vbg = vld3q_u8(bg_ptr + pix_idx);
+                                uint8x16x3_t vcurr = vld3q_u8(curr_ptr + pix_idx);
+                                
+                                for (int k = 0; k < 3; ++k) {
+                                    // Process low 8 pixels
+                                    uint16x8_t bg_lo = vmovl_u8(vget_low_u8(vbg.val[k]));
+                                    uint16x8_t curr_lo = vmovl_u8(vget_low_u8(vcurr.val[k]));
+                                    uint16x8_t res_lo = vmulq_u16(bg_lo, vinv_alpha);
+                                    res_lo = vmlaq_u16(res_lo, curr_lo, valpha);
+                                    uint8x8_t out_lo = vmovn_u16(vshrq_n_u16(res_lo, 8));
+                                    
+                                    // Process high 8 pixels
+                                    uint16x8_t bg_hi = vmovl_u8(vget_high_u8(vbg.val[k]));
+                                    uint16x8_t curr_hi = vmovl_u8(vget_high_u8(vcurr.val[k]));
+                                    uint16x8_t res_hi = vmulq_u16(bg_hi, vinv_alpha);
+                                    res_hi = vmlaq_u16(res_hi, curr_hi, valpha);
+                                    uint8x8_t out_hi = vmovn_u16(vshrq_n_u16(res_hi, 8));
+                                    
+                                    vbg.val[k] = vcombine_u8(out_lo, out_hi);
+                                }
+                                
+                                vst3q_u8(bg_ptr + pix_idx, vbg);
+                                
+                            } else if (C == 1) {
+                                uint8x16_t vbg = vld1q_u8(bg_ptr + pix_idx);
+                                uint8x16_t vcurr = vld1q_u8(curr_ptr + pix_idx);
+                                
+                                uint16x8_t bg_lo = vmovl_u8(vget_low_u8(vbg));
+                                uint16x8_t curr_lo = vmovl_u8(vget_low_u8(vcurr));
+                                uint16x8_t res_lo = vmulq_u16(bg_lo, vinv_alpha);
+                                res_lo = vmlaq_u16(res_lo, curr_lo, valpha);
+                                uint8x8_t out_lo = vmovn_u16(vshrq_n_u16(res_lo, 8));
+                                
+                                uint16x8_t bg_hi = vmovl_u8(vget_high_u8(vbg));
+                                uint16x8_t curr_hi = vmovl_u8(vget_high_u8(vcurr));
+                                uint16x8_t res_hi = vmulq_u16(bg_hi, vinv_alpha);
+                                res_hi = vmlaq_u16(res_hi, curr_hi, valpha);
+                                uint8x8_t out_hi = vmovn_u16(vshrq_n_u16(res_hi, 8));
+                                
+                                vst1q_u8(bg_ptr + pix_idx, vcombine_u8(out_lo, out_hi));
+                            }
+                            
+                            x += 16;
+                            vec_len -= 16;
+                        }
+#endif
+                        // Scalar tail for NO BED MASK
+                        for (; x < x_end; ++x) {
+                            int pix_idx = row_offset + x * C;
+                            for (int k = 0; k < C; ++k) {
+                                int idx = pix_idx + k;
+                                int val = (bg_ptr[idx] * inv_alpha + curr_ptr[idx] * alpha_int) >> 8;
+                                bg_ptr[idx] = (unsigned char)val;
                             }
                         }
+                    } else {
+                        // BED MASK: Scalar Path (due to varying per-pixel alpha)
+                        int fast_alpha = (int)(alpha_int * cfg.bed_update_alpha_multiplier); 
+                        if (fast_alpha > 256) fast_alpha = 256;
+                        int fast_inv_alpha = 256 - fast_alpha;
+                        
+                        for (; x < x_end; ++x) {
+                            int pix_idx = row_offset + x * C;
+                            
+                            int current_alpha = alpha_int;
+                            int current_inv_alpha = inv_alpha;
+                            
+                            if (x < bed_w && bed_ptr[bed_row_offset + x] == 0) {
+                                current_alpha = fast_alpha; 
+                                current_inv_alpha = fast_inv_alpha;
+                            }
 
-                        for (int k = 0; k < C; ++k) {
-                            int idx = pix_idx + k;
-                            // Update
-                            int val = (bg_ptr[idx] * current_inv_alpha + curr_ptr[idx] * current_alpha) >> 8;
-                            bg_ptr[idx] = (unsigned char)val;
+                            for (int k = 0; k < C; ++k) {
+                                int idx = pix_idx + k;
+                                int val = (bg_ptr[idx] * current_inv_alpha + curr_ptr[idx] * current_alpha) >> 8;
+                                bg_ptr[idx] = (unsigned char)val;
+                            }
                         }
                     }
                 }
@@ -3490,12 +3558,11 @@ StatusCode FallDetector::Detect(const Image& frame, bool& is_fall) {
     int global_fg_count = 0;
     if (pImpl->backgroundFrame.width() > 0) 
     {
-        // TimerGuard moved to inner scope to protect maskData lifetime
+        TimerGuard t_mask(g_perf_timer, "1_1_BGMask_And_FindObj");
         // Create Binary Mask
         int w = wrapper.width();
         int h = wrapper.height();
         
-        TimerGuard t_alloc(g_perf_timer, "1_4_MaskAllocAndPrep");
         std::vector<unsigned char> maskData(w * h);
         const uint8_t* curr = wrapper.getData();
         const uint8_t* bg = pImpl->backgroundFrame.getData();
@@ -3504,9 +3571,6 @@ StatusCode FallDetector::Detect(const Image& frame, bool& is_fall) {
         const unsigned char* bed_data = (pImpl->hasBedMask) ? pImpl->bedMask.getData() : nullptr;
         int bed_w = (pImpl->hasBedMask) ? pImpl->bedMask.width() : 0;
         int bed_h = (pImpl->hasBedMask) ? pImpl->bedMask.height() : 0;
-
-        {
-        TimerGuard t_mask(g_perf_timer, "1_5_BGMask_FindObj");
 
         // NEON-accelerated BG diff → mask generation
         // Process 16 grayscale pixels per iteration on ARM.
@@ -3559,113 +3623,16 @@ StatusCode FallDetector::Detect(const Image& frame, bool& is_fall) {
 #endif
 
         // Identify and store full-frame foreground objects
-        // Identify and store full-frame foreground objects
         pImpl->full_frame_objects = find_objects_optimized(maskData.data(), w, h, 20, pImpl->config.foreground_merge_radius); // Min area 20, config merge radius
-    } // End BGMask Timer
-
-        // --- NEW: Optical Flow (Integer-LK) for top 2 objects ---
-    {
-    TimerGuard t_lk(g_perf_timer, "1_6_SparseLK");
-    //if ((int)pImpl->raw_frame_history.size() >= max_history) {
-            /*
-            // Sort objects by area descending
-            std::vector<::VisionSDK::ObjectFeatures*> sorted_objs;
-            for (auto& obj : pImpl->full_frame_objects) {
-                sorted_objs.push_back(&obj);
-            }
-            std::sort(sorted_objs.begin(), sorted_objs.end(), [](::VisionSDK::ObjectFeatures* a, ::VisionSDK::ObjectFeatures* b) {
-                return a->area > b->area;
-            });
-
-            // NEW: Robust LK uses smoothed frames
-            ::Image smoothed_prev, smoothed_curr;
-            pImpl->smoothImage(pImpl->raw_frame_history.front(), smoothed_prev);
-            pImpl->smoothImage(pImpl->raw_frame_history.back(), smoothed_curr);
-
-            const ::Image& prev_frame = smoothed_prev; 
-            const ::Image& curr_frame = smoothed_curr;
-
-            int num_to_process = std::min(2, (int)sorted_objs.size());
-            for (int i = 0; i < num_to_process; ++i) {
-                auto* obj = sorted_objs[i];
-#if defined(__ARM_NEON) || defined(__ARM_NEON__)
-                // OPTIMIZATION: Diabled unused LK calculation
-                // pImpl->computeIntegerLK_NEON(prev_frame, curr_frame, obj->pixels, obj->pixel_dx, obj->pixel_dy, obj->pixel_dir);
-#else
-                // pImpl->computeIntegerLK(prev_frame, curr_frame, sorted_objs[i]->pixels, sorted_objs[i]->pixel_dx, sorted_objs[i]->pixel_dy, sorted_objs[i]->pixel_dir);
-#endif
-            }
-            */
-       // }
-    } // End SparseLK Timer    
+        
         // Optional: Save BG Mask if configured
         if (pImpl->config.enable_save_bg_mask) {
              // (Logic for saving here if needed)
         }
     }
             
-            // Save
-            // char filename[256];
-            // // Ensure directory check (handled by caller possibly, but we should be safe)
-            // std::string savePath = pImpl->config.save_image_path.empty() ? "." : pImpl->config.save_image_path;
-            // snprintf(filename, sizeof(filename), "%s/bg_mask_%05d.bmp", savePath.c_str(), pImpl->frame_idx);
-            
-            // // SaveBMP (Minimal logic, header+data)
-            // FILE* f = fopen(filename, "wb");
-            // if(f) {
-            //     // Grayscale BMP Header? Or standard 24bit?
-            //     // 8-bit BMP requires Palette. 24-bit is easier.
-            //     // Let's save as 24-bit BGR for compatibility.
-            //     int filesize = 54 + 3 * w * h;
-            //     unsigned char bmpfileheader[14] = {'B','M', 0,0,0,0, 0,0,0,0, 54,0,0,0};
-            //     unsigned char bmpinfoheader[40] = {40,0,0,0, 0,0,0,0, 0,0,0,0, 1,0, 24,0};
-                
-            //     bmpfileheader[ 2] = (unsigned char)(filesize);
-            //     bmpfileheader[ 3] = (unsigned char)(filesize>>8);
-            //     bmpfileheader[ 4] = (unsigned char)(filesize>>16);
-            //     bmpfileheader[ 5] = (unsigned char)(filesize>>24);
-
-            //     bmpinfoheader[ 4] = (unsigned char)(w);
-            //     bmpinfoheader[ 5] = (unsigned char)(w>>8);
-            //     bmpinfoheader[ 6] = (unsigned char)(w>>16);
-            //     bmpinfoheader[ 7] = (unsigned char)(w>>24);
-            //     bmpinfoheader[ 8] = (unsigned char)(h); 
-            //     bmpinfoheader[ 9] = (unsigned char)(h>>8); // Negative for Top-Down? No, standard is Bottom-Up.
-            //     // If we want raw save, let's use +h (Top-Down inverse usually)
-            //     // Standard BMP: Height > 0 means Bottom-Up.
-            //     // Our data is Top-Down. To save correctly, we should flip or use negative height (some viewers support).
-            //     // Let's use negative height for Top-Down order if header allows (V5/V4 header).
-            //     // But simplified here: Just write Top-Down data with +Height -> Image will be flipped.
-            //     // We'll flip row writing.
-            //     bmpinfoheader[11] = (unsigned char)(h>>24);
-
-            //     fwrite(bmpfileheader,1,14,f);
-            //     fwrite(bmpinfoheader,1,40,f);
-                
-            //     int pad = (4 - (w * 3) % 4) % 4;
-            //     unsigned char bmppad[3] = {0,0,0};
-                
-            //     // Write Bottom-Up (h-1 to 0)
-            //     for(int y=h-1; y>=0; y--) {
-            //         for(int x=0; x<w; x++) {
-            //             unsigned char v = maskData[y*w+x];
-            //             unsigned char pixel[3] = {v,v,v};
-            //             fwrite(pixel, 1, 3, f);
-            //         }
-            //         fwrite(bmppad, 1, pad, f);
-            //     }
-            //     fclose(f);
-            // }
-
     #if ENABLE_PERF_PROFILING
     long long t1 = pImpl->get_now_us(); // Wrapper Init (Part of Motion Est prep)
-    #endif
-
-    #if ENABLE_PERF_PROFILING
-
-    // Wait, blockBasedMotionEstimation is called later!
-    // Moving t1, t2 logic...
-    // The previous block was JUST image conversion.
     #endif
 
     // --- 0. Face Detection Integration ---
@@ -3674,20 +3641,22 @@ StatusCode FallDetector::Detect(const Image& frame, bool& is_fall) {
     long long t_face_start = pImpl->get_now_us();
     #endif
 
-    bool has_face = false;
-    FaceROI face_roi = {0,0,0,0,0.0f};
+    bool has_face = pImpl->last_has_face;
+    FaceROI face_roi = pImpl->last_face_roi;
 
-    // Retry Init if failed in Config (Optional, or just rely on SetConfig)
-    if (pImpl->config.enable_face_detection && !pImpl->face_model_inited) {
-         // Try one more time? Or just skip?
-         // Let's print warning once?
-         // Or try to init again?
+    bool should_run_face_detect = pImpl->config.enable_face_detection;
+    if (should_run_face_detect && pImpl->config.face_detect_interval_frames > 1) {
+        if (pImpl->frame_idx % pImpl->config.face_detect_interval_frames != 0) {
+            should_run_face_detect = false;
+        }
+    }
+
+    // Retry Init if failed in Config
+    if (should_run_face_detect && !pImpl->face_model_inited) {
          StatusCode ret = pImpl->faceDetector.Init("res/blaze_face_detect_nnp310_128x128.ty");
          if (ret == StatusCode::OK) {
               pImpl->face_model_inited = true;
          } else {
-             // Print error every 100 frames to avoid spam?
-             // Just print error
              if (ENABLE_DEBUG_PRINT) std::cout << "[FallDetector::Detect] FaceDetector not initialized (Retry Failed: " << (int)ret << ")" << std::endl;
          }
     }
@@ -3695,9 +3664,10 @@ StatusCode FallDetector::Detect(const Image& frame, bool& is_fall) {
     // Resize for Face Detection (Uses RGB frame)
     Image faceInput;
     {
-    //TimerGuard t_facecrop(g_perf_timer, "1_8_FaceCrop");
-    TimerGuard t_face(g_perf_timer, "1_9_FaceDetect");
-    if (pImpl->config.enable_face_detection) {
+    TimerGuard t_face(g_perf_timer, "1_2_FaceDetect");
+    if (should_run_face_detect) {
+        has_face = false; // Reset before detection explicitly
+        
         // [CROP LOWER HALF OF BED REGION INTO A SQUARE]
         int bed_min_x = frame.width - 1, bed_max_x = 0;
         int bed_min_y = frame.height - 1, bed_max_y = 0;
@@ -3774,6 +3744,9 @@ StatusCode FallDetector::Detect(const Image& frame, bool& is_fall) {
         } else {
             // std::cout << "[FallDetector] Resize failed!" << std::endl;
         }
+        
+        pImpl->last_has_face = has_face;
+        pImpl->last_face_roi = face_roi;
     }
     }
 
@@ -4081,6 +4054,8 @@ StatusCode FallDetector::Detect(const Image& frame, bool& is_fall) {
     // =========================================================
     // NEW: Compute Pixel Stats (Count & Brightness)
     // =========================================================
+    {
+    TimerGuard t_pixel_stats(g_perf_timer, "4_1_PixelStats");
     const unsigned char* currData = frame.data;
     const unsigned char* bgData = pImpl->backgroundFrame.empty() ? nullptr : pImpl->backgroundFrame.getData();
     // Use existing W, H declarations
@@ -4280,24 +4255,21 @@ StatusCode FallDetector::Detect(const Image& frame, bool& is_fall) {
             int endX = std::min(W, (int)((max_c + 1) * bw));
             int endY = std::min(H, (int)((max_r + 1) * bh));
             
-            for(int y=startY; y<endY; ++y) {
-                // Optimization: Compute Grid Row once
-                int gr = y / bh;
-                
-                for(int x=startX; x<endX; ++x) {
-                    int gc = x / bw;
-                    
-                    // Point In Hull (Check Center of Grid Cell)
-                    double testX = gc + 0.5;
-                    double testY = gr + 0.5;
-                    
+            // Optimization 1: Precompute "inside" for each grid cell
+            int grid_h = max_r - min_r + 1;
+            int grid_w = max_c - min_c + 1;
+            std::vector<bool> cell_inside(grid_h * grid_w, false);
+            
+            size_t n = blockPts.size();
+            for (int r = min_r; r <= max_r; ++r) {
+                for (int c = min_c; c <= max_c; ++c) {
+                    double testX = c + 0.5;
+                    double testY = r + 0.5;
                     bool inside = false;
-                    size_t n = blockPts.size();
+                    
                     if (n < 3) {
-                        // Fallback
-                        inside = true; 
+                        inside = true;
                     } else {
-                        // Ray casting algorithm
                         for (size_t i = 0, j = n - 1; i < n; j = i++) {
                             if (((blockPts[i].y > testY) != (blockPts[j].y > testY)) &&
                                 (testX < (blockPts[j].x - blockPts[i].x) * (testY - blockPts[i].y) / (blockPts[j].y - blockPts[i].y) + blockPts[i].x)) {
@@ -4305,32 +4277,177 @@ StatusCode FallDetector::Detect(const Image& frame, bool& is_fall) {
                             }
                         }
                     }
+                    cell_inside[(r - min_r) * grid_w + (c - min_c)] = inside;
+                }
+            }
+
+            for(int y=startY; y<endY; ++y) {
+                int gr = y / bh;
+                int r_idx = gr - min_r;
+                
+                int x = startX;
+                while (x < endX) {
+                    int gc = x / bw;
+                    int c_idx = gc - min_c;
+                    
+                    bool inside = false;
+                    if (r_idx >= 0 && r_idx < grid_h && c_idx >= 0 && c_idx < grid_w) {
+                        inside = cell_inside[r_idx * grid_w + c_idx];
+                    }
+                    
+                    int next_block_x = std::min(endX, (gc + 1) * bw);
+                    int pixels_in_block = next_block_x - x;
                     
                     if (inside) {
-                        int idx = (y * W + x) * 3; 
-                        // Check Foreground
-                        int diff = 0;
-                        
+#if defined(__ARM_NEON) || defined(__ARM_NEON__)
                         if (pImpl->backgroundFrame.getChannels() == 1) {
-                            // BG is Gray, Input is RGB
-                            int bgVal = bgData[y * W + x];
-                            // Simple average or G channel?
-                            int grayVal = (currData[idx] + currData[idx+1]*2 + currData[idx+2]) / 4;
-                            diff = std::abs(grayVal - bgVal);
+                            // BG is Gray, Input is RGB (3 channels)
+                            uint8x16_t vthr = vdupq_n_u8((uint8_t)bg_thresh);
+                            int vec_len = pixels_in_block;
+                            
+                            while (vec_len >= 16) {
+                                int base_idx = y * W + x;
+                                int idx = base_idx * 3;
+                                
+                                // Load 16 RGB pixels (48 bytes) -> Need deinterleave, but vld3q_u8 is perfect
+                                uint8x16x3_t vrgb = vld3q_u8(currData + idx);
+                                
+                                // gray = (R + 2G + B) / 4
+                                uint16x8_t r_lo = vmovl_u8(vget_low_u8(vrgb.val[0]));
+                                uint16x8_t r_hi = vmovl_u8(vget_high_u8(vrgb.val[0]));
+                                uint16x8_t g_lo = vmovl_u8(vget_low_u8(vrgb.val[1]));
+                                uint16x8_t g_hi = vmovl_u8(vget_high_u8(vrgb.val[1]));
+                                uint16x8_t b_lo = vmovl_u8(vget_low_u8(vrgb.val[2]));
+                                uint16x8_t b_hi = vmovl_u8(vget_high_u8(vrgb.val[2]));
+                                
+                                // lo
+                                uint16x8_t sum_lo = vaddq_u16(r_lo, b_lo);
+                                sum_lo = vmlaq_u16(sum_lo, g_lo, vdupq_n_u16(2));
+                                uint8x8_t gray_lo = vmovn_u16(vshrq_n_u16(sum_lo, 2));
+                                
+                                // hi
+                                uint16x8_t sum_hi = vaddq_u16(r_hi, b_hi);
+                                sum_hi = vmlaq_u16(sum_hi, g_hi, vdupq_n_u16(2));
+                                uint8x8_t gray_hi = vmovn_u16(vshrq_n_u16(sum_hi, 2));
+                                
+                                uint8x16_t vgray = vcombine_u8(gray_lo, gray_hi);
+                                
+                                // Load BG (1 channel)
+                                uint8x16_t vbg = vld1q_u8(bgData + base_idx);
+                                
+                                // Diff and threshold
+                                uint8x16_t vdif = vabdq_u8(vgray, vbg);
+                                uint8x16_t vmsk = vcgtq_u8(vdif, vthr);
+                                
+                                // Accumulate count
+                                uint8x16_t vbits = vcntq_u8(vmsk);
+                                uint16x8_t vsum16 = vpaddlq_u8(vbits);
+                                uint32x4_t vsum32 = vpaddlq_u16(vsum16);
+                                uint64x2_t vsum64 = vpaddlq_u32(vsum32);
+                                count_pixels += (int)((vgetq_lane_u64(vsum64, 0) + vgetq_lane_u64(vsum64, 1)) / 8);
+                                
+                                // Accumulate brightness: Mask vgray, then sum
+                                uint8x16_t vmasked_gray = vandq_u8(vgray, vmsk);
+                                uint16x8_t vbri16 = vpaddlq_u8(vmasked_gray);
+                                uint32x4_t vbri32 = vpaddlq_u16(vbri16);
+                                uint64x2_t vbri64 = vpaddlq_u32(vbri32);
+                                sum_brightness += (vgetq_lane_u64(vbri64, 0) + vgetq_lane_u64(vbri64, 1));
+                                
+                                x += 16;
+                                vec_len -= 16;
+                            }
                         } else {
-                            // BG is RGB
-                            diff += std::abs((int)currData[idx] - (int)bgData[idx]);
-                            diff += std::abs((int)currData[idx+1] - (int)bgData[idx+1]);
-                            diff += std::abs((int)currData[idx+2] - (int)bgData[idx+2]);
-                            diff /= 3;
+                            // RGB BG
+                            uint8x16_t vthr = vdupq_n_u8((uint8_t)bg_thresh);
+                            int vec_len = pixels_in_block;
+                            
+                            while (vec_len >= 16) {
+                                int base_idx = y * W + x;
+                                int idx = base_idx * 3;
+                                
+                                uint8x16x3_t vrgb = vld3q_u8(currData + idx);
+                                uint8x16x3_t vbg  = vld3q_u8(bgData + idx);
+                                
+                                uint8x16_t dR = vabdq_u8(vrgb.val[0], vbg.val[0]);
+                                uint8x16_t dG = vabdq_u8(vrgb.val[1], vbg.val[1]);
+                                uint8x16_t dB = vabdq_u8(vrgb.val[2], vbg.val[2]);
+                                
+                                // Sum diffs (need 16-bit to avoid overflow)
+                                uint16x8_t dlo = vaddl_u8(vget_low_u8(dR), vget_low_u8(dG));
+                                dlo = vaddw_u8(dlo, vget_low_u8(dB));
+                                uint8x8_t diff_lo = vmovn_u16(vshrq_n_u16(vmlaq_u16(dlo, dlo, vdupq_n_u16(0)), 0)); // wait, div by 3 is hard in NEON.
+                                // Approximation for / 3: multiply by 85 (0x55) and shift right 8.
+                                dlo = vshrq_n_u16(vmulq_n_u16(dlo, 85), 8);
+                                
+                                uint16x8_t dhi = vaddl_u8(vget_high_u8(dR), vget_high_u8(dG));
+                                dhi = vaddw_u8(dhi, vget_high_u8(dB));
+                                dhi = vshrq_n_u16(vmulq_n_u16(dhi, 85), 8);
+                                
+                                uint8x16_t vdif = vcombine_u8(vmovn_u16(dlo), vmovn_u16(dhi));
+                                uint8x16_t vmsk = vcgtq_u8(vdif, vthr);
+                                
+                                // Accumulate count
+                                uint8x16_t vbits = vcntq_u8(vmsk);
+                                uint16x8_t vsum16 = vpaddlq_u8(vbits);
+                                uint32x4_t vsum32 = vpaddlq_u16(vsum16);
+                                uint64x2_t vsum64 = vpaddlq_u32(vsum32);
+                                count_pixels += (int)((vgetq_lane_u64(vsum64, 0) + vgetq_lane_u64(vsum64, 1)) / 8);
+                                
+                                // Accumulate brightness (gray)
+                                uint16x8_t r_lo = vmovl_u8(vget_low_u8(vrgb.val[0]));
+                                uint16x8_t r_hi = vmovl_u8(vget_high_u8(vrgb.val[0]));
+                                uint16x8_t g_lo = vmovl_u8(vget_low_u8(vrgb.val[1]));
+                                uint16x8_t g_hi = vmovl_u8(vget_high_u8(vrgb.val[1]));
+                                uint16x8_t b_lo = vmovl_u8(vget_low_u8(vrgb.val[2]));
+                                uint16x8_t b_hi = vmovl_u8(vget_high_u8(vrgb.val[2]));
+                                
+                                uint16x8_t sum_lo = vaddq_u16(r_lo, b_lo);
+                                sum_lo = vmlaq_u16(sum_lo, g_lo, vdupq_n_u16(2));
+                                uint8x8_t gray_lo = vmovn_u16(vshrq_n_u16(sum_lo, 2));
+                                
+                                uint16x8_t sum_hi = vaddq_u16(r_hi, b_hi);
+                                sum_hi = vmlaq_u16(sum_hi, g_hi, vdupq_n_u16(2));
+                                uint8x8_t gray_hi = vmovn_u16(vshrq_n_u16(sum_hi, 2));
+                                
+                                uint8x16_t vgray = vcombine_u8(gray_lo, gray_hi);
+                                uint8x16_t vmasked_gray = vandq_u8(vgray, vmsk);
+                                
+                                uint16x8_t vbri16 = vpaddlq_u8(vmasked_gray);
+                                uint32x4_t vbri32 = vpaddlq_u16(vbri16);
+                                uint64x2_t vbri64 = vpaddlq_u32(vbri32);
+                                sum_brightness += (vgetq_lane_u64(vbri64, 0) + vgetq_lane_u64(vbri64, 1));
+                                
+                                x += 16;
+                                vec_len -= 16;
+                            }
                         }
-                        
-                        // Check Foreground
-                        if (diff > bg_thresh) {
-                            count_pixels++;
-                            int bri = (currData[idx] + currData[idx+1]*2 + currData[idx+2])/4;
-                            sum_brightness += bri;
+#endif
+                        // Scalar tail
+                        while (x < next_block_x) {
+                            int idx = (y * W + x) * 3; 
+                            int diff = 0;
+                            
+                            if (pImpl->backgroundFrame.getChannels() == 1) {
+                                int bgVal = bgData[y * W + x];
+                                int grayVal = (currData[idx] + currData[idx+1]*2 + currData[idx+2]) / 4;
+                                diff = std::abs(grayVal - bgVal);
+                            } else {
+                                diff += std::abs((int)currData[idx] - (int)bgData[idx]);
+                                diff += std::abs((int)currData[idx+1] - (int)bgData[idx+1]);
+                                diff += std::abs((int)currData[idx+2] - (int)bgData[idx+2]);
+                                diff /= 3;
+                            }
+                            
+                            if (diff > bg_thresh) {
+                                count_pixels++;
+                                int bri = (currData[idx] + currData[idx+1]*2 + currData[idx+2])/4;
+                                sum_brightness += bri;
+                            }
+                            x++;
                         }
+                    } else {
+                        // Skip entire block if not inside
+                        x = next_block_x;
                     }
                 }
             }
@@ -4338,6 +4455,7 @@ StatusCode FallDetector::Detect(const Image& frame, bool& is_fall) {
             obj.pixel_count = count_pixels;
             obj.avg_brightness = (count_pixels > 0) ? (float)sum_brightness / count_pixels : 0.0f;
         }
+    }//if bgdata
     }
     // DEBUG_PRINT("[Detect] Pixel Stats Done.\n");
 
@@ -5730,8 +5848,9 @@ StatusCode FallDetector::Detect(const Image& frame, bool& is_fall) {
     if (pImpl->absolute_frame_count % 100 == 0) {
         DEBUG_PRINT("\n=== PERFORMANCE PROFILE (Avg over last 100 frames) ===\n");
         for (auto const& [name, total_ms] : g_perf_timer.total_ms) {
-             double avg = total_ms / (double)g_perf_timer.calls[name];
-             DEBUG_PRINT("  Step [%s]: %.3f ms\n", name.c_str(), avg);
+             uint64_t count = g_perf_timer.calls[name];
+             double avg = total_ms / (double)count;
+             DEBUG_PRINT("  Step [%s]: %.3f ms (Calls: %llu)\n", name.c_str(), avg, (unsigned long long)count);
         }
         DEBUG_PRINT("======================================================\n\n");
         // Optional: Reset? No, let's keep running average or reset. 

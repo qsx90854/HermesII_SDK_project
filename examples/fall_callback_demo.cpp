@@ -195,7 +195,7 @@ int main() {
     sdk.SetConfig(&objCfg);
 
     // 3. Fall Detection Config
-    VisionSDK::FallDetection_v2 fallCfg;
+    VisionSDK::FallDetection_v3 fallCfg;
     fallCfg.header.type = VisionSDK::ConfigType::FallDetection_v2;
     fallCfg.header.version = 1;
     fallCfg.fall_movement_threshold = (float)cfg.getFloat("FallDetect.Fall_Detect_Minimum_Strength", 3.0);
@@ -205,6 +205,7 @@ int main() {
     fallCfg.fall_window_size = 30; // Default
     fallCfg.fall_duration = 5; // Default
     fallCfg.enable_face_detection = (cfg.getInt("FallDetect.Enable_Face_Detection", 1) != 0);
+    fallCfg.face_detect_interval_frames = cfg.getInt("FallDetect.Face_Detect_Interval_Frames", 1);
     sdk.SetConfig(&fallCfg);
 
     // 4. Image Related Config

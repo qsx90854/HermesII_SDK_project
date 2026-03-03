@@ -35,8 +35,8 @@ using namespace VisionSDK;
 #define USE_SDK_FALL_RESULT 1
 
 #define SAVE_ALL_TEST_IMAGES 0
-#define SAVE_GRID_IMAGE 1
-#define SAVE_FACE_IMAGES 0
+#define SAVE_GRID_IMAGE 0
+#define SAVE_FACE_IMAGES 1
 #define DRAW_PERSPECTIVE_AND_AXIS 0
 // Drawing Helper
 void drawRectRGB(std::vector<uint8_t>& img, int w, int h, int x, int y, int rw, int rh, uint8_t r, uint8_t g, uint8_t b, int thickness=2) {
@@ -663,6 +663,7 @@ int main(int argc, char** argv) {
     std::cout << "DEBUG: Loaded Duration: " << fallCfg.fall_duration << std::endl;
     std::cout << "DEBUG: Loaded Duration: " << fallCfg.fall_duration << std::endl;
     fallCfg.enable_face_detection = (cfg.getInt("FallDetect.Enable_Face_Detection", 1) != 0);
+    fallCfg.face_detect_interval_frames = cfg.getInt("FallDetect.Face_Detect_Interval_Frames", 1);
     // Load Verification Flags
     fallCfg.enable_bed_exit_verification = (cfg.getInt("FallDetect.Enable_Bed_Exit_Verification", 1) != 0);
     fallCfg.enable_block_shrink_verification = (cfg.getInt("FallDetect.Enable_Block_Shrink_Verification", 1) != 0);
@@ -1082,7 +1083,7 @@ int main(int argc, char** argv) {
              double bg_diff_thr = (double)fallCfg.bg_diff_threshold; 
              if (bg_diff_thr < 1.0) bg_diff_thr = 30.0;
              
-             printf("[Debug] BBox Scan Init. W=%d H=%d bw=%d bh=%d. bg_ref_sz=%zu\n", W, H, W/grid_cols, H/grid_rows, bg_reference.size());
+             //printf("[Debug] BBox Scan Init. W=%d H=%d bw=%d bh=%d. bg_ref_sz=%zu\n", W, H, W/grid_cols, H/grid_rows, bg_reference.size());
 
              // Compute Global Diff (Moved OUTSIDE object loop)
              int startX = 0;
@@ -1384,7 +1385,7 @@ int main(int argc, char** argv) {
                     
                     // Draw Trajectory Line (Green)
                     drawLine(ff_viz_img, W, H, px1, py1, px2, py2, 0, 255, 0, 2);
-                    printf("draw trajectory: %d %d %d %d\n", px1, py1, px2, py2);
+                    //printf("draw trajectory: %d %d %d %d\n", px1, py1, px2, py2);
                 }
             }
 #endif

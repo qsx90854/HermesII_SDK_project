@@ -192,6 +192,7 @@ void run_test_case(const TestParams& ds, int mode, const std::string& modeName, 
     fallCfg.fall_window_size = 30;
     fallCfg.fall_duration = 5;
     fallCfg.enable_face_detection = (cfg.getInt("FallDetect.Enable_Face_Detection", 1) != 0);
+    //fallCfg.face_detect_interval_frames = cfg.getInt("FallDetect.Face_Detect_Interval_Frames", 1);
     sdk.SetConfig(&fallCfg);
 
     // 4. Image Related Config (Disable Saving)

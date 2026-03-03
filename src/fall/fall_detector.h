@@ -67,6 +67,7 @@ struct InternalConfig {
     int fall_window_size = 30;
     int fall_duration = 5;
     bool enable_face_detection = true; // Default True
+    int face_detect_interval_frames = 1; // NEW: Control face detection frequency
     
     // Background Update
     int bg_update_interval_frames = 0;
