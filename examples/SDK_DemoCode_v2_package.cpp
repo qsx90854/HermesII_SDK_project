@@ -150,28 +150,6 @@ std::vector<std::pair<int, int>> loadBedPoints(const std::string& filename) {
     return points;
 }
 
-// Helper to load Ground Truth Intervals
-std::vector<std::pair<int, int>> loadGroundTruth(const std::string& filename) {
-    std::vector<std::pair<int, int>> intervals;
-    std::ifstream file(filename);
-    if (!file.is_open()) return intervals; // Return empty if not found (or optionally warn)
-
-    std::string line;
-    while (std::getline(file, line)) {
-        if (line.empty()) continue;
-        // Remove trailing comma if present
-        if (line.back() == ',') line.pop_back(); 
-        
-        std::replace(line.begin(), line.end(), ',', ' ');
-        std::stringstream ss(line);
-        int start, end;
-        if (ss >> start >> end) {
-            intervals.push_back({start, end});
-        }
-    }
-    file.close();
-    return intervals;
-}
 
 
 
@@ -179,7 +157,6 @@ int main(int argc, char** argv) {
     std::cout << "Starting Fall Callback Demo v2 SAVE (30FPS Sim)..." << std::endl;
     std::cout << "SDK Version: " << VisionSDK::VisionSDK::GetVersion() << std::endl;
     // 1. Load Configs
-    ConfigLoader cfg;
     ConfigLoader appCfg;
     
     std::string app_config_path = "app_config.ini";
@@ -210,14 +187,6 @@ int main(int argc, char** argv) {
     pW = W;
     pH = H;
 
-    if (cfg.load("parameter.ini")) {
-        std::cout << "Loaded parameter.ini" << std::endl;
-        std::cout << "DEBUG: Object.Block_Merge_Range = " << cfg.getInt("Object.Block_Merge_Range", -1) << std::endl;
-        std::cout << "DEBUG: Motion.Block_Dilation_Threshold = " << cfg.getInt("Motion.Block_Dilation_Threshold", -1) << std::endl;
-    } else {
-        std::cerr << "Warning: parameter.ini not found, using defaults." << std::endl;
-    }
-
     // 2. Initialize SDK
     VisionSDK::VisionSDK sdk;
     sdk.Init("", 4); // Default Init
@@ -226,68 +195,64 @@ int main(int argc, char** argv) {
     VisionSDK::MotionEstimation_v1 motionCfg;
     motionCfg.header.type = VisionSDK::ConfigType::MotionEstimation_v1;
     motionCfg.header.version = 1;
-    motionCfg.grid_cols = cfg.getInt("Motion.Grid_Cols", 12);
-    motionCfg.grid_rows = cfg.getInt("Motion.Grid_Rows", 16);
+    motionCfg.grid_cols = 10;
+    motionCfg.grid_rows = 6;
     motionCfg.block_size = 16;
     motionCfg.search_range = 24;
-    motionCfg.history_size = cfg.getInt("Motion.Diff_Check_Range", 5);
-    motionCfg.block_change_threshold = cfg.getFloat("Motion.Block_Difference_Ratio_Threshold", 0.03);
-    motionCfg.search_mode = cfg.getInt("Motion.Search_Mode", 1);
-    motionCfg.enable_block_decay = (cfg.getInt("Motion.Enable_Block_Decay", 1) != 0);
-    motionCfg.block_decay_frames = cfg.getInt("Motion.Block_Decay_Frames", 3);
-    motionCfg.enable_block_dilation = (cfg.getInt("Motion.Enable_Block_Dilation", 1) != 0);
-    motionCfg.block_dilation_threshold = cfg.getInt("Motion.Block_Dilation_Threshold", 2);
+    motionCfg.history_size = 5;
+    motionCfg.block_change_threshold = 0.03;
+    motionCfg.search_mode = 1;
+    motionCfg.enable_block_decay = false;
+    motionCfg.block_decay_frames = 6;
+    motionCfg.enable_block_dilation = false;
+    motionCfg.block_dilation_threshold = 4;
     sdk.SetConfig(&motionCfg);
 
     // 2. Object Extraction Config
     VisionSDK::ObjectExtraction_v1 objCfg;
     objCfg.header.type = VisionSDK::ConfigType::ObjectExtraction_v1;
     objCfg.header.version = 1;
-    objCfg.object_merge_radius = cfg.getInt("Object.Block_Merge_Range", 3);
-    objCfg.foreground_merge_radius = cfg.getInt("Object.Foreground_Merge_Range", 1); // Default 1 pixel
+    objCfg.object_merge_radius = 1;
+    objCfg.foreground_merge_radius = 6; 
     objCfg.object_extraction_threshold = 2.0f; 
-    objCfg.tracking_overlap_threshold = cfg.getFloat("Tracking.Tracking_Overlap_Threshold", 0.5f);
-    objCfg.tracking_mode = cfg.getInt("Tracking.Tracking_Mode", 1);
+    objCfg.tracking_overlap_threshold = 0.5f;
+    objCfg.tracking_mode = 4;
     sdk.SetConfig(&objCfg);
 
-    // 3. Fall Detection Config
     // 3. Fall Detection Config
     VisionSDK::FallDetection_v3 fallCfg;
     fallCfg.header.type = VisionSDK::ConfigType::FallDetection_v3;
     fallCfg.header.version = 1;
-    fallCfg.fall_movement_threshold = (float)cfg.getFloat("FallDetect.Fall_Detect_Minimum_Strength", 3.0);
-    fallCfg.fall_strong_threshold = (float)cfg.getFloat("FallDetect.Fall_Detect_Strong_Strength", 8.0);
-    fallCfg.fall_acceleration_threshold = (float)cfg.getFloat("FallDetect.Fall_Detect_Acceleration_Threshold", 5.0f);
-    fallCfg.fall_acceleration_upper_threshold = (float)cfg.getFloat("FallDetect.Fall_Detect_Accel_Upper_Threshold", 2.0f);
-    fallCfg.fall_acceleration_lower_threshold = (float)cfg.getFloat("FallDetect.Fall_Detect_Accel_Lower_Threshold", -2.0f);
-    float bed_pixel_ratio_threshold = (float)cfg.getFloat("FallDetect.Fall_Detect_Bed_Pixel_Ratio_Threshold", 0.3f);
-    fallCfg.bed_pixel_ratio_threshold = bed_pixel_ratio_threshold; // NEW
-    fallCfg.safe_area_ratio_threshold = (float)cfg.getFloat("FallDetect.Safe_Area_Ratio_Threshold", 0.5);
-    fallCfg.fall_window_size = cfg.getInt("FallDetect.Fall_Detect_Frame_History_Length", 30);
-    fallCfg.fall_duration = cfg.getInt("FallDetect.Fall_Detect_Frame_History_Threshold", 5);
-    fallCfg.post_fall_distance_threshold = (float)cfg.getFloat("FallDetect.Fall_Detect_Post_Fall_Distance_Threshold", 10.0f);
-    fallCfg.post_fall_check_frames = cfg.getInt("FallDetect.Fall_Detect_Post_Fall_Check_Frames", 5);
-    fallCfg.momentum_calc_type = cfg.getInt("FallDetect.Fall_Detect_Momentum_Calc_Type", 0);
+    fallCfg.fall_movement_threshold = 2.5f;
+    fallCfg.fall_strong_threshold = 6.0f;
+    fallCfg.fall_acceleration_threshold = -4.0f;
+    fallCfg.fall_acceleration_upper_threshold = 6.0f;
+    fallCfg.fall_acceleration_lower_threshold = -4.0f;
+    fallCfg.bed_pixel_ratio_threshold = 0.15f; 
+    fallCfg.safe_area_ratio_threshold = 0.5f;
+    fallCfg.fall_window_size = 30;
+    fallCfg.fall_duration = 5;
+    fallCfg.post_fall_distance_threshold = 4.0f;
+    fallCfg.post_fall_check_frames = 5;
+    fallCfg.momentum_calc_type = 1;
 
-    fallCfg.enable_face_detection = (cfg.getInt("FallDetect.Enable_Face_Detection", 1) != 0);
-    fallCfg.face_detect_interval_frames = cfg.getInt("FallDetect.Face_Detect_Interval_Frames", 1);
+    fallCfg.enable_face_detection = true;
+    fallCfg.face_detect_interval_frames = 8;
     // Load Verification Flags
-    fallCfg.enable_bed_exit_verification = (cfg.getInt("FallDetect.Enable_Bed_Exit_Verification", 1) != 0);
-    fallCfg.enable_block_shrink_verification = (cfg.getInt("FallDetect.Enable_Block_Shrink_Verification", 1) != 0);
+    fallCfg.enable_bed_exit_verification = false;
+    fallCfg.enable_block_shrink_verification = false;
     
     // Background Method Config
-    fallCfg.enable_save_bg_mask = (cfg.getInt("FallDetect.Enable_Save_BG_Mask", 0) != 0);
-    fallCfg.bg_init_start_frame = cfg.getInt("FallDetect.BG_Init_Start_Frame", 10);
-    fallCfg.bg_init_end_frame = cfg.getInt("FallDetect.BG_Init_End_Frame", 20);
-    fallCfg.bg_diff_threshold = cfg.getInt("FallDetect.BG_Diff_Threshold", 30);
-    fallCfg.bg_update_interval_frames = cfg.getInt("FallDetect.BG_Update_Interval", 10);
-    fallCfg.bg_update_alpha = cfg.getFloat("FallDetect.BG_Update_Alpha", 0.01f);
-    fallCfg.bed_update_alpha_multiplier = cfg.getFloat("FallDetect.Bed_Update_Alpha_Multiplier", 4.0f);
-    fallCfg.enable_post_bed_exit_threshold = (cfg.getInt("FallDetect.Enable_Post_BedExit_Threshold", 0) != 0);
-    fallCfg.post_bed_exit_threshold_multiplier = cfg.getFloat("FallDetect.Post_BedExit_Threshold_Multiplier", 0.7f);
-    fallCfg.projection_use_foreground = (cfg.getInt("FallDetect.Projection_Use_Foreground", 0) != 0);
-    
-
+    fallCfg.enable_save_bg_mask = true;
+    fallCfg.bg_init_start_frame = 2;
+    fallCfg.bg_init_end_frame = 5;
+    fallCfg.bg_diff_threshold = 18;
+    fallCfg.bg_update_interval_frames = 8;
+    fallCfg.bg_update_alpha = 0.1f;
+    fallCfg.bed_update_alpha_multiplier = 8.0f;
+    fallCfg.enable_post_bed_exit_threshold = true;
+    fallCfg.post_bed_exit_threshold_multiplier = 0.7f;
+    fallCfg.projection_use_foreground = false;
 
     sdk.SetConfig(&fallCfg);
 
@@ -299,8 +264,8 @@ int main(int argc, char** argv) {
     imgCfg.save_image_path = savePath;
     imgCfg.enable_save_images = false; // We do manual saving here
     imgCfg.enable_draw_bg_noise = (appCfg.getInt("Demo.Demo_Draw_Background_Noise", 0) != 0);
-    imgCfg.expected_frame_interval_ms = cfg.getInt("Validation.Expected_Frame_Interval", 33);
-    imgCfg.frame_interval_tolerance_ms = cfg.getInt("Validation.Frame_Interval_Tolerance", 10);
+    imgCfg.expected_frame_interval_ms = 33;
+    imgCfg.frame_interval_tolerance_ms = 10;
     sdk.SetConfig(&imgCfg);
 
     sdk.RegisterVisionSDKCallback(onFallDetected);
@@ -450,27 +415,6 @@ int main(int argc, char** argv) {
              dataset_name = pattern.substr(0, last_slash);
         }
     }
-    
-    // ------------------------------------------------------------------
-
-    // NEW: Fall Interval Logging
-    std::string f_interval_name = save_dir + "/detected_fall_intervals.txt";
-    std::ofstream f_interval(f_interval_name);
-    
-    bool is_currently_falling = false;
-    int fall_start_frame = -1;
-    int total_fall_events = 0; // NEW: Counter
-
-    
-    
-    // Stored Intervals for Verification
-    struct FallInterval {
-        int start;
-        int end;
-        std::string reasons;
-    };
-    std::vector<FallInterval> detected_intervals_vec;
-
 
     // Check if input is MP4
     std::unique_ptr<VideoReader> videoReader = nullptr;
@@ -551,187 +495,14 @@ int main(int argc, char** argv) {
 
         auto t2 = std::chrono::steady_clock::now();
         double ms = std::chrono::duration<double, std::milli>(t2 - t1).count();
-        if (i % 50 == 0) 
-        {
-            std::cout << "Frame " << i << " Total Process Time: " << ms << " ms (" << (1000.0/ms) << " FPS)" << std::endl;
-        }
+
         
         // Accumulate Average Time
         total_process_time_ms += ms;
         frame_count_time++;
 
-        bool custom_fall_signal = false;
-
-
-
-        
-        // Override SDK fall signal
-        static int custom_hold_frames = 0;
-        if (custom_fall_signal) custom_hold_frames = 30; // Hold for 1 second at 30fps
-        
-        // Reset original flag and use custom one
-        #if USE_SDK_FALL_RESULT
-            // SDK Logic: Do nothing (keep result from onFallDetected)
-            // But we still countdown for debug visualization if needed
-        #else
-            // Demo Logic: Override SDK result
-            is_fall_in_current_frame = (custom_hold_frames > 0);
-        #endif
-        if (custom_hold_frames > 0) custom_hold_frames--;
-
-        // Interval Tracking Logic (Moved here)
-        static std::set<std::string> current_interval_reasons_set;
-
-        if (is_fall_in_current_frame) {
-            if (!is_currently_falling) {
-                is_currently_falling = true;
-                fall_start_frame = i;
-                current_interval_reasons_set.clear();
-            }
-            if (!current_frame_reasons.empty()) {
-                // Parse "Area;Angle;" into set
-                std::stringstream ss(current_frame_reasons);
-                std::string segment;
-                while(std::getline(ss, segment, ';')) {
-                    if(!segment.empty()) current_interval_reasons_set.insert(segment);
-                }
-            }
-        } else {
-            if (is_currently_falling) {
-                is_currently_falling = false;
-                if (f_interval.is_open()) {
-                     f_interval << fall_start_frame << "," << (i - 1) << "\n";
-                     f_interval.flush(); // Ensure written
-                     
-                     std::string combined_reasons = "";
-                     for(const auto& r : current_interval_reasons_set) combined_reasons += r + " ";
-                     
-                     FallInterval new_interval;
-                     new_interval.start = fall_start_frame;
-                     new_interval.end = i - 1;
-                     new_interval.reasons = combined_reasons;
-                     detected_intervals_vec.push_back(new_interval);
-                     total_fall_events++;
-                }
-            }
-        }
-
-
-
-        
-
-        
     } // End of loop
     
-    // Close interval if still falling at end
-    if (is_currently_falling && f_interval.is_open()) {
-        f_interval << fall_start_frame << "," << (total_frames - 1) << "\n";
-        
-        std::string combined_reasons = "";
-        // reuse static set? No, it's outside main loop now. 
-        // We'll just put "Unknown/AtEnd" or similar if we didn't capture.
-        // But better to just close it.
-        FallInterval new_interval;
-        new_interval.start = fall_start_frame;
-        new_interval.end = (int)(total_frames - 1);
-        new_interval.reasons = "AtEnd";
-        detected_intervals_vec.push_back(new_interval);
-        total_fall_events++;
-    }
-    
-    // NEW: Ground Truth Verification
-    int tp = 0;
-    int fp = 0;
-    int fn = 0;
-    std::vector<std::pair<int, int>> gt_intervals;
-    std::vector<bool> gt_found;
-    
-    if (!gtFile.empty()) {
-        gt_intervals = loadGroundTruth(gtFile);
-        gt_found.resize(gt_intervals.size(), false);
-        
-        // Check Detects vs GT
-        int tolerance = 30; // +/- 30 frames (1 sec) tolerance
-        
-        for(const auto& det : detected_intervals_vec) {
-            bool matched = false;
-            for(size_t k=0; k<gt_intervals.size(); ++k) {
-                // Expanded Overlap Check
-                int det_start = std::max(0, det.start - tolerance);
-                int det_end = det.end + tolerance;
-                
-                int overlap_start = std::max(det_start, gt_intervals[k].first);
-                int overlap_end = std::min(det_end, gt_intervals[k].second);
-                
-                if (overlap_start <= overlap_end) {
-                    matched = true;
-                    gt_found[k] = true;
-                    // Note: Do NOT increment TP here to avoid double counting multiple detections for one GT.
-                }
-            }
-            if(!matched) fp++; // If this detection matched NO GT, it's a False Positive.
-        }
-        
-        // Count TP (Unique GTs found) and FN (GTs missed)
-        for(bool f : gt_found) {
-            if(f) tp++;
-            else fn++;
-        }
-        
-    } else {
-        tp = 0; fp = total_fall_events; fn = 0; // Default fail-safe?
-    }
-
-    // Save Verification Report
-    std::string f_ver_name = save_dir + "/verification_report.txt";
-    std::ofstream report(f_ver_name);
-    if(report.is_open()) {
-        report << "TP=" << tp << "\n";
-        report << "FP=" << fp << "\n";
-        report << "FN=" << fn << "\n";
-        
-        report << "--- Debug Info ---\n";
-        std::cout << "--- GT Verification Debug ---\n";
-        report << "Loaded " << gt_intervals.size() << " GT Intervals:\n";
-        std::cout << "Loaded " << gt_intervals.size() << " GT Intervals:\n";
-        for(size_t k=0; k<gt_intervals.size(); ++k) {
-            std::string status = (gt_found[k] ? " (FOUND)" : " (MISSED)");
-            report << "  [" << k << "] " << gt_intervals[k].first << "-" << gt_intervals[k].second << status << "\n";
-            std::cout << "  [" << k << "] " << gt_intervals[k].first << "-" << gt_intervals[k].second << status << "\n";
-        }
-        
-        // Save Average Time
-        if (frame_count_time > 0) {
-            double avg_ms = total_process_time_ms / frame_count_time;
-            double avg_fps = 1000.0 / avg_ms;
-            report << "AvgTime=" << avg_ms << "\n";
-            std::cout << "[Demo] Average Process Time: " << avg_ms << " ms (" << avg_fps << " FPS)" << std::endl;
-        }
-        
-        report.close();
-    }
-
-    // Append Detailed Detections to Report
-    std::ofstream report_app(f_ver_name, std::ios::app);
-    if(report_app.is_open()) {
-        report_app << "\n--- Detected Intervals ---\n";
-        for(const auto& det : detected_intervals_vec) {
-            report_app << "Start: " << det.start << " End: " << det.end << " Reason: " << det.reasons << "\n";
-        }
-        report_app.close();
-    }
-    
-    // NEW: Save Count File (User Request)
-    std::string f_count_name = save_dir + "/fall_count.txt";
-    std::ofstream f_count(f_count_name);
-    if(f_count.is_open()) {
-        f_count << total_fall_events << "\n";
-        f_count.close();
-    }
-    
-    if (f_interval.is_open()) f_interval.close();
-
-
 
     std::cout << "Done. Saved to " << save_dir << "/" << std::endl;
     return 0;

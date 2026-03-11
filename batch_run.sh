@@ -8,7 +8,7 @@ LOG_DIR="batch_logs"
 
 # Select Datasets to Run
 # Options: "all" or space-separated list e.g., "data1 data2 data6"
-DATASETS=${DATASETS:-"data1"} # "data8 data9 data10 data11 data12 data13 data14 data15 data16 data17" "data1 data2 data3 data4 data5 data6 data7"
+DATASETS=${DATASETS:-"data1 data2 data3 data4 data5 data6 data7 data8 data9 data10 data11 data12 data13 data14 data15 data16 data17"} # "data8 data9 data10 data11 data12 data13 data14 data15 data16 data17" "data1 data2 data3 data4 data5 data6 data7"
 echo "DEBUG: DATASETS is '$DATASETS'" 
 
 # Ensure executable exists

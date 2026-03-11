@@ -32,7 +32,7 @@ using namespace VisionSDK;
 VisionSDK::VisionSDK::VisionSDK() : pImpl(std::unique_ptr<Impl>(new Impl())) {}
 VisionSDK::VisionSDK::~VisionSDK() = default;
 
-#define VISION_SDK_VERSION_INTERNAL "1.0.1a"
+#define VISION_SDK_VERSION_INTERNAL "2.0.1"
 
 const char* VisionSDK::VisionSDK::GetVersion() {
     return VISION_SDK_VERSION_INTERNAL;
@@ -143,6 +143,7 @@ StatusCode VisionSDK::VisionSDK::SetConfig(const void* config) {
             pImpl->config.enable_post_bed_exit_threshold = c->enable_post_bed_exit_threshold;
             pImpl->config.post_bed_exit_threshold_multiplier = c->post_bed_exit_threshold_multiplier;
             pImpl->config.projection_use_foreground = c->projection_use_foreground;
+            pImpl->config.enable_edge_drop_filter = c->enable_edge_drop_filter; // NEW
             break;
         }
         case ConfigType::BedExitDetection_v1: {

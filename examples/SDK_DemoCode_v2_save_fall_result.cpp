@@ -34,8 +34,8 @@ using namespace VisionSDK;
 // TOGGLE: 1 = Use SDK Internal Logic, 0 = Use Demo Custom Logic (Peak-Valley)
 #define USE_SDK_FALL_RESULT 1
 
-#define SAVE_ALL_TEST_IMAGES 0
-#define SAVE_GRID_IMAGE 0
+#define SAVE_ALL_TEST_IMAGES 1
+#define SAVE_GRID_IMAGE 1
 #define SAVE_FACE_IMAGES 1
 #define DRAW_PERSPECTIVE_AND_AXIS 0
 // Drawing Helper
@@ -664,6 +664,7 @@ int main(int argc, char** argv) {
     std::cout << "DEBUG: Loaded Duration: " << fallCfg.fall_duration << std::endl;
     fallCfg.enable_face_detection = (cfg.getInt("FallDetect.Enable_Face_Detection", 1) != 0);
     fallCfg.face_detect_interval_frames = cfg.getInt("FallDetect.Face_Detect_Interval_Frames", 1);
+    fallCfg.enable_edge_drop_filter = (cfg.getInt("FallDetect.Enable_Edge_Drop_Filter", 1) != 0);
     // Load Verification Flags
     fallCfg.enable_bed_exit_verification = (cfg.getInt("FallDetect.Enable_Bed_Exit_Verification", 1) != 0);
     fallCfg.enable_block_shrink_verification = (cfg.getInt("FallDetect.Enable_Block_Shrink_Verification", 1) != 0);

@@ -206,6 +206,7 @@ int main() {
     fallCfg.fall_duration = 5; // Default
     fallCfg.enable_face_detection = (cfg.getInt("FallDetect.Enable_Face_Detection", 1) != 0);
     fallCfg.face_detect_interval_frames = cfg.getInt("FallDetect.Face_Detect_Interval_Frames", 1);
+    fallCfg.enable_edge_drop_filter = (cfg.getInt("FallDetect.Enable_Edge_Drop_Filter", 1) != 0);
     sdk.SetConfig(&fallCfg);
 
     // 4. Image Related Config

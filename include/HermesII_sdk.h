@@ -81,7 +81,7 @@ struct FallDetection_v3 {
     float fall_movement_threshold = 0.0f;
     float fall_strong_threshold = 0.0f;
     float safe_area_ratio_threshold = 0.0f;
-    float fall_acceleration_threshold = 0.0f; 
+    float fall_acceleration_threshold = 0.0f;
     int fall_window_size = 0;
     int fall_duration = 0;
     bool enable_face_detection = true;
@@ -90,7 +90,7 @@ struct FallDetection_v3 {
     int bg_init_start_frame = 0;
     int bg_init_end_frame = 0;
     int bg_diff_threshold = 30; // Default
-    
+
     // Background Update Params
     int bg_update_interval_frames = 0;
     float bg_update_alpha = 0.0f;
@@ -119,6 +119,9 @@ struct FallDetection_v3 {
     
     // Projection Point Selection
     bool projection_use_foreground = false;
+    
+    // NEW: Edge Drop Filter
+    bool enable_edge_drop_filter = false;
 };
 
 struct BedExitDetection_v1 {

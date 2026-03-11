@@ -102,6 +102,7 @@ struct InternalConfig {
     int min_trigger_area = 2000; // Base min area (pixels) for mid-frame zone; scaled by Y position
     float bed_pixel_ratio_threshold = 0.3f; // NEW
     int momentum_calc_type = 0; // 0: Avg (Default), 1: Peak Block
+    bool enable_edge_drop_filter = false; // NEW: Enable edge drop filter
 };
 
 class FallDetector {

@@ -2242,6 +2242,7 @@ public:
         int frames_observed_wait;      // NEW: Frames during wait phase
         float accumulated_bed_ratio_wait; // NEW: Accumulated ratio during wait phase
         float peak_bed_ratio_wait = 0.0f;
+        int edge_touch_frames_obs; // NEW: Edge Drop tracking
         
         // FG Object Tracking (Stability)
         float last_fg_cx = -1.0f;
@@ -2256,7 +2257,7 @@ public:
                             frames_waiting(0), is_active(false), waiting_for_deceleration(false),
                             aligned_frames(0), valid_angle_frames(0), rotation_detected(false), flat_posture_frames(0), 
                             accumulated_bed_ratio(0.0f), frames_observed_wait(0), accumulated_bed_ratio_wait(0.0f),
-                            peak_bed_ratio_wait(0.0f), center_ever_in_bed(false), peak_momentum(0.0f),
+                            peak_bed_ratio_wait(0.0f), edge_touch_frames_obs(0), center_ever_in_bed(false), peak_momentum(0.0f),
                             trigger_pixel_count(0), accumulated_pixel_count(0) {}
 
         // Area Tracking
@@ -4911,6 +4912,7 @@ StatusCode FallDetector::Detect(const Image& frame, bool& is_fall) {
                         state.accumulated_bed_ratio_wait = 0.0f;
                         state.frames_observed_wait = 0;
                         state.peak_bed_ratio_wait = 0.0f; // Reset wait-phase bed ratio
+                        state.edge_touch_frames_obs = 0; // NEW: Reset Edge Drop tracking
                         state.center_ever_in_bed = false; // RESET HERE
                         state.flat_posture_frames = 0;
                         state.peak_momentum = threshold1;//recent_mom_avg; // NEW: Init peak
@@ -5239,26 +5241,22 @@ StatusCode FallDetector::Detect(const Image& frame, bool& is_fall) {
                             if (matched_full_frame_idx != -1) {
                                 auto& fg_obj = pImpl->full_frame_objects[matched_full_frame_idx];
                                 
-                                // === NEW: Physical Size Projection (Replacing Angle Check) ===
-                                // We use the max/min x/y of the raw pixel object, project to Floor Plane, 
-                                // and calculate True Physical Width and Height (in cm).
                                 float p_width = 0.0f;
                                 float p_height = 0.0f;
                                 float p_area = 0.0f;
                                 
+                                // We use the max/min x/y of the raw pixel object
+                                int fmin_x = 99999, fmax_x = -1, fmin_y = 99999, fmax_y = -1;
+                                for(int p_idx : fg_obj.pixels) {
+                                    int px = p_idx % frame.width;
+                                    int py = p_idx / frame.width;
+                                    if (px < fmin_x) fmin_x = px;
+                                    if (px > fmax_x) fmax_x = px;
+                                    if (py < fmin_y) fmin_y = py;
+                                    if (py > fmax_y) fmax_y = py;
+                                }
+
                                 if (pImpl->has_homography) {
-                                     // fg_obj.min_x, max_x, min_y, max_y need to be calculated on the fly or added to ObjectFeatures.
-                                     // Actually find_objects_optimized doesn't store bounding box in ObjectFeatures currently.
-                                     // Let's compute it quickly from the pixels list.
-                                    int fmin_x = 99999, fmax_x = -1, fmin_y = 99999, fmax_y = -1;
-                                    for(int p_idx : fg_obj.pixels) {
-                                        int px = p_idx % frame.width;
-                                        int py = p_idx / frame.width;
-                                        if (px < fmin_x) fmin_x = px;
-                                        if (px > fmax_x) fmax_x = px;
-                                        if (py < fmin_y) fmin_y = py;
-                                        if (py > fmax_y) fmax_y = py;
-                                    }
                                     
                                     if (!fg_obj.pixels.empty()) {
                                         // Project Top-Center and Bottom-Center
@@ -5291,6 +5289,13 @@ StatusCode FallDetector::Detect(const Image& frame, bool& is_fall) {
                                         
                                         p_area = p_width * p_height;
                                     }
+                                }
+
+                                // NEW: Edge Drop Filter Check
+                                // If the Foreground Bounding Box touches the frame edge (0 or w-1/h-1), count it.
+                                if (fmin_x <= 0 || fmax_x >= frame.width - 1 || 
+                                    fmin_y <= 0 || fmax_y >= frame.height - 1) {
+                                    state.edge_touch_frames_obs++;
                                 }
 
                                 // Store in Observation State for average/median calculation at the end
@@ -5450,6 +5455,17 @@ StatusCode FallDetector::Detect(const Image& frame, bool& is_fall) {
                             }
                             
                             // Fall detected only if PERPENDICULAR to perspective line (lying down) AND NOT Bed Event
+                            
+                            // NEW: Edge Drop Filter Validation
+                            if (is_fall_case5 && pImpl->config.enable_edge_drop_filter) {
+                                if (state.edge_touch_frames_obs > state.frames_observed * 0.5f) {
+                                    is_fall_case5 = false;
+                                    DEBUG_PRINT("[Case5] ID:%d Suppressed: Edge Drop Filter (Edge:%d / Obs:%d)\n", 
+                                            curr.id, state.edge_touch_frames_obs, state.frames_observed);
+                                    pImpl->LogTrace(curr.id, pImpl->frame_idx, "FILTER_EDGE", (float)state.edge_touch_frames_obs / state.frames_observed, "Touches frame edge too often");
+                                }
+                            }
+
                             if (is_fall_case5) {
                                 potential_fall = true;
                                 fall_type = "Momentum_Transition";
@@ -5867,11 +5883,7 @@ StatusCode FallDetector::Detect(const Image& frame, bool& is_fall) {
 }
 
 const std::vector<MotionObject>& FallDetector::GetMotionObjects() const {
-    if (!pImpl->current_objects.empty() && pImpl->frame_idx >= 300 && pImpl->frame_idx <= 302) {
-        DEBUG_PRINT("[SDK-FD-Get] F:%d Size:%lu IDs:", pImpl->frame_idx, pImpl->current_objects.size());
-        for(const auto& o : pImpl->current_objects) DEBUG_PRINT(" %d", o.id);
-        DEBUG_PRINT("\n");
-    }
+
     return pImpl->current_objects;
 }
 
