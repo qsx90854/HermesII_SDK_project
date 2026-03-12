@@ -466,7 +466,7 @@ void onFallDetected(const VisionSDK::VisionSDKEvent& event) {
 
     if (event.is_fall_detected) {
         // Warning Logic
-        fall_red_box_countdown = 90;
+        fall_red_box_countdown = 20;
     }
 }
 
@@ -924,15 +924,18 @@ int main(int argc, char** argv) {
     std::vector<FallInterval> detected_intervals_vec;
 
 
-    // Check if input is RTSP or string
-    std::string rtsp_url = appCfg.getString("Demo.Demo_RTSP_URL", "rtsp://10.161.116.233:1254/live"); //rtsp://10.0.1.105:1254/live
-    std::cout << "[Demo] RTSP Mode: " << rtsp_url << std::endl;
+    // Check if input is MP4
     std::unique_ptr<VideoReader> videoReader = nullptr;
-    try {
-        videoReader = std::make_unique<VideoReader>(rtsp_url, W, H);
-    } catch (const std::exception& e) {
-        std::cerr << "Error opening RTSP stream: " << e.what() << std::endl;
-        return -1;
+    if (imgFormat.size() > 4 && imgFormat.substr(imgFormat.size() - 4) == ".mp4") {
+        std::cout << "[Demo] MP4 Mode Detected: " << imgFormat << std::endl;
+        try {
+            videoReader = std::make_unique<VideoReader>(imgFormat, W, H);
+        } catch (const std::exception& e) {
+            std::cerr << "Error opening MP4: " << e.what() << std::endl;
+            return -1;
+        }
+    } else {
+        std::cout << "[Demo] Image Sequence Mode: " << imgFormat << std::endl;
     }
 
     // Main processing loop
@@ -946,33 +949,42 @@ int main(int argc, char** argv) {
         auto t_read_start = std::chrono::steady_clock::now();
 
         if (videoReader) {
-            // Apply Frame Step Skipping for stream (discard frames)
+            // Apply Frame Step Skipping for MP4
+            // Since MP4 reader is sequential, we must consume and discard frames if step > 1
             if (i > start_frame) { // Don't skip before the very first frame
                 for (int s = 0; s < frame_step - 1; ++s) {
+                    // Read into dummy buffer or same buffer to discard
                     if (!videoReader->readFrame(file_buffer)) {
-                        break; 
+                        break; // End of video during skip
                     }
                 }
             }
 
-             // 讀取 RTSP 的下一幀到 file_buffer 中，並自動 Resize 轉 RGB
+             // 讀取 MP4 的下一幀到 file_buffer 中，並自動 Resize 轉 RGB
             if (!videoReader->readFrame(file_buffer)) {
-                std::cout << "串流讀取完畢或發生錯誤，結束迴圈。" << std::endl;
-                break; // 串流中斷就跳出迴圈
+                std::cout << "影片讀取完畢或發生錯誤，結束迴圈。" << std::endl;
+                break; // 影片結束就跳出迴圈
             }
+        } else {
+            char raw_name[256];
+            snprintf(raw_name, sizeof(raw_name), pattern.c_str(), i);
+            
+            std::ifstream file(raw_name, std::ios::binary);
+            if (!file) {
+                if (i > 0) break; 
+                continue;
+            }
+            file.read(reinterpret_cast<char*>(file_buffer.data()), frame_size_rgb);
+            file.close();
         }
-        
         // Timer End for Read
         auto t_read_end = std::chrono::steady_clock::now();
         double read_duration_ms = std::chrono::duration<double, std::milli>(t_read_end - t_read_start).count();
 
         // Simulate 30FPS Camera (Ensure Read+Wait = 33ms)
-        // 對於即時 RTSP 影像，不應該手動 sleep，否則會累積延遲造成掉幀
-        if (rtsp_url.find("rtsp://") != 0) {
-            if (read_duration_ms < 33.0) {
-                int sleep_ms = (int)(33.0 - read_duration_ms);
-                std::this_thread::sleep_for(std::chrono::milliseconds(sleep_ms));
-            }
+        if (read_duration_ms < 33.0) {
+            int sleep_ms = (int)(33.0 - read_duration_ms);
+            std::this_thread::sleep_for(std::chrono::milliseconds(sleep_ms));
         }
 
         // Copy for drawing
@@ -1001,7 +1013,7 @@ int main(int argc, char** argv) {
                 bg_reference[k] = (uint8_t)(bg_accumulator[k] / bg_frames_count);
             }
             // 6. Save Image
-            //printf("[Debug] Step 7: Save Image (Frame %d)\n", i);
+            printf("[Debug] Step 7: Save Image (Frame %d)\n", i);
             char bg_filename[256];
             snprintf(bg_filename, sizeof(bg_filename), "%s/background_init.jpg", save_dir.c_str());
             stbi_write_jpg(bg_filename, W, H, 3, bg_reference.data(), 90);
@@ -1042,7 +1054,7 @@ int main(int argc, char** argv) {
         double ms = std::chrono::duration<double, std::milli>(t2 - t1).count();
         //if (i % 50 == 0) 
         {
-            //std::cout << "Frame " << i << " Total Process Time: " << ms << " ms (" << (1000.0/ms) << " FPS)" << std::endl;
+            std::cout << "Frame " << i << " Total Process Time: " << ms << " ms (" << (1000.0/ms) << " FPS)" << std::endl;
         }
         
         // Accumulate Average Time
@@ -1067,7 +1079,7 @@ int main(int argc, char** argv) {
         int grid_cols = cfg.getInt("Motion.Grid_Cols", 80);
         int grid_rows = cfg.getInt("Motion.Grid_Rows", 45);
         if (bg_saved_flag && !bg_reference.empty()) {
-             //printf("[Debug] Step 2: Entering BG Mask Gen (Frame %d)\n", i);
+             printf("[Debug] Step 2: Entering BG Mask Gen (Frame %d)\n", i);
              bg_mask_img.resize(W*H*3, 0); // Black
              double bg_diff_thr = (double)fallCfg.bg_diff_threshold; 
              if (bg_diff_thr < 1.0) bg_diff_thr = 30.0;
@@ -1611,7 +1623,7 @@ int main(int argc, char** argv) {
         // MOVED HERE (Before Object Loop) to avoid N^2 complexity
         // -------------------------------------------------------------
 #if (SAVE_ALL_TEST_IMAGES || SAVE_GRID_IMAGE)
-        //printf("[Debug] Step 5: Start Hull/Draw Loop (Frame %d)\n", i); fflush(stdout);
+        printf("[Debug] Step 5: Start Hull/Draw Loop (Frame %d)\n", i); fflush(stdout);
         if (true && !bg_mask_img.empty() && !objects.empty()) { // RE-ENABLED
             
             std::vector<uint8_t> final_mask(W*H*3, 0);
@@ -1910,7 +1922,7 @@ int main(int argc, char** argv) {
                     }
                 }
             }
-            //printf("[Debug] Drawn Blocks for Obj %d (Frame %d)\n", obj.id, i);
+            printf("[Debug] Drawn Blocks for Obj %d (Frame %d)\n", obj.id, i);
             //printf("[Debug] End Block Loop for Object %d\n", obj.id);
             //printf("[Debug] End Block Loop\n");
             

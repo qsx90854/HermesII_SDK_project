@@ -22,7 +22,7 @@
 
 // Define this to 1 to enable debug prints in this file, or 0 to suppress them
 #ifndef ENABLE_DEBUG_PRINT
-#define ENABLE_DEBUG_PRINT 1
+#define ENABLE_DEBUG_PRINT 0
 #endif
 
 #if ENABLE_DEBUG_PRINT
@@ -2653,12 +2653,14 @@ void FallDetector::SetConfig(const InternalConfig& config) {
          if (ENABLE_DEBUG_PRINT) std::cout << "[FallDetector::SetConfig] Initializing FaceDetector..." << std::endl;
          StatusCode ret = pImpl->faceDetector.Init("res/blaze_face_detect_nnp310_128x128.ty");
          if (ret != StatusCode::OK) {
-             if (ENABLE_DEBUG_PRINT) std::cout << "[FallDetector::SetConfig] FaceDetector Init Failed: " << (int)ret << std::endl;
+             //if (ENABLE_DEBUG_PRINT) 
+             std::cout << "[FallDetector::SetConfig] FaceDetector Init Failed: " << (int)ret << std::endl;
              // Do NOT set true, allows retry on next Config call or manually? 
              // Actually, Config is usually called once. If it fails, maybe we should try in Detect too?
              // But let's stick to Config first.
          } else {
-             if (ENABLE_DEBUG_PRINT) std::cout << "[FallDetector::SetConfig] FaceDetector Init OK" << std::endl;
+             //if (ENABLE_DEBUG_PRINT) 
+             std::cout << "[FallDetector::SetConfig] FaceDetector Init OK" << std::endl;
              pImpl->face_model_inited = true;
          }
     }
@@ -2669,10 +2671,13 @@ void FallDetector::SetBedRegion(const std::vector<std::pair<int, int>>& points) 
     pImpl->hasBedMask = false; 
     if (!points.empty()) {
         pImpl->hasBedMask = true; // Signal that we have a region
-        if(points.size() == 4) {
+        if(points.size() == 4) 
+        {
              pImpl->has_homography = computeHomography(points, 100.0f, 200.0f, pImpl->homography_matrix);
              if(pImpl->has_homography) DEBUG_PRINT("[FallDetector] Homography Computed Successfully.\n");
              else DEBUG_PRINT("[FallDetector] Failed to compute Homography (Singular?).\n");
+             
+             std::cout << "[FallDetector] Bed Region Set Successfully, point " << points[0].first << ", " << points[0].second << ", " << points[1].first << ", " << points[1].second << ", " << points[2].first << ", " << points[2].second << ", " << points[3].first << ", " << points[3].second << ", " << std::endl;
         } else {
              pImpl->has_homography = false;
         }
@@ -3727,7 +3732,9 @@ StatusCode FallDetector::Detect(const Image& frame, bool& is_fall) {
         // Note: FaceDetector::Resize internally applies a vertical flip (vflip=true) as requested.
         if (pImpl->faceDetector.Resize(cropInput, faceInput)) {
              std::vector<FaceROI> faces;
+             std::cout<<"[FallDetector::Detect] FaceDetector::Detect GO"<<std::endl;
              int ret = pImpl->faceDetector.Detect(faceInput, faces);
+             std::cout<<"[FallDetector::Detect] FaceDetector::Detect End"<<std::endl;
              if (ret == 0 && !faces.empty()) {
                  has_face = true;
                  
@@ -3741,6 +3748,7 @@ StatusCode FallDetector::Detect(const Image& frame, bool& is_fall) {
                  face_roi.x2 = crop_min_x + roi_128.x2 * scale;
                  face_roi.y2 = crop_min_y + roi_128.y2 * scale;
                  face_roi.score = roi_128.score;
+                 std::cout<<"[FallDetector::Detect] FaceDetector::Detect Get Face"<<face_roi.x1<<", "<<face_roi.y1<<", "<<face_roi.x2<<", "<<face_roi.y2<<", "<<face_roi.score<<std::endl;
              }
         } else {
             // std::cout << "[FallDetector] Resize failed!" << std::endl;
@@ -4780,7 +4788,7 @@ StatusCode FallDetector::Detect(const Image& frame, bool& is_fall) {
                 float threshold1 = threshold1_base;
                 const float decel_threshold = 4.0f;  // Deceleration complete threshold
                 const float threshold2 = 9.5f;  // Low momentum threshold - Balanced for ~90% TP retention
-                const int observation_frames = 75;  // Extended from 60 to 120 frames (4 seconds @ 30fps)
+                const int observation_frames = 45;  // Extended from 60 to 120 frames (4 seconds @ 30fps)
                 const int max_waiting_frames = 15;  // Max frames to wait for deceleration
                 
                 if (pImpl->config.enable_post_bed_exit_threshold)
