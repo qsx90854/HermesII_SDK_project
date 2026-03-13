@@ -111,7 +111,8 @@ $(SDK_DEMO_CODE_V2_TARGET): examples/SDK_DemoCode_v2.cpp $(LIB_TARGET)
 
 # 編譯 SDK Demo Code v2 Save Result
 $(SDK_DEMO_CODE_V2_SAVE_FALL_RESULT_TARGET): examples/SDK_DemoCode_v2_save_fall_result.cpp $(LIB_TARGET)
-	$(CXX) $(CXXFLAGS) -o $@ $< -L$(BUILD_DIR) -lHermesII_sdk -Wl,-rpath,'$$ORIGIN/$(BUILD_DIR)' -lpthread
+	$(CXX) $(CXXFLAGS) -I/usr/include/opencv4 -DENABLE_OPENCV_DISPLAY -o $@ $< -L$(BUILD_DIR) -lHermesII_sdk -Wl,-rpath,'$$ORIGIN/$(BUILD_DIR)' -lpthread -lopencv_core -lopencv_imgproc -lopencv_videoio -lopencv_highgui
+
 
 # 編譯 SDK Demo Code v1 Accuracy Test
 $(SDK_DEMO_TEST_ACCURACY_TARGET): examples/SDK_DemoCode_v1_test_accuracy.cpp $(LIB_TARGET)

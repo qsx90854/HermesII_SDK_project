@@ -107,7 +107,56 @@ void projectPoint(float u, float v, const float H[9], float& x, float& y) {
 // =========================================================
 // Visualization Utilities (RGB)
 // =========================================================
+static void save_debug_gray_bmp(const char* filename, const unsigned char* data, int w, int h) {
+    if (!data) return;
+    FILE* f = fopen(filename, "wb");
+    if (!f) return;
 
+    int padSize  = (4 - (w * 3) % 4) % 4;
+    int filesize = 54 + (w * 3 + padSize) * h;
+
+    unsigned char fileHdr[14] = {'B','M', 0,0,0,0, 0,0, 0,0, 54,0,0,0};
+    unsigned char infoHdr[40] = {40,0,0,0, 0,0,0,0, 0,0,0,0, 1,0, 24,0};
+
+    // 填入檔案大小
+    fileHdr[2] = (unsigned char)(filesize);
+    fileHdr[3] = (unsigned char)(filesize >> 8);
+    fileHdr[4] = (unsigned char)(filesize >> 16);
+    fileHdr[5] = (unsigned char)(filesize >> 24);
+
+    // 填入寬高
+    infoHdr[4] = (unsigned char)(w);
+    infoHdr[5] = (unsigned char)(w >> 8);
+    infoHdr[6] = (unsigned char)(w >> 16);
+    infoHdr[7] = (unsigned char)(w >> 24);
+    infoHdr[8] = (unsigned char)(h);
+    infoHdr[9] = (unsigned char)(h >> 8);
+    infoHdr[10] = (unsigned char)(h >> 16);
+    infoHdr[11] = (unsigned char)(h >> 24);
+
+    fwrite(fileHdr, 1, 14, f);
+    fwrite(infoHdr, 1, 40, f);
+
+    unsigned char pad[3] = {0,0,0};
+    unsigned char* rowBuffer = (unsigned char*)malloc(w * 3);
+
+    for (int i = 0; i < h; i++) {
+        // BMP 預設由下而上儲存
+        int y = h - 1 - i;
+        const unsigned char* srcRow = data + (y * w);
+        
+        for (int j = 0; j < w; j++) {
+            rowBuffer[j * 3 + 0] = srcRow[j]; // B
+            rowBuffer[j * 3 + 1] = srcRow[j]; // G
+            rowBuffer[j * 3 + 2] = srcRow[j]; // R
+        }
+        fwrite(rowBuffer, 1, w * 3, f);
+        if (padSize > 0) fwrite(pad, 1, padSize, f);
+    }
+
+    free(rowBuffer);
+    fclose(f);
+}
 
 #if 0
 struct ObjectFeatures {
@@ -2735,7 +2784,8 @@ void TrackObjects(std::vector<MotionObject>& current, const std::vector<MotionOb
                   std::map<int, int>& object_first_seen_frame,
                   std::map<int, bool>& object_is_new_entry,
                   std::map<int, std::vector<int>>& persistent_object_blocks,
-                  int frame_idx) 
+                  int frame_idx,
+                  std::vector<int>& expired_ids) 
 {
     DEBUG_PRINT("[Debug] TrackObjects Start. Current: %zu Previous: %zu\n", current.size(), previous.size());
     float threshold = config.tracking_overlap_threshold;
@@ -3068,6 +3118,7 @@ void TrackObjects(std::vector<MotionObject>& current, const std::vector<MotionOb
                  if (track_ttl[trackID] <= 0) {
                      kalmanFilters.erase(trackID);
                      track_ttl.erase(trackID);
+                     expired_ids.push_back(trackID);
                      // std::cout << "Track " << trackID << " Expired." << std::endl;
                  }
             }
@@ -3125,6 +3176,7 @@ void TrackObjects(std::vector<MotionObject>& current, const std::vector<MotionOb
                 kalmanFilters.erase(id);
                 track_ttl.erase(id);
                 persistent_object_blocks.erase(id);
+                expired_ids.push_back(id);
                 
                 // Also remove from the 'current' object list so we don't return duplicates
                 auto it = std::remove_if(current.begin(), current.end(), 
@@ -3545,6 +3597,10 @@ StatusCode FallDetector::Detect(const Image& frame, bool& is_fall) {
         }
     } else if (frame.channels == 1) {
         memcpy(wrapper.getData(), frame.data, W * H);
+        //static int debug_frame_count = 0;
+        //char debug_filename[256];
+        //snprintf(debug_filename, sizeof(debug_filename), "test%05d.bmp", debug_frame_count++);
+        //save_debug_gray_bmp(debug_filename, frame.data,  800,450);
     }
     } // End ImageConv Timer
 
@@ -3698,6 +3754,14 @@ StatusCode FallDetector::Detect(const Image& frame, bool& is_fall) {
         int s = std::max(bw, bh);
         if (s <= 0) s = 128; // Fallback
         
+        // --- VMM ALIGNMENT FIX ---
+        // Hardware Image Resizer (TY_CV) requires width/stride to be 16-byte aligned.
+        // If 's' is an odd number, the driver may calculate false strides,
+        // read past the allocated mmz buffer, and cause Kernel NULL Pointer Dereference.
+        if (s % 16 != 0) {
+            s += (16 - (s % 16));
+        }
+        
         int cx = bed_min_x + bw / 2;
         int cy = mid_y + bh / 2;
         
@@ -3734,7 +3798,7 @@ StatusCode FallDetector::Detect(const Image& frame, bool& is_fall) {
              std::vector<FaceROI> faces;
              std::cout<<"[FallDetector::Detect] FaceDetector::Detect GO"<<std::endl;
              int ret = pImpl->faceDetector.Detect(faceInput, faces);
-             std::cout<<"[FallDetector::Detect] FaceDetector::Detect End"<<std::endl;
+             //std::cout<<"[FallDetector::Detect] FaceDetector::Detect End"<<std::endl;
              if (ret == 0 && !faces.empty()) {
                  has_face = true;
                  
@@ -3840,6 +3904,7 @@ StatusCode FallDetector::Detect(const Image& frame, bool& is_fall) {
                                                       pImpl->config.object_merge_radius,
                                                       pImpl->config.momentum_calc_type);
                                                       
+        std::vector<int> expired_ids;
         // TRACKING
         TrackObjects(pImpl->current_objects, 
                      pImpl->previous_objects, 
@@ -3850,7 +3915,27 @@ StatusCode FallDetector::Detect(const Image& frame, bool& is_fall) {
                      pImpl->object_first_seen_frame, 
                      pImpl->object_is_new_entry, 
                      pImpl->persistent_object_blocks, 
-                     (int)pImpl->frame_idx);
+                     (int)pImpl->frame_idx,
+                     expired_ids);
+                     
+        // GARBAGE COLLECTION: Prevent Memory Leaks / Edge Device OOM
+        for (int id : expired_ids) {
+            pImpl->object_first_seen_frame.erase(id);
+            pImpl->object_is_new_entry.erase(id);
+            // Local maps are effectively cleared every frame.
+            // Only erase global struct maps here:
+            pImpl->object_bed_exit_status.erase(id);
+            pImpl->object_bed_stats_history.erase(id);
+            pImpl->object_accumulated_descent.erase(id);
+            pImpl->observation_states.erase(id);
+            pImpl->object_y_history_buffer.erase(id);
+            pImpl->object_safe_ratio_history_buffer.erase(id);
+            
+            // Clean up any pending falls associated with this dead object
+            auto pf_it = std::remove_if(pImpl->pending_falls.begin(), pImpl->pending_falls.end(), 
+                                        [id](const auto& pf){ return pf.object_id == id; });
+            pImpl->pending_falls.erase(pf_it, pImpl->pending_falls.end());
+        }
     }
     
     // INJECT LOST TRACKS (Coasting)
@@ -5483,8 +5568,8 @@ StatusCode FallDetector::Detect(const Image& frame, bool& is_fall) {
                                 
                                 pImpl->LogTrace(curr.id, pImpl->frame_idx, "DETECTED", obs_mom_avg, (is_flat_posture ? "Adaptive Threshold Passed" : "Normal Threshold Passed"));
 
-                                // Activate Persistence (Suppress struggles for 150 frames = 5 seconds at 30fps)
-                                state.post_fall_counter = 75; 
+                                // Activate Persistence (Suppress struggles for 30 frames = 1 second at 30fps)
+                                state.post_fall_counter = 30; 
                                 state.fall_snapshot_dx = curr.avgDx;
                                 state.fall_snapshot_dy = curr.avgDy;
                                 state.fall_snapshot_mom = std::sqrt(curr.avgDx*curr.avgDx + curr.avgDy*curr.avgDy);

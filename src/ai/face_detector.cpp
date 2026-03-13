@@ -270,6 +270,7 @@ public:
              free(task_outputs);
         }
         for (int i=0; i<model_mem.segNum; i++) free_mmz_memory(&model_mem.memInfo[i].mem);
+        for (int i=0; i<task_mem.segNum; i++) free_mmz_memory(&task_mem.memInfo[i].mem);
         
         initialized = false;
     }
@@ -392,10 +393,10 @@ public:
         
         // --- SAVE DEBUG IMAGE ---
         static int debug_frame_count = 0;
-        char debug_filename[256];
-        snprintf(debug_filename, sizeof(debug_filename), "debug_face_input/face_input_%05d.bmp", debug_frame_count++);
+        //char debug_filename[256];
+        //snprintf(debug_filename, sizeof(debug_filename), "face_input_%05d.bmp", debug_frame_count++);
         // Assuming img is 128x128 Gray (YUV400)
-        // save_debug_gray_bmp(debug_filename, (const unsigned char*)img.data, img.width, img.height);
+        //save_debug_gray_bmp(debug_filename, (const unsigned char*)img.data, img.width, img.height);
         // ------------------------
 
         // 1. Copy image data to NPU input buffer
@@ -410,6 +411,7 @@ public:
          flush_mmz_memory(&task_inputs[0].dataIn);
          // printf("before NPU Forward\n");
          // 2. Inference
+         //std::cout<<"GO NPU"<<std::endl;
          int ret = TY_NPU_Forward(task_handle, E_TY_NPU_ID_0, 
                                   model_desc.ioDesc.inputNum, task_inputs, 
                                   model_desc.ioDesc.outputNum, task_outputs);

@@ -24,7 +24,9 @@
 #include "ffmpeg_precoss.h" // 加入這行
 #include <memory> // For std::unique_ptr
 
-
+#ifdef ENABLE_OPENCV_DISPLAY
+#include <opencv2/opencv.hpp>
+#endif
 using namespace VisionSDK;
 
 #include <sys/stat.h>
@@ -34,10 +36,15 @@ using namespace VisionSDK;
 // TOGGLE: 1 = Use SDK Internal Logic, 0 = Use Demo Custom Logic (Peak-Valley)
 #define USE_SDK_FALL_RESULT 1
 
-#define SAVE_ALL_TEST_IMAGES 1
+#define SAVE_ALL_TEST_IMAGES 0
 #define SAVE_GRID_IMAGE 1
-#define SAVE_FACE_IMAGES 1
+#define SAVE_FACE_IMAGES 0
 #define DRAW_PERSPECTIVE_AND_AXIS 0
+#define ENABLE_VIDEO_RECORDING 1
+#include <ctime>
+#include <iomanip>
+#include <sstream>
+
 // Drawing Helper
 void drawRectRGB(std::vector<uint8_t>& img, int w, int h, int x, int y, int rw, int rh, uint8_t r, uint8_t g, uint8_t b, int thickness=2) {
     if (x < 0) x = 0; if (y < 0) y = 0;
@@ -941,6 +948,24 @@ int main(int argc, char** argv) {
     double total_process_time_ms = 0.0;
     long frame_count_time = 0;
 
+#if ENABLE_VIDEO_RECORDING
+#ifdef ENABLE_OPENCV_DISPLAY
+    cv::VideoWriter raw_video_writer;
+    {
+        auto t = std::time(nullptr);
+        auto tm = *std::localtime(&t);
+        std::ostringstream oss;
+        oss << save_dir << "/record_" << std::put_time(&tm, "%Y%m%d_%H%M%S") << ".mp4";
+        raw_video_writer.open(oss.str(), cv::VideoWriter::fourcc('m', 'p', '4', 'v'), 30.0, cv::Size(W, H), true);
+        if(!raw_video_writer.isOpened()){
+            std::cerr << "[Demo] Failed to open VideoWriter for " << oss.str() << std::endl;
+        } else {
+            std::cout << "[Demo] Recording raw video to " << oss.str() << std::endl;
+        }
+    }
+#endif
+#endif
+
     for (int i = start_frame; i < total_frames; i += frame_step) {
         
         auto t_read_start = std::chrono::steady_clock::now();
@@ -980,6 +1005,18 @@ int main(int argc, char** argv) {
 #if (SAVE_ALL_TEST_IMAGES || SAVE_GRID_IMAGE)
         memcpy(clean_frame_rgb.data(), file_buffer.data(), frame_size_rgb);
 #endif
+
+#if ENABLE_VIDEO_RECORDING
+#ifdef ENABLE_OPENCV_DISPLAY
+        if (raw_video_writer.isOpened()) {
+            cv::Mat frame_rgb(H, W, CV_8UC3, file_buffer.data());
+            cv::Mat frame_bgr;
+            cv::cvtColor(frame_rgb, frame_bgr, cv::COLOR_RGB2BGR);
+            raw_video_writer.write(frame_bgr);
+        }
+#endif
+#endif
+
         // (current_frame_rgb_onlyBlock removed)
         current_frame_idx = i;
         is_fall_in_current_frame = false; // Reset
@@ -2241,11 +2278,34 @@ int main(int argc, char** argv) {
             char grid_filename[256];
             snprintf(grid_filename, sizeof(grid_filename), "%s/grid_frame_%05d.jpg", save_dir.c_str(), i);
             stbi_write_jpg(grid_filename, CW, CH, 3, composite.data(), 85);
+
+#ifdef ENABLE_OPENCV_DISPLAY
+            // Convert RGB to BGR for OpenCV
+            cv::Mat cv_img(CH, CW, CV_8UC3, composite.data());
+            cv::Mat cv_bgr;
+            cv::cvtColor(cv_img, cv_bgr, cv::COLOR_RGB2BGR);
+            cv::imshow("Grid Output", cv_bgr);
+            int key = cv::waitKey(1) & 0xFF;
+            if (key == 'q' || key == 27) { // 27 is ESC
+                std::cout << "[Demo] Exiting by user input (q/ESC)." << std::endl;
+                break;
+            }
+#endif
+
         }
 #endif // SAVE_GRID_IMAGE
         
     } // End of loop
     
+#if ENABLE_VIDEO_RECORDING
+#ifdef ENABLE_OPENCV_DISPLAY
+    if (raw_video_writer.isOpened()) {
+        raw_video_writer.release();
+        std::cout << "[Demo] Video Recording Saved." << std::endl;
+    }
+#endif
+#endif
+
     // Close interval if still falling at end
     if (is_currently_falling && f_interval.is_open()) {
         f_interval << fall_start_frame << "," << (total_frames - 1) << "\n";
