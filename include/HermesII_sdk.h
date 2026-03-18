@@ -51,6 +51,7 @@ struct ObjectExtraction_v1 {
     int foreground_merge_radius = 1; // NEW: Default 1 pixel merge
     float tracking_overlap_threshold = 0.0f;
     int tracking_mode = 0; 
+    int tracking_ttl = 60; // NEW
 };
 
 struct FallDetection_v1 {
@@ -145,7 +146,7 @@ struct Image {
     int width;
     int height;
     int channels;
-    uint64_t timestamp; // Timestamp in milliseconds
+    uint64_t timestamp; // Timestamp in milliseconds (ms since epoch or monotonic)
 };
 
 struct DetectionResult {
@@ -240,6 +241,7 @@ struct MotionObject {
     
     // NEW: Debug info for visualization
     int matched_fg_obj_id = -1; // ID of the FullFrameObject used for perspective check
+    float matched_fg_dist = -1.0f; // NEW: Squared distance to matched FG object
     bool is_in_observation_mode = false; // NEW: True if currently in Case 5 observation (or waiting)
 };
 
@@ -320,7 +322,28 @@ public:
     // Coordinate Mapping V2
     StatusCode MapPointV2(float ir_x, float ir_y, const FusionParams& params, float& th_x, float& th_y);
 
+    /**
+     * @brief Store IR/Thermal camera intrinsics and extrinsics in the SDK
+     *        for use with MapROI(). Call once before using MapROI().
+     */
+    void SetFusionCameraParams(const FusionParams& params);
 
+    /**
+     * @brief Map an IR ROI (x, y, w, h) to the corresponding bounding box
+     *        in the thermal image, using params stored by SetFusionCameraParams().
+     *
+     * @param ir_x   ROI left edge in IR image (pixels)
+     * @param ir_y   ROI top edge  in IR image (pixels)
+     * @param ir_w   ROI width  in IR image (pixels)
+     * @param ir_h   ROI height in IR image (pixels)
+     * @param out_x  Output: left edge in thermal image
+     * @param out_y  Output: top  edge in thermal image
+     * @param out_w  Output: width  in thermal image
+     * @param out_h  Output: height in thermal image
+     * @return StatusCode::OK, or ERROR_INVALID_INPUT if params not set yet.
+     */
+    StatusCode MapROI(float ir_x, float ir_y, float ir_w, float ir_h,
+                      float& out_x, float& out_y, float& out_w, float& out_h);
 
 
     // Unified Fall Detection API
@@ -335,7 +358,7 @@ public:
      * @param channels Image channels (e.g., 3 for RGB).
      * @return StatusCode 
      */
-    StatusCode SetInputMemory(unsigned char* buffer, int width, int height, int channels);
+    StatusCode SetInputMemory(unsigned char* buffer, int width, int height, int channels, uint64_t timestamp = 0);
 
     /**
      * @brief Set the Background Image explicitly.

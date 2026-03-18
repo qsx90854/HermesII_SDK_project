@@ -54,6 +54,7 @@ struct InternalConfig {
     int foreground_merge_radius = 1; // NEW: Separate pixel merge radius
     float tracking_overlap_threshold = 0.5f;
     int tracking_mode = 1; 
+    int tracking_ttl = 60; // NEW: Object persistence time in frames
 
     // Fall Detection
     float fall_movement_threshold = 2.0f;
@@ -128,6 +129,9 @@ public:
 
     // Register a callback for fall events
     void RegisterCallback(VisionSDKCallback cb);
+
+    // Enable per-frame debug logging to a file (call after Init)
+    void EnableDebugLog(const std::string& filepath);
 
     // Main Detection Logic
     // Returns status code (0 = success)

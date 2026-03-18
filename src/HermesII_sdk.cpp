@@ -4,6 +4,9 @@
 #include "fall/fall_detector.h"
 #include "Image.h"
 #include <iostream>
+#include <fstream>
+#include <ctime>
+#include <chrono>
 
 // Note: Do not wrap entire file in namespace VisionSDK
 // to avoid "VisionSDK::VisionSDK::" confusion if using prefix.
@@ -23,6 +26,11 @@ namespace VisionSDK {
         int input_width = 0;
         int input_height = 0;
         int input_channels = 0;
+        uint64_t input_timestamp = 0;
+
+        // Stored fusion params (for MapROI)
+        FusionParams stored_fusion_params;
+        bool has_stored_fusion_params = false;
     };
 }
 
@@ -32,13 +40,52 @@ using namespace VisionSDK;
 VisionSDK::VisionSDK::VisionSDK() : pImpl(std::unique_ptr<Impl>(new Impl())) {}
 VisionSDK::VisionSDK::~VisionSDK() = default;
 
-#define VISION_SDK_VERSION_INTERNAL "2.0.1a"
+#define VISION_SDK_VERSION_INTERNAL "2.0.1c"
 
 const char* VisionSDK::VisionSDK::GetVersion() {
     return VISION_SDK_VERSION_INTERNAL;
 }
 
 StatusCode VisionSDK::VisionSDK::Init(const std::string& model_path, int num_threads) {
+    // ---- [sdk.ini] Read debug logging config ----
+    {
+        bool save_txt = false;
+        std::ifstream ini_file("sdk.ini");
+        if (ini_file.is_open()) {
+            std::string line;
+            while (std::getline(ini_file, line)) {
+                // Strip spaces around '='
+                auto pos = line.find('=');
+                if (pos != std::string::npos) {
+                    std::string key = line.substr(0, pos);
+                    std::string val = line.substr(pos + 1);
+                    // Trim whitespace
+                    key.erase(0, key.find_first_not_of(" \t\r\n"));
+                    key.erase(key.find_last_not_of(" \t\r\n") + 1);
+                    val.erase(0, val.find_first_not_of(" \t\r\n"));
+                    val.erase(val.find_last_not_of(" \t\r\n") + 1);
+                    if (key == "save_txt" && val == "1") {
+                        save_txt = true;
+                    }
+                }
+            }
+            ini_file.close();
+            std::cout << "[SDK] sdk.ini loaded. save_txt=" << (int)save_txt << std::endl;
+        } else {
+            std::cout << "[SDK] sdk.ini not found, debug logging disabled." << std::endl;
+        }
+
+        if (save_txt) {
+            // Build timestamped filename: sdk_fall_debug_YYYYMMDD_HHMMSS.txt
+            std::time_t now = std::time(nullptr);
+            char timebuf[32];
+            std::strftime(timebuf, sizeof(timebuf), "%Y%m%d_%H%M%S", std::localtime(&now));
+            std::string log_path = std::string("sdk_fall_debug_") + timebuf + ".txt";
+            pImpl->fall_detector.EnableDebugLog(log_path);
+        }
+    }
+    // ---- [sdk.ini] end ----
+
     pImpl->config.model_path = model_path;
     pImpl->config.num_threads = num_threads;
     
@@ -71,7 +118,7 @@ StatusCode VisionSDK::VisionSDK::SetConfig(const void* config) {
             pImpl->config.grid_rows = c->grid_rows;
             pImpl->config.block_size = c->block_size;
             pImpl->config.search_range = c->search_range;
-            pImpl->config.history_size = c->history_size;
+            pImpl->config.history_size = 2;//c->history_size;
             pImpl->config.search_mode = c->search_mode;
             pImpl->config.block_change_threshold = c->block_change_threshold;
             pImpl->config.enable_block_decay = c->enable_block_decay;
@@ -87,6 +134,7 @@ StatusCode VisionSDK::VisionSDK::SetConfig(const void* config) {
             pImpl->config.foreground_merge_radius = c->foreground_merge_radius; // NEW
             pImpl->config.tracking_overlap_threshold = c->tracking_overlap_threshold;
             pImpl->config.tracking_mode = c->tracking_mode;
+            pImpl->config.tracking_ttl = c->tracking_ttl; // NEW
             break;
         }
         case ConfigType::FallDetection_v1: {
@@ -120,7 +168,7 @@ StatusCode VisionSDK::VisionSDK::SetConfig(const void* config) {
             pImpl->config.fall_window_size = c->fall_window_size;
             pImpl->config.fall_duration = c->fall_duration;
             pImpl->config.enable_face_detection = c->enable_face_detection;
-            pImpl->config.face_detect_interval_frames = c->face_detect_interval_frames;
+            pImpl->config.face_detect_interval_frames = 30;//c->face_detect_interval_frames;
             pImpl->config.bg_update_interval_frames = c->bg_update_interval_frames;
             pImpl->config.bg_update_alpha = c->bg_update_alpha;
             pImpl->config.enable_save_bg_mask = c->enable_save_bg_mask;
@@ -285,18 +333,14 @@ StatusCode VisionSDK::VisionSDK::FuseImages3D(const Image& imgA, const CameraInt
     return StatusCode::OK;
 }
 
-StatusCode VisionSDK::VisionSDK::SetInputMemory(unsigned char* buffer, int width, int height, int channels) {
+StatusCode VisionSDK::VisionSDK::SetInputMemory(unsigned char* buffer, int width, int height, int channels, uint64_t timestamp) {
     if (!buffer) return StatusCode::ERROR_INVALID_INPUT;
     
     pImpl->input_buffer = buffer;
     pImpl->input_width = width;
     pImpl->input_height = height;
     pImpl->input_channels = channels;
-
-    // Wrap buffer in Image struct
-    // (Unused wrapper variable removed)
-    // Debug Print
-    // printf("[VisionSDK::SetInputMemory] Input buffer=%p, w=%d, h=%d, c=%d\n", buffer, width, height, channels);
+    pImpl->input_timestamp = timestamp;
 
     return StatusCode::OK;
 }
@@ -329,10 +373,18 @@ StatusCode VisionSDK::VisionSDK::ProcessNextFrame() {
     internal_img.width = pImpl->input_width;
     internal_img.height = pImpl->input_height;
     internal_img.channels = pImpl->input_channels;
-    internal_img.timestamp = 0;
+    internal_img.timestamp = pImpl->input_timestamp;
     
     bool is_fall = false;
+    
+    // Performance Profiling
+    auto t0 = std::chrono::high_resolution_clock::now();
     StatusCode ret = pImpl->fall_detector.Detect(internal_img, is_fall);
+    auto t1 = std::chrono::high_resolution_clock::now();
+    auto duration = std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count();
+    
+    std::cout << "[SDK] Detect() Execution Time: " << duration << " us" << std::endl;
+
     if (ret != StatusCode::OK) return StatusCode::ERROR_INVALID_INPUT;
     
     return StatusCode::OK;
@@ -369,6 +421,47 @@ StatusCode VisionSDK::VisionSDK::MapPointV2(float ir_x, float ir_y, const Fusion
     return StatusCode::OK;
 }
 
+void VisionSDK::VisionSDK::SetFusionCameraParams(const FusionParams& params) {
+    pImpl->stored_fusion_params = params;
+    pImpl->has_stored_fusion_params = true;
+}
+
+StatusCode VisionSDK::VisionSDK::MapROI(
+        float ir_x, float ir_y, float ir_w, float ir_h,
+        float& out_x, float& out_y, float& out_w, float& out_h) {
+    if (!pImpl->has_stored_fusion_params) {
+        std::cerr << "[SDK] MapROI: fusion params not set. Call SetFusionCameraParams() first." << std::endl;
+        return StatusCode::ERROR_INVALID_INPUT;
+    }
+    const FusionParams& p = pImpl->stored_fusion_params;
+
+    // Map 4 corners of the IR ROI to thermal coordinates
+    float corners_ir[4][2] = {
+        {ir_x,          ir_y         },  // TL
+        {ir_x + ir_w,   ir_y         },  // TR
+        {ir_x + ir_w,   ir_y + ir_h  },  // BR
+        {ir_x,          ir_y + ir_h  }   // BL
+    };
+
+    float tx_min =  1e9f, ty_min =  1e9f;
+    float tx_max = -1e9f, ty_max = -1e9f;
+
+    for (int i = 0; i < 4; ++i) {
+        float tx, ty;
+        pImpl->image_fusion.TransformPointV2(corners_ir[i][0], corners_ir[i][1], p, tx, ty);
+        if (tx < tx_min) tx_min = tx;
+        if (tx > tx_max) tx_max = tx;
+        if (ty < ty_min) ty_min = ty;
+        if (ty > ty_max) ty_max = ty;
+    }
+
+    out_x = tx_min;
+    out_y = ty_min;
+    out_w = tx_max - tx_min;
+    out_h = ty_max - ty_min;
+    return StatusCode::OK;
+}
+
 
 // std::vector<MotionObject> VisionSDK::VisionSDK::GetMotionObjects() {
 //     return pImpl->fall_detector.GetMotionObjects();
@@ -385,7 +478,7 @@ void VisionSDK::VisionSDK::GetMotionObjects(std::vector<MotionObject>& out_objec
     }
 
     if (log_it) {
-         printf("[SDK-Wrapper-Ref] Filling Source Size:%lu IDs:", objs.size());
+         printf("[SDK-Wrapper-Ref] Filling Source Size:%zu IDs:", objs.size());
          for(const auto& o : objs) printf(" %d", o.id);
          printf("\n");
     }

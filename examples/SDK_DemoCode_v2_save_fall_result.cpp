@@ -36,11 +36,11 @@ using namespace VisionSDK;
 // TOGGLE: 1 = Use SDK Internal Logic, 0 = Use Demo Custom Logic (Peak-Valley)
 #define USE_SDK_FALL_RESULT 1
 
-#define SAVE_ALL_TEST_IMAGES 0
+#define SAVE_ALL_TEST_IMAGES 1
 #define SAVE_GRID_IMAGE 1
 #define SAVE_FACE_IMAGES 0
 #define DRAW_PERSPECTIVE_AND_AXIS 0
-#define ENABLE_VIDEO_RECORDING 1
+#define ENABLE_VIDEO_RECORDING 0
 #include <ctime>
 #include <iomanip>
 #include <sstream>
@@ -931,15 +931,30 @@ int main(int argc, char** argv) {
     std::vector<FallInterval> detected_intervals_vec;
 
 
-    // Check if input is RTSP or string
-    std::string rtsp_url = appCfg.getString("Demo.Demo_RTSP_URL", "rtsp://10.161.116.233:1254/live"); //rtsp://10.0.1.105:1254/live
-    std::cout << "[Demo] RTSP Mode: " << rtsp_url << std::endl;
+    // Check input type: Video (mp4/avi/etc), RTSP, or RAW Sequence
+    std::string rtsp_url = appCfg.getString("Demo.Demo_RTSP_URL", ""); 
+    std::string lower_format = imgFormat;
+    std::transform(lower_format.begin(), lower_format.end(), lower_format.begin(), ::tolower);
+    
+    bool is_video_file = (lower_format.find(".mp4") != std::string::npos || 
+                          lower_format.find(".avi") != std::string::npos || 
+                          lower_format.find(".mkv") != std::string::npos || 
+                          lower_format.find(".mov") != std::string::npos);
+    bool is_rtsp = (rtsp_url.find("rtsp://") == 0);
+    bool is_raw_sequence = (lower_format.find(".raw") != std::string::npos || lower_format.find("%") != std::string::npos);
+
     std::unique_ptr<VideoReader> videoReader = nullptr;
-    try {
+    if (is_video_file) {
+        std::cout << "[Demo] Video File Mode: " << imgFormat << std::endl;
+        videoReader = std::make_unique<VideoReader>(imgFormat, W, H);
+    } else if (is_raw_sequence) {
+        std::cout << "[Demo] RAW Sequence Mode: " << imgFormat << std::endl;
+        // No videoReader needed for RAW
+    } else if (is_rtsp) {
+        std::cout << "[Demo] RTSP Mode: " << rtsp_url << std::endl;
         videoReader = std::make_unique<VideoReader>(rtsp_url, W, H);
-    } catch (const std::exception& e) {
-        std::cerr << "Error opening RTSP stream: " << e.what() << std::endl;
-        return -1;
+    } else {
+        std::cerr << "[Demo] Warning: No valid input source found." << std::endl;
     }
 
     // Main processing loop
@@ -971,29 +986,41 @@ int main(int argc, char** argv) {
         auto t_read_start = std::chrono::steady_clock::now();
 
         if (videoReader) {
+            // A. FFmpeg Reader (Video / RTSP)
             // Apply Frame Step Skipping for stream (discard frames)
-            if (i > start_frame) { // Don't skip before the very first frame
+            if (i > start_frame) { 
                 for (int s = 0; s < frame_step - 1; ++s) {
-                    if (!videoReader->readFrame(file_buffer)) {
-                        break; 
-                    }
+                    if (!videoReader->readFrame(file_buffer)) break; 
                 }
             }
-
-             // 讀取 RTSP 的下一幀到 file_buffer 中，並自動 Resize 轉 RGB
             if (!videoReader->readFrame(file_buffer)) {
-                std::cout << "串流讀取完畢或發生錯誤，結束迴圈。" << std::endl;
-                break; // 串流中斷就跳出迴圈
+                std::cout << "[Demo] Stream/Video finished." << std::endl;
+                break;
+            }
+        } else {
+            // B. RAW Sequence Reader (Traditional)
+            char filename[512];
+            snprintf(filename, sizeof(filename), imgFormat.c_str(), i);
+            FILE* fp = fopen(filename, "rb");
+            if (!fp) {
+                std::cerr << "[Demo] Failed to open RAW frame: " << filename << std::endl;
+                break;
+            }
+            size_t read_bytes = fread(file_buffer.data(), 1, frame_size_rgb, fp);
+            fclose(fp);
+            if (read_bytes != frame_size_rgb) {
+                std::cerr << "[Demo] RAW file size mismatch: " << filename << std::endl;
+                break;
             }
         }
         
-        // Timer End for Read
         auto t_read_end = std::chrono::steady_clock::now();
         double read_duration_ms = std::chrono::duration<double, std::milli>(t_read_end - t_read_start).count();
 
         // Simulate 30FPS Camera (Ensure Read+Wait = 33ms)
-        // 對於即時 RTSP 影像，不應該手動 sleep，否則會累積延遲造成掉幀
-        if (rtsp_url.find("rtsp://") != 0) {
+        // If it's a real RTSP stream, don't sleep
+        bool is_live_rtsp = (videoReader && rtsp_url.find("rtsp://") == 0);
+        if (!is_live_rtsp) {
             if (read_duration_ms < 33.0) {
                 int sleep_ms = (int)(33.0 - read_duration_ms);
                 std::this_thread::sleep_for(std::chrono::milliseconds(sleep_ms));
