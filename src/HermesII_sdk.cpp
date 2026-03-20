@@ -135,6 +135,7 @@ StatusCode VisionSDK::VisionSDK::SetConfig(const void* config) {
             pImpl->config.tracking_overlap_threshold = c->tracking_overlap_threshold;
             pImpl->config.tracking_mode = c->tracking_mode;
             pImpl->config.tracking_ttl = c->tracking_ttl; // NEW
+            if (pImpl->config.tracking_ttl <= 0) pImpl->config.tracking_ttl = 1000; // Force default if user passed 0
             break;
         }
         case ConfigType::FallDetection_v1: {
@@ -174,7 +175,7 @@ StatusCode VisionSDK::VisionSDK::SetConfig(const void* config) {
             pImpl->config.enable_save_bg_mask = c->enable_save_bg_mask;
             pImpl->config.bg_init_start_frame = c->bg_init_start_frame;
             pImpl->config.bg_init_end_frame = c->bg_init_end_frame;
-            pImpl->config.bg_diff_threshold = c->bg_diff_threshold;
+            pImpl->config.bg_diff_threshold = 28;//c->bg_diff_threshold; //18 up
             pImpl->config.fall_acceleration_upper_threshold = c->fall_acceleration_upper_threshold;
             pImpl->config.fall_acceleration_lower_threshold = c->fall_acceleration_lower_threshold;
             pImpl->config.post_fall_distance_threshold = c->post_fall_distance_threshold;
@@ -248,6 +249,7 @@ StatusCode VisionSDK::VisionSDK::SetConfig(const void* config) {
     printf("[PARAM-DUMP]  foreground_merge_radius           = %d\n", cfg.foreground_merge_radius);
     printf("[PARAM-DUMP]  tracking_overlap_threshold        = %.4f\n", cfg.tracking_overlap_threshold);
     printf("[PARAM-DUMP]  tracking_mode                     = %d\n", cfg.tracking_mode);
+    printf("[PARAM-DUMP]  tracking_ttl                      = %d\n", cfg.tracking_ttl);
     // Fall Detection
     printf("[PARAM-DUMP]  fall_movement_threshold           = %.4f\n", cfg.fall_movement_threshold);
     printf("[PARAM-DUMP]  fall_strong_threshold             = %.4f\n", cfg.fall_strong_threshold);
