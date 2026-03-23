@@ -115,6 +115,7 @@ void projectPoint(float u, float v, const float H[9], float& x, float& y) {
 // Visualization Utilities (RGB)
 // =========================================================
 static void drawRectangleGray(uint8_t* data, int w, int h, int x1, int y1, int x2, int y2, uint8_t color, int thickness = 3) {
+    if (!data || w <= 0 || h <= 0) return;
     for (int t = 0; t < thickness; ++t) {
         int nx1 = x1 + t;
         int ny1 = y1 + t;
@@ -123,12 +124,16 @@ static void drawRectangleGray(uint8_t* data, int w, int h, int x1, int y1, int x
         if (nx1 > nx2 || ny1 > ny2) break;
         
         for (int x = nx1; x <= nx2; ++x) {
-            if (ny1 >= 0 && ny1 < h) data[ny1 * w + x] = color;
-            if (ny2 >= 0 && ny2 < h) data[ny2 * w + x] = color;
+            if (x >= 0 && x < w) {
+                if (ny1 >= 0 && ny1 < h) data[ny1 * w + x] = color;
+                if (ny2 >= 0 && ny2 < h) data[ny2 * w + x] = color;
+            }
         }
         for (int y = ny1; y <= ny2; ++y) {
-            if (nx1 >= 0 && nx1 < w) data[y * w + nx1] = color;
-            if (nx2 >= 0 && nx2 < w) data[y * w + nx2] = color;
+            if (y >= 0 && y < h) {
+                if (nx1 >= 0 && nx1 < w) data[y * w + nx1] = color;
+                if (nx2 >= 0 && nx2 < w) data[y * w + nx2] = color;
+            }
         }
     }
 }
@@ -342,6 +347,10 @@ std::vector<::VisionSDK::ObjectFeatures> find_objects_optimized(const uint8_t* m
             for (int j = i + 1; j < (int)blobs.size(); ++j) {
                 if (blobs[j].merged) continue;
 
+                // NEW: Only allow merging if BOTH objects are substantial (> 30 pixels).
+                // This prevents small noise points from chaining together or "bridging" large objects.
+                if (blobs[i].count <= 30 || blobs[j].count <= 30) continue;
+
                 if (!(blobs[i].max_x + expansion < blobs[j].min_x - expansion ||
                       blobs[i].min_x - expansion > blobs[j].max_x + expansion ||
                       blobs[i].max_y + expansion < blobs[j].min_y - expansion ||
@@ -364,9 +373,13 @@ std::vector<::VisionSDK::ObjectFeatures> find_objects_optimized(const uint8_t* m
     }
 
     // 3. Output results (Skip moments for Case 5)
-    const int minAreaThreshold = 50; 
+    // solidity filter: pixel_count / bounding_box_area > 0.05 (5%)
     for (auto& blob : blobs) {
-        if (!blob.merged && blob.count > minArea && blob.count >= minAreaThreshold) {
+        float bW = (float)(blob.max_x - blob.min_x + 1);
+        float bH = (float)(blob.max_y - blob.min_y + 1);
+        float solidity = (float)blob.count / (bW * bH);
+        
+        if (!blob.merged && blob.count > minArea && blob.count >= 50 && solidity > 0.05f) {
             ::VisionSDK::ObjectFeatures obj;
             obj.id = (int)results.size();
             obj.area = blob.count;
@@ -427,6 +440,12 @@ static void getObjectBoundingBoxPixels(const MotionObject& obj, int grid_cols, i
     out_max_x = (max_block_x + 1) * block_width;  // +1 to get right edge of block
     out_max_y = (max_block_y + 1) * block_height; // +1 to get bottom edge of block
     
+    // Safety Clamping: Ensure coordinates are within image bounds
+    if (out_max_x >= frame_width) out_max_x = frame_width - 1;
+    if (out_max_y >= frame_height) out_max_y = frame_height - 1;
+    if (out_min_x < 0) out_min_x = 0;
+    if (out_min_y < 0) out_min_y = 0;
+
     out_bbox_width = out_max_x - out_min_x;
     out_bbox_height = out_max_y - out_min_y;
 }
@@ -3705,7 +3724,9 @@ StatusCode FallDetector::Detect(const Image& frame, bool& is_fall) {
     int bSize = (pImpl->config.block_size > 0) ? pImpl->config.block_size : 16;
     
 #if ENABLE_DEBUG_FRAME_SAVE
-    auto save_debug_jpg = [&](const char* event_name, const MotionObject& obj) {
+    auto save_debug_jpg = [&](const char* event_name, const MotionObject& obj) 
+    {
+        DEBUG_PRINT("[Debug] Start Saving event %s frame jpg %lld\n", event_name, (long long)pImpl->absolute_frame_count);
         int channels = frame.channels;
         if (channels != 3 && channels != 1) return; // Support RGB and Grayscale
         
@@ -3870,15 +3891,6 @@ StatusCode FallDetector::Detect(const Image& frame, bool& is_fall) {
 #endif
         }
 
-#if ENABLE_DEBUG_FRAME_SAVE
-        if (pImpl->absolute_frame_count % ggap == 0) {
-            pImpl->lastMaskData = maskData;
-            pImpl->lastMaskW = w;
-            pImpl->lastMaskH = h;
-        } else {
-            pImpl->lastMaskData.clear();
-        }
-#endif
 
         {
             TimerGuard t_find_obj(g_perf_timer, "1_1b_FindObjects");
@@ -3893,6 +3905,27 @@ StatusCode FallDetector::Detect(const Image& frame, bool& is_fall) {
                 pImpl->full_frame_objects.resize(5);
             }
         }
+
+#if ENABLE_DEBUG_FRAME_SAVE
+        if (pImpl->absolute_frame_count % ggap == 0) 
+        {
+            pImpl->lastMaskData.assign(w * h, 0); // Start with clean black mask
+            pImpl->lastMaskW = w;
+            pImpl->lastMaskH = h;
+            // Only copy pixels from substantial objects (> 30 pixels)
+            for (const auto& f_obj : pImpl->full_frame_objects) {
+                if (f_obj.area > 30) {
+                    for (int p_idx : f_obj.pixels) {
+                        if (p_idx >= 0 && (size_t)p_idx < pImpl->lastMaskData.size()) {
+                            pImpl->lastMaskData[p_idx] = 255;
+                        }
+                    }
+                }
+            }
+        } else {
+            pImpl->lastMaskData.clear();
+        }
+#endif
         
         if (pImpl->config.enable_save_bg_mask) {
              // (Logic for saving here if needed)
@@ -4095,7 +4128,9 @@ StatusCode FallDetector::Detect(const Image& frame, bool& is_fall) {
     for (bool b : pImpl->changed_mask) if (b) total_changed_blocks++;
 
 #if ENABLE_DEBUG_FRAME_SAVE
-    if (pImpl->absolute_frame_count % ggap == 0) {
+    if (pImpl->absolute_frame_count % ggap == 0) 
+    {
+        DEBUG_PRINT("[Debug] Start Saving frame jpg %lld\n", (long long)pImpl->absolute_frame_count);
         char filename[256];
         //mkdir("debug_frames", 0777);
         snprintf(filename, sizeof(filename), "/nfs/test1/frame_%06lld.jpg", (long long)pImpl->absolute_frame_count);
@@ -4132,8 +4167,9 @@ StatusCode FallDetector::Detect(const Image& frame, bool& is_fall) {
                 }
             }
             
-            stbi_write_jpg(filename, W, H, 1, gray_buffer.data(), 90);
+            stbi_write_jpg(filename, W, H, 1, gray_buffer.data(), 70);
         }
+        DEBUG_PRINT("[Debug] End Saving frame jpg %lld\n", (long long)pImpl->absolute_frame_count);
     }
 #endif
 
@@ -4515,11 +4551,12 @@ StatusCode FallDetector::Detect(const Image& frame, bool& is_fall) {
     // =========================================================
     {
     // [DIAG] PixelStats health snapshot - watch for unbounded growth
-    printf("[DIAG-PixelStats] frame=%lld  persistent_blocks=%zu  cur_objs=%zu  kalman=%zu\n",
-           pImpl->absolute_frame_count,
-           pImpl->persistent_object_blocks.size(),
-           pImpl->current_objects.size(),
-           pImpl->kalmanFilters.size());
+    // [DIAG] PixelStats health snapshot - silenced to reduce log flooding
+    // printf("[DIAG-PixelStats] frame=%lld  persistent_blocks=%zu  cur_objs=%zu  kalman=%zu\n",
+    //        pImpl->absolute_frame_count,
+    //        pImpl->persistent_object_blocks.size(),
+    //        pImpl->current_objects.size(),
+    //        pImpl->kalmanFilters.size());
     TimerGuard t_pixel_stats(g_perf_timer, "4_1_PixelStats");
     const unsigned char* currData = frame.data;
     const unsigned char* bgData = pImpl->backgroundFrame.empty() ? nullptr : pImpl->backgroundFrame.getData();
@@ -5336,8 +5373,8 @@ StatusCode FallDetector::Detect(const Image& frame, bool& is_fall) {
                         
                         if (is_ancestor_dead && (it->second.is_active || it->second.waiting_for_deceleration)) {
                             if (it->second.last_fg_valid) {
-                                float dx = it->second.last_fg_cx - curr.centerX;
-                                float dy = it->second.last_fg_cy - curr.centerY;
+                                float dx = it->second.last_fg_cx - (curr.centerX + 0.5f);
+                                float dy = it->second.last_fg_cy - (curr.centerY + 0.5f);
                                 float dist_sq = dx*dx + dy*dy;
                                 if (dist_sq < 9.0f) { // Within 3.0 grid blocks
                                     pImpl->observation_states[curr.id] = it->second;
@@ -5433,7 +5470,9 @@ StatusCode FallDetector::Detect(const Image& frame, bool& is_fall) {
                                curr.id, pImpl->frame_idx, recent_mom_avg, threshold1, curr.pixel_count);
                         pImpl->LogTrace(curr.id, pImpl->frame_idx, "WAIT_START", recent_mom_avg, "Peak Detected");
                         pImpl->LogTrace(curr.id, pImpl->frame_idx, "TRIGGER", recent_mom_avg, "Peak Momentum > 5.5");
+                        #if ENABLE_DEBUG_FRAME_SAVE
                         save_debug_jpg("WaitPhase", curr);
+                        #endif
                     }
                 } // End of Case 5 Trigger Check
 
@@ -5446,7 +5485,9 @@ StatusCode FallDetector::Detect(const Image& frame, bool& is_fall) {
                     if (state.frames_waiting > max_waiting_frames) {
                         DEBUG_PRINT("[Case5-ABORT] ID:%d WAIT phase timed out (limit:%d frames)\n", curr.id, max_waiting_frames);
                         pImpl->LogTrace(curr.id, pImpl->frame_idx, "WAIT_TIMEOUT", (float)state.frames_waiting, "Momentum never dropped");
+                        #if ENABLE_DEBUG_FRAME_SAVE
                         save_debug_jpg("WaitPhase_Abort", curr);
+                        #endif
                         state.waiting_for_deceleration = false;
                     }
 
@@ -5516,7 +5557,9 @@ StatusCode FallDetector::Detect(const Image& frame, bool& is_fall) {
                         DEBUG_PRINT("[Case5] ID:%d DECELERATION complete at frame %d (curr_mom=%.2f < %.2f) - starting observation\n",  
                                curr.id, pImpl->frame_idx, curr.strength, decel_threshold);
                         pImpl->LogTrace(curr.id, pImpl->frame_idx, "OBS_START", recent_mom_avg, "Deceleration Complete");
+                        #if ENABLE_DEBUG_FRAME_SAVE
                         save_debug_jpg("ObsStart", curr);
+                        #endif
                     }
 
                     // TRACK HERE DURING WAIT
@@ -5527,8 +5570,8 @@ StatusCode FallDetector::Detect(const Image& frame, bool& is_fall) {
                         int cols = pImpl->config.grid_cols;
 
                         // Center check & All Blocks check for ever_in_bed
-                        int cx = (int)(curr.centerX * (frame.width / cols)); 
-                        int cy = (int)(curr.centerY * (frame.height / pImpl->config.grid_rows));
+                        int cx = (int)((curr.centerX + 0.5f) * (frame.width / cols)); 
+                        int cy = (int)((curr.centerY + 0.5f) * (frame.height / pImpl->config.grid_rows));
                         if (cx >= 0 && cx < BW && cy >= 0 && cy < BH) {
                             if (bed_data[cy * BW + cx] == 0) {
                                 state.center_ever_in_bed = true;
@@ -5588,9 +5631,9 @@ StatusCode FallDetector::Detect(const Image& frame, bool& is_fall) {
                          float blk_w = (float)frame.width / pImpl->config.grid_cols;
                          
                          // Use Center X (converted to pixels) and Top/Bottom Y (pixels)
-                         float top_u = curr.centerX * blk_w; 
+                         float top_u = (curr.centerX + 0.5f) * blk_w; 
                          float top_v = (float)m2; // Min Y
-                         float bot_u = curr.centerX * blk_w;
+                         float bot_u = (curr.centerX + 0.5f) * blk_w;
                          float bot_v = (float)m4; // Max Y
                          
                          float tx, ty, bx, by;
@@ -5607,8 +5650,8 @@ StatusCode FallDetector::Detect(const Image& frame, bool& is_fall) {
                          curr.has_projection = true;
                          
                          // DEBUG: Verify Projection is set
-                         DEBUG_PRINT("[DEBUG-PROJ] F:%d ID:%d Set Proj: Top(%.1f, %.1f) Bot(%.1f, %.1f)\n", 
-                                pImpl->frame_idx, curr.id, tx, ty, bx, by);
+                         // DEBUG_PRINT("[DEBUG-PROJ] F:%d ID:%d Set Proj: Top(%.1f, %.1f) Bot(%.1f, %.1f)\n", 
+                         //        pImpl->frame_idx, curr.id, tx, ty, bx, by);
                     }
 
                     // Step 4.0b: Bed Ratio Accumulation
@@ -5641,8 +5684,8 @@ StatusCode FallDetector::Detect(const Image& frame, bool& is_fall) {
                         }
 
                         // NEW: Per-frame Center Check for center_ever_in_bed
-                        int cx = (int)(curr.centerX * (frame.width / pImpl->config.grid_cols)); 
-                        int cy = (int)(curr.centerY * (frame.height / pImpl->config.grid_rows));
+                        int cx = (int)((curr.centerX + 0.5f) * (frame.width / pImpl->config.grid_cols)); 
+                        int cy = (int)((curr.centerY + 0.5f) * (frame.height / pImpl->config.grid_rows));
                         if (cx >= 0 && cx < W && cy >= 0 && cy < H) {
                             if (bed_data[cy * W + cx] == 0) {
                                 state.center_ever_in_bed = true;
@@ -5673,71 +5716,72 @@ StatusCode FallDetector::Detect(const Image& frame, bool& is_fall) {
                              // (e.g. person lying still after a fall).
                              bool large_enough_motion = (curr.blocks.size() >= 3);
 
-                             // Determine center to search from:
-                             // If we have enough motion blocks, use curr.centerX/Y.
-                             // If not but we have a last known position, search from there.
-                             float search_cx = curr.centerX;
-                             float search_cy = curr.centerY;
-                             if (!large_enough_motion && state.last_fg_valid) {
-                                 search_cx = state.last_fg_cx;
-                                 search_cy = state.last_fg_cy;
-                             }
-
-                             for (size_t i = 0; i < pImpl->full_frame_objects.size(); ++i) {
-                                 // Size Filter to avoid matching small noise fragments
-                                 if (pImpl->full_frame_objects[i].pixels.size() < 100) continue;
-
-                                 // Convert FG object (Pixels) to Blocks
-                                 float fg_blk_cx = pImpl->full_frame_objects[i].cx / blk_w;
-                                 float fg_blk_cy = pImpl->full_frame_objects[i].cy / blk_h;
-
-                                 float dx = fg_blk_cx - search_cx;
-                                 float dy = fg_blk_cy - search_cy;
-                                 float dist = dx*dx + dy*dy;
-
-                                 if (dist < min_dist) {
-                                     min_dist = dist;
-                                     best_idx = (int)i;
-                                 }
-                             }
-                            
-                            // Debug Print if no suitable object found
-                            // if (best_idx == -1 && !pImpl->full_frame_objects.empty()) {
-                            // }
-                            
-                            // DEBUG_PRINT("[Case5-DEBUG] ID:%d F:%lld best_idx=%d min_dist=%.2f\n", curr.id, pImpl->frame_idx, best_idx, min_dist);
-
-                            // Relaxed distance threshold: 10 blocks (100.0)
+                            // Relaxed distance threshold: 3.0 blocks (9.0)
                             int matched_full_frame_idx = -1;
+                            float search_cx = curr.centerX + 0.5f;
+                            float search_cy = curr.centerY + 0.5f;
+                            bool jump_detected = false;
 
-                            if (best_idx >= 0 && min_dist < 100.0f) {  // Was 25.0f (5 blocks)
+                            if (state.last_fg_valid) {
+                                float dist_to_last = std::pow((curr.centerX + 0.5f) - state.last_fg_cx, 2) + std::pow((curr.centerY + 0.5f) - state.last_fg_cy, 2);
+                                if (dist_to_last > 25.0f) { 
+                                    jump_detected = true;
+                                    DEBUG_PRINT("[Case5-Match] Suspicious Centroid Jump (ID:%d Dist:%.1f). Using LastFGPos for search.\n", curr.id, dist_to_last);
+                                }
+                            }
+
+                            if ((!large_enough_motion || jump_detected) && state.last_fg_valid) {
+                                search_cx = state.last_fg_cx;
+                                search_cy = state.last_fg_cy;
+                            }
+
+                            // Re-run matching search with finalized search center
+                            best_idx = -1;
+                            min_dist = 999999.0f;
+                            for (size_t i = 0; i < pImpl->full_frame_objects.size(); ++i) {
+                                if (pImpl->full_frame_objects[i].pixels.size() < 100) continue;
+                                float fg_blk_cx = pImpl->full_frame_objects[i].cx / blk_w;
+                                float fg_blk_cy = pImpl->full_frame_objects[i].cy / blk_h;
+                                float dx = fg_blk_cx - search_cx;
+                                float dy = fg_blk_cy - search_cy;
+                                float dist = dx*dx + dy*dy;
+                                if (dist < min_dist) {
+                                    min_dist = dist;
+                                    best_idx = (int)i;
+                                }
+                            }
+
+                            if (best_idx >= 0 && min_dist < 9.0f) {  // Reduced from 36.0f (6 blocks) to 9.0 (3 blocks)
                                 // Standard Match Success
                                 auto& fg_obj = pImpl->full_frame_objects[best_idx];
                                 matched_full_frame_idx = best_idx;
-
-
-
-                                // Update last known position ONLY if enough motion blocks
+                                
+                                // Update last known position ONLY if enough motion blocks AND not a jump
                                 // to avoid overwriting a good position with a stale one.
-                                if (large_enough_motion) {
-                                    state.last_fg_cx = fg_obj.cx / blk_w;
-                                    state.last_fg_cy = fg_obj.cy / blk_h;
+                                if (large_enough_motion && !jump_detected) {
+                                    float new_cx = fg_obj.cx / blk_w;
+                                    float new_cy = fg_obj.cy / blk_h;
+                                    if (state.last_fg_valid) {
+                                        float fg_jump = std::pow(new_cx - state.last_fg_cx, 2) + std::pow(new_cy - state.last_fg_cy, 2);
+                                        if (fg_jump > 1.0f) {
+                                            DEBUG_PRINT("[Case5-Match] FG Jump Alert (ID:%d Dist:%.1f). FG object position shifted.\n", curr.id, fg_jump);
+                                        }
+                                    }
+                                    state.last_fg_cx = new_cx;
+                                    state.last_fg_cy = new_cy;
                                     state.last_fg_valid = true;
                                 }
 
-                                curr.matched_fg_obj_id = fg_obj.id; // Store ID for visualization
-                                curr.matched_fg_dist = min_dist;    // Store distance for debug log
-
-                                
-                                
-
-                            } else if (state.last_fg_valid) {
+                                curr.matched_fg_obj_id = fg_obj.id; 
+                                curr.matched_fg_dist = min_dist;    
+                            } else if (state.last_fg_valid && !jump_detected) { // Standard Recovery (only if we didn't already try LastFGPos via jump)
                                 // Match Failed, but we have a last known position.
                                 // Search near Last Known Position
                                 float rec_min_dist = 999999.0f;
                                 int rec_best_idx = -1;
                                 
-                                for (size_t i = 0; i < pImpl->full_frame_objects.size(); ++i) {
+                                for (size_t i = 0; i < pImpl->full_frame_objects.size(); ++i) 
+                                {
                                     if (pImpl->full_frame_objects[i].pixels.size() < 100) continue; 
                                     
                                     float fg_blk_cx = pImpl->full_frame_objects[i].cx / blk_w;
@@ -5753,16 +5797,23 @@ StatusCode FallDetector::Detect(const Image& frame, bool& is_fall) {
                                     }
                                 }
                                 
-
-                                if (rec_best_idx >= 0 && rec_min_dist < 100.0f) {
+                                if (rec_best_idx >= 0 && rec_min_dist < 9.0f) { // Reduced from 36.0f
                                     // Recovered!
                                     best_idx = rec_best_idx;
                                     auto& fg_obj = pImpl->full_frame_objects[best_idx];
                                     matched_full_frame_idx = best_idx;
                                     
                                     // Update Tracking State (Follow the FG object)
-                                    state.last_fg_cx = fg_obj.cx / blk_w;
-                                    state.last_fg_cy = fg_obj.cy / blk_h;
+                                    float new_cx = fg_obj.cx / blk_w;
+                                    float new_cy = fg_obj.cy / blk_h;
+                                    if (state.last_fg_valid) {
+                                        float fg_jump = std::pow(new_cx - state.last_fg_cx, 2) + std::pow(new_cy - state.last_fg_cy, 2);
+                                        if (fg_jump > 1.0f) {
+                                            DEBUG_PRINT("[Case5-Recovery] FG Jump Alert (ID:%d Dist:%.1f). Recovered at distance.\n", curr.id, fg_jump);
+                                        }
+                                    }
+                                    state.last_fg_cx = new_cx;
+                                    state.last_fg_cy = new_cy;
                                     
                                     curr.matched_fg_obj_id = fg_obj.id;
                                     curr.matched_fg_dist = rec_min_dist;
@@ -5900,10 +5951,15 @@ StatusCode FallDetector::Detect(const Image& frame, bool& is_fall) {
                                 // Check Center
                                 int cx = -1;
                                 int cy = -1;
-                                if (curr.matched_fg_obj_id != -1) {
-                                    for (const auto& f_obj : pImpl->full_frame_objects) {
-                                        if (f_obj.id == curr.matched_fg_obj_id) {
-                                            cx = (int)f_obj.cx; cy = (int)f_obj.cy; break; } }
+                                if (curr.matched_fg_obj_id != -1) 
+                                {
+                                    for (const auto& f_obj : pImpl->full_frame_objects) 
+                                    {
+                                        if (f_obj.id == curr.matched_fg_obj_id) 
+                                        {
+                                            cx = (int)f_obj.cx; cy = (int)f_obj.cy; break; 
+                                        } 
+                                    }
                                 }
                                 if (cx == -1) {
                                     cx = (int)(curr.centerX * (frame.width / pImpl->config.grid_cols)); 
@@ -5916,8 +5972,9 @@ StatusCode FallDetector::Detect(const Image& frame, bool& is_fall) {
                                     }
                                 }
                                 
-                                bool reject_bed = (center_in_bed_flag || state.center_ever_in_bed || avg_obs > pImpl->config.bed_pixel_ratio_threshold);
-
+                                bool reject_bed = (center_in_bed_flag);// || state.center_ever_in_bed || avg_obs > pImpl->config.bed_pixel_ratio_threshold);
+                                DEBUG_PRINT("[Case5-DEBUG] ID:%d reject_bed=%d, center_in_bed_flag=%d, state.center_ever_in_bed=%d, avg_obs=%.2f, pImpl->config.bed_pixel_ratio_threshold=%.2f\n", 
+                                       curr.id, reject_bed, center_in_bed_flag, state.center_ever_in_bed, avg_obs, pImpl->config.bed_pixel_ratio_threshold);
                                 if (reject_bed) {
                                     bool confirm_bed = true;
                                     float min_confirm = std::min(0.05f, pImpl->config.bed_pixel_ratio_threshold);
@@ -5944,7 +6001,8 @@ StatusCode FallDetector::Detect(const Image& frame, bool& is_fall) {
                             // NEW: Projected Size & Object Verification
                             bool is_fall_case5 = false;
                             
-                            if (!is_bed_event && pImpl->has_homography) {
+                            if (!is_bed_event && pImpl->has_homography) 
+                            {
                                 // Calculate median values over observation period for stability
                                 auto get_median = [](std::vector<float>& vec) {
                                     if (vec.empty()) return 0.0f;
@@ -5974,13 +6032,14 @@ StatusCode FallDetector::Detect(const Image& frame, bool& is_fall) {
                                 // Thresholds:
                                 float MIN_FALL_AREA = 2000.0f;     // Min area to be a person (not noise)
                                 float MAX_FALL_AREA = 26000.0f;    // Increased from 26K to avoid rejections of slightly larger projections
+                                float MAX_FALL_AREA_FINAL = 30000.0f;
                                 float EXTREME_FALL_AREA = 40000.0f; // > 40K: extreme fall towards camera
 
                                 if (med_area >= MIN_FALL_AREA && med_area <= MAX_FALL_AREA) 
                                 {
                                     float cur_area = state.proj_areas.empty() ? 0.0f : state.proj_areas.back();
                                     
-                                    if (cur_area > MAX_FALL_AREA) {
+                                    if (cur_area > MAX_FALL_AREA_FINAL) {
                                         // Guard: Even if median area is OK, the current frame's area is too large (likely walking upright)
                                         is_fall_case5 = false;
                                         DEBUG_PRINT("[Case5] ID:%d REJECTED FALL (MedArea OK:%.1f but CurArea:%.1f > %.0f)\n", 
@@ -6049,8 +6108,9 @@ StatusCode FallDetector::Detect(const Image& frame, bool& is_fall) {
                                        curr.id, obs_mom_avg, obs_min_mom, obs_max_mom, current_threshold2, (is_flat_posture?"YES":"NO"), state.flat_posture_frames, state.frames_observed, state.trigger_frame, state.frames_observed);
                                 
                                 pImpl->LogTrace(curr.id, pImpl->frame_idx, "DETECTED", obs_mom_avg, (is_flat_posture ? "Adaptive Threshold Passed" : "Normal Threshold Passed"));
+#if ENABLE_DEBUG_FRAME_SAVE
                                 save_debug_jpg("FallTriggered", curr);
-
+#endif
 
                                 // Activate Persistence (Suppress struggles for 30 frames = 1 second at 30fps)
                                 state.post_fall_counter = 30; 
@@ -6061,13 +6121,17 @@ StatusCode FallDetector::Detect(const Image& frame, bool& is_fall) {
                             } else {
                                 DEBUG_PRINT("[Case5] ID:%d observation ENDED - PERSPECTIVE ALIGNED (obs_avg=%.2f, min=%.2f, max=%.2f) < %.2f but NOT a fall (Flat: %d/%d)\n", 
                                        curr.id, obs_mom_avg, obs_min_mom, obs_max_mom, current_threshold2, state.flat_posture_frames, state.frames_observed);
+#if ENABLE_DEBUG_FRAME_SAVE
                                 save_debug_jpg("ObsEnd_NoFall", curr);
+#endif
                             }
                         } else {
                             DEBUG_PRINT("[Case5] ID:%d observation ENDED - NO FALL (obs_avg=%.2f, min=%.2f, max=%.2f) >= %.2f (Adaptive: %s, Flat: %d/%d)\n", 
                                    curr.id, obs_mom_avg, obs_min_mom, obs_max_mom, current_threshold2, (is_flat_posture?"YES":"NO"), state.flat_posture_frames, state.frames_observed);
                             pImpl->LogTrace(curr.id, pImpl->frame_idx, "FILTER_MOMENTUM", obs_mom_avg, "Observation Avg > Threshold");
+                            #if ENABLE_DEBUG_FRAME_SAVE
                             save_debug_jpg("ObsEnd_NoFall", curr);
+                            #endif
                         }
                         
                         // Case 5 State
@@ -6592,10 +6656,61 @@ StatusCode FallDetector::Detect(const Image& frame, bool& is_fall) {
     }
 
 #if ENABLE_DEBUG_FRAME_SAVE
-    if (!pImpl->lastMaskData.empty()) {
+    // Selective saving: only if there is a detected object with area > 30
+    bool has_substantial_fg = false;
+    for (const auto& obj : pImpl->full_frame_objects) {
+        if (obj.area > 30) {
+            has_substantial_fg = true;
+            break;
+        }
+    }
+    
+    // Synchronize mask saving with periodic frame saving (every ggap frames)
+    if (has_substantial_fg && !pImpl->lastMaskData.empty() && (pImpl->absolute_frame_count % ggap == 0)) 
+    {
+        // NEW: Draw a 4x4 white block for each object in observation or wait phase
+        for (auto const& kv : pImpl->observation_states) {
+            const auto& state = kv.second;
+            if (state.is_active || state.waiting_for_deceleration) {
+                int cx = -1, cy = -1;
+                // Try to find matching object in this frame
+                for (const auto& obj : pImpl->current_objects) {
+                    if (obj.id == state.object_id) {
+                        if (obj.matched_fg_obj_id != -1) {
+                            for (const auto& f_obj : pImpl->full_frame_objects) {
+                                if (f_obj.id == obj.matched_fg_obj_id) {
+                                    cx = (int)f_obj.cx; cy = (int)f_obj.cy; break;
+                                }
+                            }
+                        }
+                        if (cx == -1) {
+                            cx = (int)((obj.centerX + 0.5f) * ((float)W / pImpl->config.grid_cols));
+                            cy = (int)((obj.centerY + 0.5f) * ((float)H / pImpl->config.grid_rows));
+                        }
+                        break;
+                    }
+                }
+
+                if (cx != -1 && cy != -1) {
+                    // Draw 4x4 white block
+                    for (int dy = -2; dy <= 1; ++dy) {
+                        for (int dx = -2; dx <= 1; ++dx) {
+                            int py = cy + dy;
+                            int px = cx + dx;
+                            if (px >= 0 && px < W && py >= 0 && py < H) {
+                                pImpl->lastMaskData[py * W + px] = 180;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        DEBUG_PRINT("[Debug] Start Saving mask for frame %lld (Objects > 30pt detected)\n", (long long)pImpl->absolute_frame_count);
         char mask_filename[256];
         snprintf(mask_filename, sizeof(mask_filename), "/nfs/test1_mask/mask_%06lld.jpg", (long long)pImpl->absolute_frame_count);
         stbi_write_jpg(mask_filename, pImpl->lastMaskW, pImpl->lastMaskH, 1, pImpl->lastMaskData.data(), 80);
+        DEBUG_PRINT("[Debug] End Saving mask for frame %lld\n", (long long)pImpl->absolute_frame_count);
     }
 #endif
     
