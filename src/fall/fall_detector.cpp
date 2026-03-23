@@ -23,7 +23,7 @@
 #define ENABLE_PERF_PROFILING 1
 #define ENABLE_DEBUG_FRAME_SAVE 1 // Feature to save current frame as JPG every 3 frames
 
-int ggap = 12;
+int ggap = 10;
 // Define this to 1 to enable debug prints in this file, or 0 to suppress them
 #ifndef ENABLE_DEBUG_PRINT
 #define ENABLE_DEBUG_PRINT 1
@@ -2328,6 +2328,7 @@ namespace LK_Utils {
         float last_fg_cy = -1.0f;
         bool last_fg_valid = false;
         bool center_ever_in_bed = false; // NEW
+        bool has_matched_fg = false;      // NEW: Track if we've ever matched an FG since trigger
         
         // Momentum Tracking
         float peak_momentum = 0.0f; // NEW: Track peak during Wait phase
@@ -2336,7 +2337,8 @@ namespace LK_Utils {
                             frames_waiting(0), is_active(false), waiting_for_deceleration(false),
                             aligned_frames(0), valid_angle_frames(0), rotation_detected(false), flat_posture_frames(0), 
                             accumulated_bed_ratio(0.0f), frames_observed_wait(0), accumulated_bed_ratio_wait(0.0f),
-                            peak_bed_ratio_wait(0.0f), edge_touch_frames_obs(0), center_ever_in_bed(false), peak_momentum(0.0f),
+                            peak_bed_ratio_wait(0.0f), edge_touch_frames_obs(0), center_ever_in_bed(false), 
+                            has_matched_fg(false), peak_momentum(0.0f),
                             trigger_pixel_count(0), accumulated_pixel_count(0) {}
 
         // Area Tracking
@@ -3695,6 +3697,20 @@ void detectFallMomentumTrend(
 StatusCode FallDetector::Detect(const Image& frame, bool& is_fall) {
     is_fall = false;
     pImpl->absolute_frame_count++; // Increment frame counter
+
+    if (pImpl->config.only_save_raw) {
+        char filename[256];
+        snprintf(filename, sizeof(filename), "/nfs/test1_raw/raw_frame_%06lld.raw", (long long)pImpl->absolute_frame_count);
+        std::ofstream fout(filename, std::ios::binary);
+        if (fout.is_open()) {
+            fout.write((const char*)frame.data, frame.width * frame.height * frame.channels);
+            fout.close();
+            DEBUG_PRINT("[SDK] only_save_raw mode: Saved %s (TS: %llu)ms\n", filename, (unsigned long long)(frame.timestamp/1000));
+        } else {
+            DEBUG_PRINT("[SDK] only_save_raw mode: Failed to open %s\n", filename);
+        }
+        return StatusCode::OK;
+    }
     long long detect_start_time = pImpl->get_now_us();
     DEBUG_PRINT("[Debug] FallDetector::Detect Start Frame %lld (SysTime: %lld us, FrameTS: %llu ms)\n", 
            pImpl->absolute_frame_count, pImpl->get_now_us(), (unsigned long long)frame.timestamp);
@@ -3896,13 +3912,31 @@ StatusCode FallDetector::Detect(const Image& frame, bool& is_fall) {
             TimerGuard t_find_obj(g_perf_timer, "1_1b_FindObjects");
             // Identify and store full-frame foreground objects
             pImpl->full_frame_objects = find_objects_optimized(maskData.data(), w, h, 20, pImpl->config.foreground_merge_radius); 
-
-            if (pImpl->full_frame_objects.size() > 5) {
+        }
+        {
+            TimerGuard t_sort_obj(g_perf_timer, "1_1b_SortObjects");
+            //先保留
+            // if (pImpl->full_frame_objects.size() > 5) {
+            //     std::sort(pImpl->full_frame_objects.begin(), pImpl->full_frame_objects.end(),
+            //               [](const ::VisionSDK::ObjectFeatures& a, const ::VisionSDK::ObjectFeatures& b) {
+            //                   return a.area > b.area;
+            //               });
+            //     pImpl->full_frame_objects.resize(5);
+            // }
+            // Sort by pixel count (points) and keep top 10
+            if (pImpl->full_frame_objects.size() > 10) {
                 std::sort(pImpl->full_frame_objects.begin(), pImpl->full_frame_objects.end(),
                           [](const ::VisionSDK::ObjectFeatures& a, const ::VisionSDK::ObjectFeatures& b) {
-                              return a.area > b.area;
+                              return a.pixels.size() > b.pixels.size();
                           });
-                pImpl->full_frame_objects.resize(5);
+                pImpl->full_frame_objects.resize(10);
+            }
+            
+            // NEW DEBUG LOG: List all candidate objects
+            for (size_t i = 0; i < pImpl->full_frame_objects.size(); ++i) {
+                const auto& obj = pImpl->full_frame_objects[i];
+                DEBUG_PRINT("[FG-Cand] F:%d #%zu ID:%d pixels:%zu Center:(%.1f,%.1f), Area:%zu\n", 
+                       pImpl->frame_idx, i, obj.id, obj.pixels.size(), obj.cx, obj.cy, obj.area);
             }
         }
 
@@ -4156,18 +4190,18 @@ StatusCode FallDetector::Detect(const Image& frame, bool& is_fall) {
             
             stbi_write_jpg(filename, W, H, 3, dst,90);
         } else if (frame.channels == 1) {
-            std::vector<uint8_t> gray_buffer(W * H);
-            memcpy(gray_buffer.data(), frame.data, W * H);
+            // std::vector<uint8_t> gray_buffer(W * H);
+            // memcpy(gray_buffer.data(), frame.data, W * H);
             
-            // Draw motion blocks (White)
-            for (size_t i = 0; i < pImpl->changed_mask.size(); ++i) {
-                if (pImpl->changed_mask[i] && i < pImpl->positions.size()) {
-                    const auto& pos = pImpl->positions[i];
-                    drawRectGray(gray_buffer.data(), W, H, pos.x_start, pos.y_start, pos.x_end - 1, pos.y_end - 1, 255);
-                }
-            }
+            // // Draw motion blocks (White)
+            // for (size_t i = 0; i < pImpl->changed_mask.size(); ++i) {
+            //     if (pImpl->changed_mask[i] && i < pImpl->positions.size()) {
+            //         const auto& pos = pImpl->positions[i];
+            //         drawRectGray(gray_buffer.data(), W, H, pos.x_start, pos.y_start, pos.x_end - 1, pos.y_end - 1, 255);
+            //     }
+            // }
             
-            stbi_write_jpg(filename, W, H, 1, gray_buffer.data(), 70);
+            // stbi_write_jpg(filename, W, H, 1, gray_buffer.data(), 70);
         }
         DEBUG_PRINT("[Debug] End Saving frame jpg %lld\n", (long long)pImpl->absolute_frame_count);
     }
@@ -5461,6 +5495,10 @@ StatusCode FallDetector::Detect(const Image& frame, bool& is_fall) {
                         state.peak_bed_ratio_wait = 0.0f; // Reset wait-phase bed ratio
                         state.edge_touch_frames_obs = 0; // NEW: Reset Edge Drop tracking
                         state.center_ever_in_bed = false; // RESET HERE (Confirmed fix for Fn after re-trigger)
+                        state.has_matched_fg = false;    // RESET: New trigger, need new FG match
+                        state.last_fg_valid = false;     // NEW: Force fresh FG search
+                        state.last_fg_cx = -1.0f;
+                        state.last_fg_cy = -1.0f;
                         state.flat_posture_frames = 0;
                         state.peak_momentum = threshold1;//recent_mom_avg; // NEW: Init peak
                         state.trigger_pixel_count = curr.pixel_count; // NEW: Store Trigger Area
@@ -5493,11 +5531,13 @@ StatusCode FallDetector::Detect(const Image& frame, bool& is_fall) {
 
                     // NEW: Draw BBox on debug mask if enabled
 #if ENABLE_DEBUG_FRAME_SAVE
-                    if (!pImpl->lastMaskData.empty()) {
+                    if (!pImpl->lastMaskData.empty()) 
+                    {
                          int box_w, box_h, m1, m2, m3, m4;
                          getObjectBoundingBoxPixels(curr, pImpl->config.grid_cols, pImpl->config.grid_rows, 
                                                     pImpl->lastMaskW, pImpl->lastMaskH, box_w, box_h, m1, m2, m3, m4);
                          drawRectangleGray(pImpl->lastMaskData.data(), pImpl->lastMaskW, pImpl->lastMaskH, m1, m2, m3, m4, 255);
+                        DEBUG_PRINT("curr.centerX, curr.centerY: %.1f, %.1f, curr.pixel_count: %d, curr.id: %d, curr.frame_idx: %d, m1, m2, m3, m4: %d, %d, %d, %d\n", curr.centerX, curr.centerY, curr.pixel_count, curr.id, pImpl->frame_idx, m1, m2, m3, m4);
                     }
 #endif
                     
@@ -5607,7 +5647,14 @@ StatusCode FallDetector::Detect(const Image& frame, bool& is_fall) {
                 // Step 4: Observation phase - collect momentum samples
                 if (state.is_active && !state.waiting_for_deceleration && state.object_id == curr.id) 
                 {
-
+#if ENABLE_DEBUG_FRAME_SAVE
+                    if (!pImpl->lastMaskData.empty()) {
+                         int box_w, box_h, m1, m2, m3, m4;
+                         getObjectBoundingBoxPixels(curr, pImpl->config.grid_cols, pImpl->config.grid_rows, 
+                                                    pImpl->lastMaskW, pImpl->lastMaskH, box_w, box_h, m1, m2, m3, m4);
+                         drawRectangleGray(pImpl->lastMaskData.data(), pImpl->lastMaskW, pImpl->lastMaskH, m1, m2, m3, m4, 255);
+                    }
+#endif
 
 
                     curr.is_in_observation_mode = true; // NEW: Flag for visualization
@@ -5720,22 +5767,18 @@ StatusCode FallDetector::Detect(const Image& frame, bool& is_fall) {
                             int matched_full_frame_idx = -1;
                             float search_cx = curr.centerX + 0.5f;
                             float search_cy = curr.centerY + 0.5f;
-                            bool jump_detected = false;
 
-                            if (state.last_fg_valid) {
-                                float dist_to_last = std::pow((curr.centerX + 0.5f) - state.last_fg_cx, 2) + std::pow((curr.centerY + 0.5f) - state.last_fg_cy, 2);
-                                if (dist_to_last > 25.0f) { 
-                                    jump_detected = true;
-                                    DEBUG_PRINT("[Case5-Match] Suspicious Centroid Jump (ID:%d Dist:%.1f). Using LastFGPos for search.\n", curr.id, dist_to_last);
-                                }
-                            }
-
-                            if ((!large_enough_motion || jump_detected) && state.last_fg_valid) {
+                            // Simplified Search Center Selection (Removing Jump Protection)
+                            if (!large_enough_motion && state.has_matched_fg) {
+                                // Only use last_fg if motion is too low and we've matched at least once
                                 search_cx = state.last_fg_cx;
                                 search_cy = state.last_fg_cy;
+                            } else {
+                                // Default: Directly trust the current motion center
+                                search_cx = curr.centerX + 0.5f;
+                                search_cy = curr.centerY + 0.5f;
                             }
 
-                            // Re-run matching search with finalized search center
                             best_idx = -1;
                             min_dist = 999999.0f;
                             for (size_t i = 0; i < pImpl->full_frame_objects.size(); ++i) {
@@ -5745,36 +5788,41 @@ StatusCode FallDetector::Detect(const Image& frame, bool& is_fall) {
                                 float dx = fg_blk_cx - search_cx;
                                 float dy = fg_blk_cy - search_cy;
                                 float dist = dx*dx + dy*dy;
+                                
+                                // Detailed Diagnostic Log
+                                DEBUG_PRINT("[Match-Loop] ID:%d FG:%zu Area:%zu Dist:%.2f (FG:%.2f,%.2f vs Search:%.2f,%.2f)\n", 
+                                       curr.id, i, pImpl->full_frame_objects[i].pixels.size(), dist, fg_blk_cx, fg_blk_cy, search_cx, search_cy);
+
                                 if (dist < min_dist) {
                                     min_dist = dist;
                                     best_idx = (int)i;
                                 }
                             }
 
-                            if (best_idx >= 0 && min_dist < 9.0f) {  // Reduced from 36.0f (6 blocks) to 9.0 (3 blocks)
+                            if (best_idx >= 0 && min_dist < 9.0f) 
+                            {  // Reverted to 9.0f (3 blocks)
                                 // Standard Match Success
                                 auto& fg_obj = pImpl->full_frame_objects[best_idx];
                                 matched_full_frame_idx = best_idx;
+                                state.has_matched_fg = true; // MARK SUCCESS
+                                DEBUG_PRINT("[Case5-Match] SUCCESS ID:%d matched FG Object %d (Dist: %.2f)\n", curr.id, fg_obj.id, min_dist);
                                 
-                                // Update last known position ONLY if enough motion blocks AND not a jump
-                                // to avoid overwriting a good position with a stale one.
-                                if (large_enough_motion && !jump_detected) {
-                                    float new_cx = fg_obj.cx / blk_w;
-                                    float new_cy = fg_obj.cy / blk_h;
-                                    if (state.last_fg_valid) {
-                                        float fg_jump = std::pow(new_cx - state.last_fg_cx, 2) + std::pow(new_cy - state.last_fg_cy, 2);
-                                        if (fg_jump > 1.0f) {
-                                            DEBUG_PRINT("[Case5-Match] FG Jump Alert (ID:%d Dist:%.1f). FG object position shifted.\n", curr.id, fg_jump);
-                                        }
+                                // Continuous FG Position Tracking
+                                float new_cx = fg_obj.cx / blk_w;
+                                float new_cy = fg_obj.cy / blk_h;
+                                if (state.last_fg_valid) {
+                                    float fg_jump = std::pow(new_cx - state.last_fg_cx, 2) + std::pow(new_cy - state.last_fg_cy, 2);
+                                    if (fg_jump > 1.0f) {
+                                        DEBUG_PRINT("[Case5-Match] FG Position Update (ID:%d Shift:%.1f). New Pos: (%.1f, %.1f)\n", curr.id, fg_jump, new_cx, new_cy);
                                     }
-                                    state.last_fg_cx = new_cx;
-                                    state.last_fg_cy = new_cy;
-                                    state.last_fg_valid = true;
                                 }
+                                state.last_fg_cx = new_cx;
+                                state.last_fg_cy = new_cy;
+                                state.last_fg_valid = true;
 
                                 curr.matched_fg_obj_id = fg_obj.id; 
                                 curr.matched_fg_dist = min_dist;    
-                            } else if (state.last_fg_valid && !jump_detected) { // Standard Recovery (only if we didn't already try LastFGPos via jump)
+                            } else if (state.last_fg_valid) { // Standard Recovery
                                 // Match Failed, but we have a last known position.
                                 // Search near Last Known Position
                                 float rec_min_dist = 999999.0f;
@@ -5797,7 +5845,7 @@ StatusCode FallDetector::Detect(const Image& frame, bool& is_fall) {
                                     }
                                 }
                                 
-                                if (rec_best_idx >= 0 && rec_min_dist < 9.0f) { // Reduced from 36.0f
+                                if (rec_best_idx >= 0 && rec_min_dist < 9.0f) { // Reverted to 9.0f
                                     // Recovered!
                                     best_idx = rec_best_idx;
                                     auto& fg_obj = pImpl->full_frame_objects[best_idx];
@@ -5818,9 +5866,14 @@ StatusCode FallDetector::Detect(const Image& frame, bool& is_fall) {
                                     curr.matched_fg_obj_id = fg_obj.id;
                                     curr.matched_fg_dist = rec_min_dist;
                                     
-                                    DEBUG_PRINT("[Case5-Recover] ID:%d Recovered FG Object %d via LastPos (Dist: %.2f)\n", curr.id, fg_obj.id, rec_min_dist);
+                                    DEBUG_PRINT("[Case5-Recover] SUCCESS ID:%d matched FG Object %d via LastPos (Dist: %.2f)\n", curr.id, fg_obj.id, rec_min_dist);
+                                } else {
+                                    DEBUG_PRINT("[Case5-Match] RECOVERY FAIL ID:%d. Nearest FG (>100 area) is Dist: %.2f (Threshold: 9.0)\n", curr.id, rec_min_dist);
                                 }
-                            }
+                            } 
+                            //else if (jump_detected) {
+                            //    DEBUG_PRINT("[Case5-Match] JUMP FAIL ID:%d. Jump detected but no FG (>100 area) near LastPos (%.1f,%.1f)\n", curr.id, search_cx, search_cy);
+                            //}
 
                             if (matched_full_frame_idx != -1) {
                                 auto& fg_obj = pImpl->full_frame_objects[matched_full_frame_idx];
