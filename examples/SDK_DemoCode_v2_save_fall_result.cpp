@@ -87,7 +87,8 @@ void drawRectRGB(std::vector<uint8_t>& img, int w, int h, int x, int y, int rw, 
     }
 }
 
-void drawLine(std::vector<uint8_t>& img, int w, int h, int x1, int y1, int x2, int y2, uint8_t r, uint8_t g, uint8_t b, int thickness=2) {
+void drawLine(std::vector<uint8_t>& img, int w, int h, int x1, int y1, int x2, int y2, uint8_t r, uint8_t g, uint8_t b, int thickness=2) 
+{
     int dx = std::abs(x2 - x1), sx = x1 < x2 ? 1 : -1;
     int dy = -std::abs(y2 - y1), sy = y1 < y2 ? 1 : -1;
     int err = dx + dy, e2;
@@ -95,17 +96,31 @@ void drawLine(std::vector<uint8_t>& img, int w, int h, int x1, int y1, int x2, i
     // Safety check
     if (x1 == x2 && y1 == y2) return;
 
-    for (;;) {
-        for(int t=-thickness/2; t<=thickness/2; ++t) {
-            for(int k=-thickness/2; k<=thickness/2; ++k) {
+    for (;;) 
+    {
+        // //rgb版本, 線可調整粗細
+        for(int t=-thickness/2; t<=thickness/2; ++t) 
+        {
+            for(int k=-thickness/2; k<=thickness/2; ++k) 
+            {
                 int px = x1 + t;
                 int py = y1 + k;
-                if (px >= 0 && px < w && py >= 0 && py < h) {
+                if (px >= 0 && px < w && py >= 0 && py < h) 
+                {
                     int idx = (py * w + px) * 3;
                     img[idx] = r; img[idx+1] = g; img[idx+2] = b;
                 }
             }
         }
+        //灰階版本, 線條沒調整粗細, 用r的數值來畫線
+        // int px = x1;
+        // int py = y1;
+        // if (px >= 0 && px < w && py >= 0 && py < h) 
+        // {
+        //     int idx = (py * w + px);
+        //     img[idx] = r;
+        // }
+
         
         if (x1 == x2 && y1 == y2) break;
         e2 = 2 * err;

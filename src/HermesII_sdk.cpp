@@ -7,6 +7,7 @@
 #include <fstream>
 #include <ctime>
 #include <chrono>
+#include <thread>
 
 // Note: Do not wrap entire file in namespace VisionSDK
 // to avoid "VisionSDK::VisionSDK::" confusion if using prefix.
@@ -40,7 +41,7 @@ using namespace VisionSDK;
 VisionSDK::VisionSDK::VisionSDK() : pImpl(std::unique_ptr<Impl>(new Impl())) {}
 VisionSDK::VisionSDK::~VisionSDK() = default;
 
-#define VISION_SDK_VERSION_INTERNAL "2.0.1c"
+#define VISION_SDK_VERSION_INTERNAL "2.0.2"
 
 const char* VisionSDK::VisionSDK::GetVersion() {
     return VISION_SDK_VERSION_INTERNAL;
@@ -174,12 +175,12 @@ StatusCode VisionSDK::VisionSDK::SetConfig(const void* config) {
             pImpl->config.fall_duration = c->fall_duration;
             pImpl->config.enable_face_detection = c->enable_face_detection;
             pImpl->config.face_detect_interval_frames = 30;//c->face_detect_interval_frames;
-            pImpl->config.bg_update_interval_frames = c->bg_update_interval_frames;
-            pImpl->config.bg_update_alpha = c->bg_update_alpha;
+            pImpl->config.bg_update_interval_frames = 12;//c->bg_update_interval_frames; //orig is 8
+            pImpl->config.bg_update_alpha = 0.08;//c->bg_update_alpha; // orig is 0.1
             pImpl->config.enable_save_bg_mask = c->enable_save_bg_mask;
             pImpl->config.bg_init_start_frame = c->bg_init_start_frame;
             pImpl->config.bg_init_end_frame = c->bg_init_end_frame;
-            pImpl->config.bg_diff_threshold = 26;//c->bg_diff_threshold; //18 up
+            pImpl->config.bg_diff_threshold = 18;//c->bg_diff_threshold; //18 up
             pImpl->config.fall_acceleration_upper_threshold = c->fall_acceleration_upper_threshold;
             pImpl->config.fall_acceleration_lower_threshold = c->fall_acceleration_lower_threshold;
             pImpl->config.post_fall_distance_threshold = c->post_fall_distance_threshold;
@@ -389,7 +390,12 @@ StatusCode VisionSDK::VisionSDK::ProcessNextFrame() {
     auto t1 = std::chrono::high_resolution_clock::now();
     auto duration = std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count();
     
-    std::cout << "[SDK] Detect() Execution Time: " << duration << " us" << std::endl;
+    long long duration_ms = duration / 1000;
+    if (duration_ms < 110) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(110 - duration_ms));
+    }
+    
+    //std::cout << "[SDK] Detect() Execution Time: " << duration << " us" << std::endl;
 
     if (ret != StatusCode::OK) return StatusCode::ERROR_INVALID_INPUT;
     
