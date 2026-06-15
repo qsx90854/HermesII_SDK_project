@@ -23,10 +23,10 @@
 #define ENABLE_PERF_PROFILING 1
 #define ENABLE_DEBUG_FRAME_SAVE 0 // Feature to save current frame as JPG every 3 frames
 
-int ggap = 10;
+int ggap = 1;
 // Define this to 1 to enable debug prints in this file, or 0 to suppress them
 #ifndef ENABLE_DEBUG_PRINT
-#define ENABLE_DEBUG_PRINT 1
+#define ENABLE_DEBUG_PRINT 0
 #endif
 
 #if ENABLE_DEBUG_PRINT
@@ -2750,11 +2750,11 @@ public:
 #endif
 
     void LogTrace(int id, int frame, const char* type, float val, const char* msg) {
-        FILE* fp = fopen("detection_trace.txt", "a");
-        if (fp) {
-            fprintf(fp, "F:%d ID:%d Type:%s Val:%.2f Msg:%s\n", frame, id, type, val, msg);
-            fclose(fp);
-        }
+        // FILE* fp = fopen("detection_trace.txt", "a");
+        // if (fp) {
+        //     fprintf(fp, "F:%d ID:%d Type:%s Val:%.2f Msg:%s\n", frame, id, type, val, msg);
+        //     fclose(fp);
+        // }
     }
 
     Impl() {
@@ -3087,7 +3087,8 @@ void FallDetector::SetConfig(const InternalConfig& config) {
 
     if (!pImpl->face_model_inited) {
          if (ENABLE_DEBUG_PRINT) std::cout << "[FallDetector::SetConfig] Initializing FaceDetector..." << std::endl;
-         StatusCode ret = pImpl->faceDetector.Init("res/blaze_face_detect_nnp310_128x128.ty");
+         std::string path = pImpl->config.model_path.empty() ? "res/blaze_face_detect_nnp310_128x128.ty" : pImpl->config.model_path;
+         StatusCode ret = pImpl->faceDetector.Init(path);
          if (ret != StatusCode::OK) {
              //if (ENABLE_DEBUG_PRINT) 
              std::cout << "[FallDetector::SetConfig] FaceDetector Init Failed: " << (int)ret << std::endl;
@@ -3984,7 +3985,7 @@ StatusCode FallDetector::Detect(const Image& frame, bool& is_fall)
         }
         printf("t_frame_diff %llu\n.", t_frame_diff);
         char filename[256];
-        snprintf(filename, sizeof(filename), "/nfs/test1_raw/raw_frame_%06lld.raw", (long long)pImpl->absolute_frame_count);
+        snprintf(filename, sizeof(filename), "nfs/test1_raw/raw_frame_%06lld.raw", (long long)pImpl->absolute_frame_count);
         std::ofstream fout(filename, std::ios::binary);
         if (fout.is_open()) {
             fout.write((const char*)frame.data, frame.width * frame.height * frame.channels);
@@ -4062,7 +4063,7 @@ StatusCode FallDetector::Detect(const Image& frame, bool& is_fall)
         // }
         
         char filename[256];
-        snprintf(filename, sizeof(filename), "/nfs/test1/fall_debug_ID%d_F%lld_%s.jpg", obj.id, pImpl->absolute_frame_count, event_name);
+        snprintf(filename, sizeof(filename), "nfs/test1/fall_debug_ID%d_F%lld_%s.jpg", obj.id, pImpl->absolute_frame_count, event_name);
         stbi_write_jpg(filename, W, H, channels, out_img.data(), 70);
         DEBUG_PRINT("[Debug] Saved event JPG: %s\n", filename);
     };
@@ -4272,7 +4273,8 @@ StatusCode FallDetector::Detect(const Image& frame, bool& is_fall)
 
     // Retry Init if failed in Config
     if (should_run_face_detect && !pImpl->face_model_inited) {
-         StatusCode ret = pImpl->faceDetector.Init("res/blaze_face_detect_nnp310_128x128.ty");
+         std::string path = pImpl->config.model_path.empty() ? "res/blaze_face_detect_nnp310_128x128.ty" : pImpl->config.model_path;
+         StatusCode ret = pImpl->faceDetector.Init(path);
          if (ret == StatusCode::OK) {
               pImpl->face_model_inited = true;
          } 
@@ -4453,7 +4455,7 @@ StatusCode FallDetector::Detect(const Image& frame, bool& is_fall)
         DEBUG_PRINT("[Debug] Start Saving frame jpg %lld\n", (long long)pImpl->absolute_frame_count);
         char filename[256];
         //mkdir("debug_frames", 0777);
-        snprintf(filename, sizeof(filename), "/nfs/test1/frame_%06lld.jpg", (long long)pImpl->absolute_frame_count);
+        snprintf(filename, sizeof(filename), "nfs/test1/frame_%06lld.jpg", (long long)pImpl->absolute_frame_count);
         
         if (frame.channels == 3) {
             int size = W * H;
@@ -6484,18 +6486,23 @@ StatusCode FallDetector::Detect(const Image& frame, bool& is_fall)
                             }
                             
                             // NEW: Screen Corner Constraint
-                            if (is_fall_case5) {
+                            if (is_fall_case5) 
+                            {
                                 int bw, bh, mx, my, mxx, mxy;
                                 getObjectBoundingBoxPixels(curr, pImpl->config.grid_cols, pImpl->config.grid_rows, W, H, bw, bh, mx, my, mxx, mxy);
                                 
                                 // NEW: Try to override with robust FG BBox
-                                if (curr.matched_fg_obj_id != -1) {
-                                    for (const auto& f_obj : pImpl->full_frame_objects) {
-                                        if (f_obj.id == curr.matched_fg_obj_id) {
+                                if (curr.matched_fg_obj_id != -1) 
+                                {
+                                    for (const auto& f_obj : pImpl->full_frame_objects) 
+                                    {
+                                        if (f_obj.id == curr.matched_fg_obj_id) 
+                                        {
                                             mx = f_obj.cx; mxx = f_obj.cx; // Initial values
                                             my = f_obj.cy; mxy = f_obj.cy;
                                             int f_mx = 99999, f_mxx = -1, f_my = 99999, f_mxy = -1;
-                                            for (int p_idx : f_obj.pixels) {
+                                            for (int p_idx : f_obj.pixels) 
+                                            {
                                                 int px = p_idx % W;
                                                 int py = p_idx / W;
                                                 if (px < f_mx) f_mx = px;
@@ -6503,7 +6510,8 @@ StatusCode FallDetector::Detect(const Image& frame, bool& is_fall)
                                                 if (py < f_my) f_my = py;
                                                 if (py > f_mxy) f_mxy = py;
                                             }
-                                            if (f_mxx != -1) {
+                                            if (f_mxx != -1) 
+                                            {
                                                 mx = f_mx; mxx = f_mxx;
                                                 my = f_my; mxy = f_mxy;
                                             }
@@ -7160,7 +7168,7 @@ StatusCode FallDetector::Detect(const Image& frame, bool& is_fall)
 
         DEBUG_PRINT("[Debug] Start Saving mask for frame %lld (Objects > 30pt detected)\n", (long long)pImpl->absolute_frame_count);
         char mask_filename[256];
-        snprintf(mask_filename, sizeof(mask_filename), "/nfs/test1_mask/mask_%06lld.jpg", (long long)pImpl->absolute_frame_count);
+        snprintf(mask_filename, sizeof(mask_filename), "nfs/test1_mask/mask_%06lld.jpg", (long long)pImpl->absolute_frame_count);
         stbi_write_jpg(mask_filename, pImpl->lastMaskW, pImpl->lastMaskH, 1, pImpl->lastMaskData.data(), 80);
         DEBUG_PRINT("[Debug] End Saving mask for frame %lld\n", (long long)pImpl->absolute_frame_count);
     }

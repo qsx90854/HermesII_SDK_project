@@ -41,7 +41,7 @@ using namespace VisionSDK;
 VisionSDK::VisionSDK::VisionSDK() : pImpl(std::unique_ptr<Impl>(new Impl())) {}
 VisionSDK::VisionSDK::~VisionSDK() = default;
 
-#define VISION_SDK_VERSION_INTERNAL "2.0.2"
+#define VISION_SDK_VERSION_INTERNAL "2.0.4c_20260612"
 
 const char* VisionSDK::VisionSDK::GetVersion() {
     return VISION_SDK_VERSION_INTERNAL;
@@ -174,7 +174,7 @@ StatusCode VisionSDK::VisionSDK::SetConfig(const void* config) {
             pImpl->config.fall_window_size = c->fall_window_size;
             pImpl->config.fall_duration = c->fall_duration;
             pImpl->config.enable_face_detection = c->enable_face_detection;
-            pImpl->config.face_detect_interval_frames = 30;//c->face_detect_interval_frames;
+            pImpl->config.face_detect_interval_frames = (c->face_detect_interval_frames > 0) ? c->face_detect_interval_frames : 30;
             pImpl->config.bg_update_interval_frames = 12;//c->bg_update_interval_frames; //orig is 8
             pImpl->config.bg_update_alpha = 0.08;//c->bg_update_alpha; // orig is 0.1
             pImpl->config.enable_save_bg_mask = c->enable_save_bg_mask;
@@ -385,15 +385,15 @@ StatusCode VisionSDK::VisionSDK::ProcessNextFrame() {
     bool is_fall = false;
     
     // Performance Profiling
-    auto t0 = std::chrono::high_resolution_clock::now();
+    //auto t0 = std::chrono::high_resolution_clock::now();
     StatusCode ret = pImpl->fall_detector.Detect(internal_img, is_fall);
-    auto t1 = std::chrono::high_resolution_clock::now();
-    auto duration = std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count();
+    //auto t1 = std::chrono::high_resolution_clock::now();
+    //auto duration = std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count();
     
-    long long duration_ms = duration / 1000;
-    if (duration_ms < 110) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(110 - duration_ms));
-    }
+    //long long duration_ms = duration / 1000;
+    //if (duration_ms < 110) {
+    //    std::this_thread::sleep_for(std::chrono::milliseconds(110 - duration_ms));
+    //}
     
     //std::cout << "[SDK] Detect() Execution Time: " << duration << " us" << std::endl;
 

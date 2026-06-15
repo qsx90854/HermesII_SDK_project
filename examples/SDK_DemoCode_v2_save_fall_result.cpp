@@ -36,7 +36,7 @@ using namespace VisionSDK;
 // TOGGLE: 1 = Use SDK Internal Logic, 0 = Use Demo Custom Logic (Peak-Valley)
 #define USE_SDK_FALL_RESULT 1
 
-#define SAVE_ALL_TEST_IMAGES 1
+#define SAVE_ALL_TEST_IMAGES 0
 #define SAVE_GRID_IMAGE 1
 #define SAVE_FACE_IMAGES 0
 #define DRAW_PERSPECTIVE_AND_AXIS 0
