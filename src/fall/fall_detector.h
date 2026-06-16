@@ -112,6 +112,9 @@ public:
     FallDetector();
     ~FallDetector();
 
+    // Release resources explicitly
+    void Release();
+
     // Configure algorithm parameters
     void SetConfig(const InternalConfig& config);
 

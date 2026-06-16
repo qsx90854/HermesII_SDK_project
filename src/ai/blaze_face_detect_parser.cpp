@@ -223,15 +223,16 @@ int blaze_face_parse(float *regressors, float *classifiers,
         det->x2 = (cx + w * 0.5f) ;
         det->y2 = (cy + h * 0.5f) ;
 
-
-        if (score > 0.5f) { // Debug print for high confidence
+        /*
+        if (score > 0.5f) 
+        { // Debug print for high confidence
              printf("Debug Parse: Anch[%.2f, %.2f, %.2f] Raw[%.2f, %.2f, %.2f, %.2f] -> Box[%.2f, %.2f, %.2f, %.2f]\n",
                     anchor.x_center, anchor.y_center, anchor.w,
                     dx, dy, dw, dh,
                     det->x1, det->y1, det->x2, det->y2);
         }
 
-        
+        */
         
         // Keypoints: 6 pairs, usually [y, x] in TF
         for (int k = 0; k < 6; k++) {

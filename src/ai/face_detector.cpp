@@ -24,6 +24,8 @@
 
 namespace VisionSDK {
 
+bool g_npu_sys_initialized = false;
+
 // =========================================================
 // Debug Helper: Save Gray BMP
 // =========================================================
@@ -94,15 +96,24 @@ static int alloc_mmz_memory(T_TY_Mem *mem, uint32_t size, E_TY_MemAllocType type
         ret = FH_SYS_VmmAllocEx64((FH_UINT64*)&mem->phyAddr, (void **)&mem->virAddr, tag, "anonymous", size, 128);
     } else {
         ret = FH_SYS_VmmAllocEx_Cached64((FH_UINT64*)&mem->phyAddr, (void **)&mem->virAddr, tag, "anonymous", size, 128);
-        if (ret == 0) FH_SYS_VmmFlushCache64(mem->phyAddr, (void *)mem->virAddr, mem->size);
+        if (ret == 0) FH_SYS_VmmFlushCache64(mem->phyAddr, (void *)mem->virAddr, size);
     }
     if (ret != 0) return ret;
     mem->size = size;
+    printf("[MMZ] Alloc (FaceDetector) Size: %u bytes, PhyAddr: 0x%llx, VirAddr: 0x%llx\n", size, (unsigned long long)mem->phyAddr, (unsigned long long)mem->virAddr);
     return 0;
 }
 
 static int free_mmz_memory(T_TY_Mem *mem) {
-    return FH_SYS_VmmFreeOne64(mem->phyAddr);
+    if (mem && mem->phyAddr) {
+        printf("[MMZ] Free (FaceDetector) Size: %u bytes, PhyAddr: 0x%llx, VirAddr: 0x%llx\n", mem->size, (unsigned long long)mem->phyAddr, (unsigned long long)mem->virAddr);
+        int ret = FH_SYS_VmmFreeOne64(mem->phyAddr);
+        mem->phyAddr = 0;
+        mem->virAddr = 0;
+        mem->size = 0;
+        return ret;
+    }
+    return 0;
 }
 
 static int flush_mmz_memory(T_TY_Mem *mem) {
@@ -245,10 +256,15 @@ public:
     T_TY_ModelDesc model_desc;
     bool initialized = false;
     
+    uint32_t call_count = 0;
+    uint32_t success_count = 0;
+    
     // Image Processor
     ImageProcess imageProcess;
 
     Impl() {
+        call_count = 0;
+        success_count = 0;
         memset(&model_mem, 0, sizeof(model_mem));
         memset(&task_mem, 0, sizeof(task_mem));
     }
@@ -276,6 +292,8 @@ public:
     }
 
     StatusCode Init(const std::string& model_path) {
+        call_count = 0;
+        success_count = 0;
         if (initialized) return StatusCode::OK;
 
         // Ensure System Init is called (checking if already called? existing API doesn't seem to error if called twice, but best practice: call once)
@@ -288,18 +306,27 @@ public:
         
         // Initializing System
         int ret = 0;
-        printf("[FaceDetector] Init: TY_NPU_SysInit\n");
-        ret = TY_NPU_SysInit();
-        if (ret != 0 && ret != 0xe0000004) { // 0xe0000004 might be "already initialized"? 
-             // Just print error for now, if it fails
-             // std::cout << "[FaceDetector] Warning: TY_NPU_SysInit returned " << ret << std::endl;
-             // If it fails seriously, we might want to return, but some drivers return error if already init.
+        extern bool g_cv_sys_initialized;
+        extern bool g_npu_sys_initialized;
+        if (!g_npu_sys_initialized) {
+            printf("[FaceDetector] Init: TY_NPU_SysInit\n");
+            ret = TY_NPU_SysInit();
+            if (ret == 0 || ret == 100002 || ret == 0xe0000004) {
+                 g_npu_sys_initialized = true;
+            } else {
+                 std::cout << "[FaceDetector] Warning: TY_NPU_SysInit returned " << ret << std::endl;
+            }
         }
-        printf("[FaceDetector] Init: TY_CV_SysInit\n");
-        // CV Init
-        ret = TY_CV_SysInit();
-         if (ret != 0 && ret != 0xe0000004) {
-             // std::cout << "[FaceDetector] Warning: TY_CV_SysInit returned " << ret << std::endl;
+        
+        if (!g_cv_sys_initialized) {
+            printf("[FaceDetector] Init: TY_CV_SysInit\n");
+            // CV Init
+            ret = TY_CV_SysInit();
+            if (ret == 0 || ret == 0xA01D8002 || ret == 0xe0000004) {
+                 g_cv_sys_initialized = true;
+            } else {
+                 std::cout << "[FaceDetector] Warning: TY_CV_SysInit returned " << ret << std::endl;
+            }
         }
 
         printf("[FaceDetector] Init: Loading model %s\n", model_path.c_str());
@@ -409,12 +436,13 @@ public:
          // Use NEON conversion from Gray to YUV420 (Task Input)
          YUV400_to_YUV420_NEON((uint8_t*)img.data, (uint8_t*)task_inputs[0].dataIn.virAddr, 128, 128);
          flush_mmz_memory(&task_inputs[0].dataIn);
-         // printf("before NPU Forward\n");
-         // 2. Inference
-         //std::cout<<"GO NPU"<<std::endl;
-         int ret = TY_NPU_Forward(task_handle, E_TY_NPU_ID_0, 
-                                  model_desc.ioDesc.inputNum, task_inputs, 
-                                  model_desc.ioDesc.outputNum, task_outputs);
+
+         
+         // disable on v204e
+         //int ret = TY_NPU_Forward(task_handle, E_TY_NPU_ID_0, 
+         //                         model_desc.ioDesc.inputNum, task_inputs, 
+         //                         model_desc.ioDesc.outputNum, task_outputs);
+         int ret = -1;
          if (ret != 0) {
              std::cout << "[FaceDetector] NPU Forward failed: " << ret << std::endl;
              return ret;
@@ -531,11 +559,30 @@ StatusCode FaceDetector::Init(const std::string& model_path) {
 }
 
 int FaceDetector::Detect(const Image& img, std::vector<FaceROI>& faces) {
-    return pImpl->Detect(img, faces);
+    printf("[FaceDetector] Detect: Starting face detection... Image resolution: %dx%d\n", img.width, img.height);
+    
+    pImpl->call_count++;
+    int ret = pImpl->Detect(img, faces);
+    
+    if (ret == 0 && !faces.empty()) {
+        pImpl->success_count++;
+    }
+    
+    printf("[FaceDetector] Detect: Finished face detection. Results count: %d | Total calls (since init): %u | Successful detections (since init): %u\n",
+           (int)faces.size(), pImpl->call_count, pImpl->success_count);
+           
+    return ret;
 }
 
 bool FaceDetector::Resize(const Image& src, Image& dst) {
     return pImpl->Resize(src, dst);
+}
+
+StatusCode FaceDetector::Release() {
+#ifndef DISABLE_NPU
+    pImpl->cleanup();
+#endif
+    return StatusCode::OK;
 }
 
 } // namespace VisionSDK

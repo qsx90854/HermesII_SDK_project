@@ -3052,10 +3052,83 @@ public:
             // DEBUG_PRINT("[Debug] updateBackground Selective: Skipped %d FG blocks.\n", total_fg_blocks);
         }
     }
+
+    void Release() {
+        // 1. Release NPU Face Detector MMZ memory
+        faceDetector.Release();
+
+        // 2. Clear STL containers to free CPU memory
+        current_objects.clear();
+        current_objects.shrink_to_fit();
+        
+        object_history.clear();
+        object_history.shrink_to_fit();
+        
+        full_frame_objects.clear();
+        full_frame_objects.shrink_to_fit();
+        
+        bed_region.clear();
+        bed_region.shrink_to_fit();
+        // Restore default bed region
+        bed_region = {{0,0}, {100,0}, {100,100}, {0,100}};
+        
+        object_bed_exit_status.clear();
+        object_bed_stats_history.clear();
+        object_accumulated_descent.clear();
+        candidates.clear();
+        candidates.shrink_to_fit();
+        
+        observation_states.clear();
+        
+        lastMaskData.clear();
+        lastMaskData.shrink_to_fit();
+        lastMaskW = 0;
+        lastMaskH = 0;
+        
+        kalmanFilters.clear();
+        track_ttl.clear();
+        
+        object_first_seen_frame.clear();
+        object_is_new_entry.clear();
+        
+        pending_falls.clear();
+        pending_falls.shrink_to_fit();
+        
+        fg_count_history_buffer.clear();
+        object_y_history_buffer.clear();
+        object_safe_ratio_history_buffer.clear();
+        persistent_object_blocks.clear();
+        object_last_active_frame.clear();
+        
+        previous_full_frame_objects.clear();
+        previous_full_frame_objects.shrink_to_fit();
+
+        previous_objects.clear();
+        previous_objects.shrink_to_fit();
+
+        // 3. Reset state counters
+        fall_confirmation_counter = 0;
+        in_fall_state = false;
+        absolute_frame_count = 0;
+        frame_idx = 0;
+        fall_consecutive_frames = 0;
+        face_model_inited = false;
+        last_has_face = false;
+        last_face_roi = {0,0,0,0,0.0f};
+        hasBedMask = false;
+        global_id_counter = 1000;
+        last_timestamp = 0;
+        
+        prof.Reset();
+    }
 };
 
 FallDetector::FallDetector() : pImpl(std::make_shared<Impl>()) {}
 FallDetector::~FallDetector() = default;
+
+void FallDetector::Release() {
+    pImpl->Release();
+}
 
 
 void FallDetector::SetConfig(const InternalConfig& config) {
@@ -4360,7 +4433,8 @@ StatusCode FallDetector::Detect(const Image& frame, bool& is_fall)
         {
              std::vector<FaceROI> faces;
              //std::cout<<"[FallDetector::Detect] FaceDetector::Detect GO"<<std::endl;
-             int ret = pImpl->faceDetector.Detect(faceInput, faces);
+             //int ret = pImpl->faceDetector.Detect(faceInput, faces);//disable for debug
+             int ret = -1;
              //std::cout<<"[FallDetector::Detect] FaceDetector::Detect End"<<std::endl;
              if (ret == 0 && !faces.empty()) {
                  has_face = true;

@@ -292,6 +292,9 @@ public:
     // Initialize SDK (Optional model loading)
     StatusCode Init(const std::string& model_path = "", int num_threads = 4);
     
+    // Release SDK resources explicitly
+    StatusCode Release();
+    
     // Set Configuration
     StatusCode SetConfig(const void* config);
 

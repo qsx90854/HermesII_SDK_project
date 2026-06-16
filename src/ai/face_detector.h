@@ -27,6 +27,9 @@ public:
     // Initialize the model
     StatusCode Init(const std::string& model_path);
 
+    // Release resources explicitly
+    StatusCode Release();
+
     // Detect faces in the input image (assumes YUV NV12 or similar if direct NPU usage)
     // For this specific task, we'll follow the pattern in ai_ex/main.cpp but adapted.
     // However, FallDetector receives a VisionSDK::Image (likely RGB or Grayscale).

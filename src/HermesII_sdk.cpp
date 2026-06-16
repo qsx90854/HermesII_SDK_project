@@ -41,7 +41,7 @@ using namespace VisionSDK;
 VisionSDK::VisionSDK::VisionSDK() : pImpl(std::unique_ptr<Impl>(new Impl())) {}
 VisionSDK::VisionSDK::~VisionSDK() = default;
 
-#define VISION_SDK_VERSION_INTERNAL "2.0.4c_20260612"
+#define VISION_SDK_VERSION_INTERNAL "2.0.4k_20260615"
 
 const char* VisionSDK::VisionSDK::GetVersion() {
     return VISION_SDK_VERSION_INTERNAL;
@@ -102,6 +102,12 @@ StatusCode VisionSDK::VisionSDK::Init(const std::string& model_path, int num_thr
     pImpl->fall_detector.SetConfig(pImpl->config);
 
     std::cout << "VisionSDK Initialized." << std::endl;
+    return StatusCode::OK;
+}
+
+StatusCode VisionSDK::VisionSDK::Release() {
+    pImpl->fall_detector.Release();
+    std::cout << "VisionSDK Released." << std::endl;
     return StatusCode::OK;
 }
 
