@@ -169,37 +169,67 @@ public:
         free_mmz_memory(&dst_mem);
     }
     
-    bool Resize(const Image& src, Image& dst, int dst_w, int dst_h, bool vflip) {
+    bool Resize(const Image& src, Image& dst, int dst_w, int dst_h, bool vflip, int crop_x = 0, int crop_y = 0, int crop_w = 0, int crop_h = 0) {
         if (&src == nullptr || &dst == nullptr) {
             std::cout << "[ImageProcess] Error: src or dst is null reference!" << std::endl;
             return false;
         }
 
-        std::cout << "[ImageProcess] Resize Enter. src: " << src.width << "x" << src.height 
-                  << ", dst_w: " << dst_w << ", dst_h: " << dst_h << ", vflip: " << vflip 
-                  << ", src_mem virAddr: " << (void*)src_mem.virAddr << " phyAddr: 0x" << std::hex << src_mem.phyAddr 
-                  << ", dst_mem virAddr: " << (void*)dst_mem.virAddr << " phyAddr: 0x" << dst_mem.phyAddr << std::dec << std::endl;
+       // std::cout << "[ImageProcess] Resize Enter. src: " << src.width << "x" << src.height 
+       //           << ", dst_w: " << dst_w << ", dst_h: " << dst_h << ", vflip: " << vflip 
+       //           << ", src_mem virAddr: " << (void*)src_mem.virAddr << " phyAddr: 0x" << std::hex << src_mem.phyAddr 
+       //           << ", dst_mem virAddr: " << (void*)dst_mem.virAddr << " phyAddr: 0x" << dst_mem.phyAddr << std::dec << std::endl;
 
         struct ExitPrinter {
             const T_TY_Mem& src;
             const T_TY_Mem& dst;
             ExitPrinter(const T_TY_Mem& s, const T_TY_Mem& d) : src(s), dst(d) {}
             ~ExitPrinter() {
-                std::cout << "[ImageProcess] Resize Exit. src_mem virAddr: " << (void*)src.virAddr 
-                          << " phyAddr: 0x" << std::hex << src.phyAddr 
-                          << ", dst_mem virAddr: " << (void*)dst.virAddr 
-                          << " phyAddr: 0x" << dst.phyAddr << std::dec << std::endl;
+                //std::cout << "[ImageProcess] Resize Exit. src_mem virAddr: " << (void*)src.virAddr 
+                //          << " phyAddr: 0x" << std::hex << src.phyAddr 
+                //          << ", dst_mem virAddr: " << (void*)dst.virAddr 
+                //          << " phyAddr: 0x" << dst.phyAddr << std::dec << std::endl;
             }
         } exit_printer(src_mem, dst_mem);
+
+        if (dst_mem.virAddr != 0) {
+            FH_UINT64 phyAddr = 0;
+            int ret = FH_SYS_VmmGetPaddr_ByVaddr64(&phyAddr, (void*)dst_mem.virAddr);
+            if (ret != 0) {
+                std::cout << "[ImageProcess] Warning: dst_mem.virAddr (0x" << std::hex << dst_mem.virAddr << std::dec << ") is invalid at start of Resize! Code: " << ret << std::endl;
+            }
+        }
+
+        if (dst_mem.virAddr != 0 && last_dst_w > 0 && last_dst_h > 0) {
+            int used_size = last_dst_w * last_dst_h;
+            int total_size = last_dst_w * last_dst_h * 4;
+            uint32_t* boundary_canary = (uint32_t*)((uint8_t*)dst_mem.virAddr + used_size);
+            uint32_t* end_canary = (uint32_t*)((uint8_t*)dst_mem.virAddr + total_size - 4);
+            if (*boundary_canary != 0xDEADC0DE) {
+                std::cout << "[ImageProcess] Warning: dst_mem boundary canary corrupted! Expected 0xDEADC0DE, got 0x" 
+                          << std::hex << *boundary_canary << std::dec << " (External overwrite suspected!)" << std::endl;
+            }
+            if (*end_canary != 0xBEAFBEAF) {
+                std::cout << "[ImageProcess] Warning: dst_mem end canary corrupted! Expected 0xBEAFBEAF, got 0x" 
+                          << std::hex << *end_canary << std::dec << " (External overwrite suspected!)" << std::endl;
+            }
+        }
 
         if (!src.data) return false;
 
         extern bool g_cv_sys_initialized;
         if (!g_cv_sys_initialized) {
             int ret = TY_CV_SysInit();
-            if (ret == 0 || ret == 0xA01D8002 || ret == 0xe0000004) {
+            if (ret == 0)
+            {
                  g_cv_sys_initialized = true;
-            } else {
+            }
+            else if (ret == 0xA01D8002 || ret == 0xe0000004)
+            {
+                std::cout << "[ImageProcess] Warning: TY_CV_SysInit returned " << ret << ", but it's ok." << std::endl;
+                 g_cv_sys_initialized = true;
+            } 
+            else {
                  std::cout << "[ImageProcess] Warning: TY_CV_SysInit returned " << ret << std::endl;
             }
         }
@@ -244,10 +274,14 @@ public:
         }
         // printf("after rgb_interleaved_to_planar\n");
         // V-Flip if requested (In-place on Planar Buffer)
+        // Optimization: Do NOT flip the large source image (640x480) here. 
+        // We will flip the resized smaller image (128x128) at the end, which is much faster.
+        /*
         if (vflip) {
             // printf("before flip_vertical_planar_rgb\n");
             flip_vertical_planar_rgb((uint8_t*)src_mem.virAddr, src.width, src.height);
         }
+        */
         flush_mmz_memory(&src_mem); // Ensure CPU writes are flushed to DDR for TY_CV CvtResize
 
         // printf("after flush_mmz\n");
@@ -275,10 +309,17 @@ public:
         src_ty.desc.picHeight = src.height;
         src_ty.desc.picWidthStride = src.width;
         src_ty.desc.picHeightStride = src.height;
-        src_ty.desc.roi.x = 0;
-        src_ty.desc.roi.y = 0;
-        src_ty.desc.roi.width = src.width;
-        src_ty.desc.roi.height = src.height;
+        if (crop_w > 0 && crop_h > 0) {
+            src_ty.desc.roi.x = crop_x;
+            src_ty.desc.roi.y = crop_y; // Since the source image is not flipped, the ROI y coordinate is directly crop_y.
+            src_ty.desc.roi.width = crop_w;
+            src_ty.desc.roi.height = crop_h;
+        } else {
+            src_ty.desc.roi.x = 0;
+            src_ty.desc.roi.y = 0;
+            src_ty.desc.roi.width = src.width;
+            src_ty.desc.roi.height = src.height;
+        }
         
         
         dst_ty.mem = dst_mem;
@@ -300,14 +341,28 @@ public:
              return false;
         }
         
+        // V-Flip the resized smaller gray output image (128x128) if requested.
+        if (vflip) {
+            flip_vertical_gray((uint8_t*)dst_mem.virAddr, dst_w, dst_h);
+        }
+        
+        if (dst_mem.virAddr != 0) {
+            int used_size = dst_w * dst_h;
+            int total_size = dst_w * dst_h * 4;
+            uint32_t* boundary_canary = (uint32_t*)((uint8_t*)dst_mem.virAddr + used_size);
+            uint32_t* end_canary = (uint32_t*)((uint8_t*)dst_mem.virAddr + total_size - 4);
+            *boundary_canary = 0xDEADC0DE;
+            *end_canary = 0xBEAFBEAF;
+        }
+        
         flush_mmz_memory(&dst_mem);
         
         {
-            static int bmp_counter = 1;
-            char filename[64];
-            snprintf(filename, sizeof(filename), "%d.bmp", bmp_counter);
-            save_bmp_gray(filename, (const uint8_t*)dst_mem.virAddr, dst_w, dst_h);
-            bmp_counter = bmp_counter % 5 + 1;
+            //static int bmp_counter = 1;
+            //char filename[64];
+            //snprintf(filename, sizeof(filename), "%d.bmp", bmp_counter);
+            //save_bmp_gray(filename, (const uint8_t*)dst_mem.virAddr, dst_w, dst_h);
+            //bmp_counter = bmp_counter % 5 + 1;
         }
         
         // 4. Set Output
@@ -316,6 +371,14 @@ public:
         dst.channels = 1;
         dst.data = (unsigned char*)dst_mem.virAddr; 
         
+        if (dst_mem.virAddr != 0) {
+            FH_UINT64 phyAddr = 0;
+            int ret = FH_SYS_VmmGetPaddr_ByVaddr64(&phyAddr, (void*)dst_mem.virAddr);
+            if (ret != 0) {
+                std::cout << "[ImageProcess] Warning: dst_mem.virAddr (0x" << std::hex << dst_mem.virAddr << std::dec << ") is invalid at end of Resize! Code: " << ret << std::endl;
+            }
+        }
+
         //std::cout << "[ImageProcess] Resize success. Dst width=" << dst.width << " height=" << dst.height << std::endl;
 
         return true;
@@ -324,7 +387,7 @@ public:
     // Mock Implementation
     Impl() {}
     ~Impl() {}
-    bool Resize(const Image& src, Image& dst, int dst_w, int dst_h, bool vflip) {
+    bool Resize(const Image& src, Image& dst, int dst_w, int dst_h, bool vflip, int crop_x = 0, int crop_y = 0, int crop_w = 0, int crop_h = 0) {
         printf("[ImageProcess] MOCK: Resize called. NPU Disabled.\n");
 
         return true; 
@@ -335,8 +398,8 @@ public:
 ImageProcess::ImageProcess() : pImpl(std::make_shared<Impl>()) {}
 ImageProcess::~ImageProcess() {}
 
-bool ImageProcess::Resize(const Image& src, Image& dst, int dst_w, int dst_h, bool vflip) {
-    return pImpl->Resize(src, dst, dst_w, dst_h, vflip);
+bool ImageProcess::Resize(const Image& src, Image& dst, int dst_w, int dst_h, bool vflip, int crop_x, int crop_y, int crop_w, int crop_h) {
+    return pImpl->Resize(src, dst, dst_w, dst_h, vflip, crop_x, crop_y, crop_w, crop_h);
 }
 
 } // namespace VisionSDK

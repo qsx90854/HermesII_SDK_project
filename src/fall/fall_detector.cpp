@@ -4097,6 +4097,203 @@ StatusCode FallDetector::Detect(const Image& frame, bool& is_fall)
     int H = frame.height;
     int bSize = (pImpl->config.block_size > 0) ? pImpl->config.block_size : 16;
     
+    // --- 0. Face Detection Integration ---
+    // Face variables declared in outer scope
+    #if ENABLE_PERF_PROFILING
+    long long t_face_start = pImpl->get_now_us();
+    #endif
+
+    bool has_face = pImpl->last_has_face;
+    FaceROI face_roi = pImpl->last_face_roi;
+
+    bool should_run_face_detect = pImpl->config.enable_face_detection;
+    //should_run_face_detect = false;
+    if (should_run_face_detect && pImpl->config.face_detect_interval_frames > 1) {
+        if (pImpl->frame_idx % pImpl->config.face_detect_interval_frames != 0) {
+            should_run_face_detect = false;
+        }
+    }
+
+    // Retry Init if failed in Config
+    if (should_run_face_detect && !pImpl->face_model_inited) {
+         std::string path = pImpl->config.model_path.empty() ? "res/blaze_face_detect_nnp310_128x128.ty" : pImpl->config.model_path;
+         StatusCode ret = pImpl->faceDetector.Init(path);
+         if (ret == StatusCode::OK) {
+              pImpl->face_model_inited = true;
+         } 
+         else 
+         {
+             if (ENABLE_DEBUG_PRINT) std::cout << "[FallDetector::Detect] FaceDetector not initialized (Retry Failed: " << (int)ret << ")" << std::endl;
+         }
+    }
+
+    // Resize for Face Detection (Uses RGB frame)
+    Image faceInput;
+    {
+    TimerGuard t_face(g_perf_timer, "1_2_FaceDetect");
+    if (should_run_face_detect) {
+        has_face = false; // Reset before detection explicitly
+        
+        // 1. Check input frame data pointer
+        if (!frame.data) {
+            std::cout << "[FallDetector::Detect] Warning: Input frame data pointer is NULL. Skipping face detection." << std::endl;
+            should_run_face_detect = false;
+        }
+        
+        // 2. Check input frame channels
+        if (should_run_face_detect && frame.channels != 1 && frame.channels != 3) {
+            std::cout << "[FallDetector::Detect] Warning: Unsupported frame channels: " << frame.channels << ". Skipping face detection." << std::endl;
+            should_run_face_detect = false;
+        }
+    }
+
+    if (should_run_face_detect) {
+        // [CROP LOWER HALF OF BED REGION INTO A SQUARE]
+        int bed_min_x = frame.width - 1, bed_max_x = 0;
+        int bed_min_y = frame.height - 1, bed_max_y = 0;
+        if (!pImpl->bed_region.empty()) {
+            for (auto const& p : pImpl->bed_region) {
+                int px = p.first;
+                int py = p.second;
+                
+                // 3. Boundary check for bed region points
+                if (px < 0 || px >= (int)frame.width || py < 0 || py >= (int)frame.height) {
+                    std::cout << "[FallDetector::Detect] Warning: Bed region point (" << px << ", " << py 
+                              << ") is out of image bounds (" << frame.width << "x" << frame.height << "). Clamping." << std::endl;
+                    px = std::max(0, std::min((int)frame.width - 1, px));
+                    py = std::max(0, std::min((int)frame.height - 1, py));
+                }
+                
+                if (px < bed_min_x) bed_min_x = px;
+                if (px > bed_max_x) bed_max_x = px;
+                if (py < bed_min_y) bed_min_y = py;
+                if (py > bed_max_y) bed_max_y = py;
+            }
+        } else {
+            bed_min_x = 0; bed_max_x = frame.width - 1;
+            bed_min_y = 0; bed_max_y = frame.height - 1;
+        }
+
+        // Lower half of bed region
+        int mid_y = (bed_min_y + bed_max_y) / 2;
+        int bw = bed_max_x - bed_min_x;
+        int bh = bed_max_y - mid_y;
+
+        // Make it a square
+        int s = std::max(bw, bh);
+        
+        // 4. Boundary check for calculated crop size s
+        int max_dim = std::max((int)frame.width, (int)frame.height);
+        if (s > max_dim) {
+            std::cout << "[FallDetector::Detect] Warning: Calculated crop size s = " << s 
+                      << " is larger than image max dimension " << max_dim << ". Clamping." << std::endl;
+            s = max_dim;
+        }
+        if (s <= 0) s = 128; // Fallback
+        
+        // --- VMM ALIGNMENT FIX ---
+        // Hardware Image Resizer (TY_CV) requires width/stride to be 16-byte aligned.
+        // If 's' is an odd number, the driver may calculate false strides,
+        // read past the allocated mmz buffer, and cause Kernel NULL Pointer Dereference.
+        if (s % 16 != 0) {
+            s += (16 - (s % 16));
+        }
+        
+        int cx = bed_min_x + bw / 2;
+        int cy = mid_y + bh / 2;
+        
+        int crop_min_x = cx - s / 2;
+        int crop_min_y = cy - s / 2;
+/* 
+        std::vector<unsigned char> crop_buf(s * s * frame.channels, 0); // zero padded outside
+        int x_start_crop = std::max(0, -crop_min_x);
+        int x_end_crop = std::min(s, (int)frame.width - crop_min_x);
+        for (int y = 0; y < s; ++y) {
+            int src_y = crop_min_y + y;
+            if (src_y >= 0 && src_y < (int)frame.height) {
+                unsigned char* dst_row = crop_buf.data() + y * s * frame.channels;
+                const unsigned char* src_row = frame.data + src_y * frame.width * frame.channels;
+                
+                
+                if (x_end_crop > x_start_crop) {
+                    memcpy(dst_row + x_start_crop * frame.channels, 
+                           src_row + (crop_min_x + x_start_crop) * frame.channels, 
+                           (x_end_crop - x_start_crop) * frame.channels);
+                }
+            }
+        }
+*/
+        Image cropInput;
+        cropInput.width = frame.width;
+        cropInput.height = frame.height;
+        cropInput.channels = frame.channels;
+        cropInput.data = frame.data;//crop_buf.data();
+        cropInput.timestamp = frame.timestamp;
+
+        int crop_x = std::max(0, crop_min_x);
+        int crop_y = std::max(0, crop_min_y);
+        int crop_w = s;
+        int crop_h = s;
+        if (crop_x + crop_w > (int)frame.width) {
+            crop_w = (int)frame.width - crop_x;
+        }
+        if (crop_y + crop_h > (int)frame.height) {
+            crop_h = (int)frame.height - crop_y;
+        }
+
+        
+
+        // Note: FaceDetector::Resize internally applies a vertical flip (vflip=true) as requested.
+        //std::cout<<"[FallDetector::Detect] FaceDetector::Resize GO"<<std::endl;
+        if (pImpl->faceDetector.Resize(cropInput, faceInput, crop_x, crop_y, crop_w, crop_h)) 
+        {
+             std::vector<FaceROI> faces;
+             //std::cout<<"[FallDetector::Detect] FaceDetector::Detect GO"<<std::endl;
+             int ret = pImpl->faceDetector.Detect(faceInput, faces);//disable for debug
+             //int ret = -1;
+             //std::cout<<"[FallDetector::Detect] FaceDetector::Detect End"<<std::endl;
+             if (ret == 0 && !faces.empty()) {
+                 has_face = true;
+                 
+                 // Map the detected ROI back to the original full frame coordinates.
+                 // FaceDetector::Detect returns coordinates relative to cropInput scaled to 128x128.
+                 FaceROI roi_128 = faces[0];
+                 float scale_x = (float)crop_w / 128.0f;
+                 float scale_y = (float)crop_h / 128.0f;
+                 
+                 face_roi.x1 = crop_x + roi_128.x1 * scale_x;
+                 face_roi.y1 = crop_y + roi_128.y1 * scale_y;
+                 face_roi.x2 = crop_x + roi_128.x2 * scale_x;
+                 face_roi.y2 = crop_y + roi_128.y2 * scale_y;
+                 face_roi.score = roi_128.score;
+                 //std::cout<<"[FallDetector::Detect] FaceDetector::Detect Get Face"<<face_roi.x1<<", "<<face_roi.y1<<", "<<face_roi.x2<<", "<<face_roi.y2<<", "<<face_roi.score<<std::endl;
+             }
+            //std::cout<<" Resize success"<<std::endl;
+        } 
+        else 
+        {
+             //std::cout << "[FallDetector] Resize failed!" << std::endl;
+        }
+        
+        pImpl->last_has_face = has_face;
+        pImpl->last_face_roi = face_roi;
+        
+    }
+    }
+
+    // End Face logic
+    
+    #if ENABLE_PERF_PROFILING
+    long long t_face_end = pImpl->get_now_us();
+    pImpl->prof.face_detect_time += (t_face_end - t_face_start);
+    #endif
+
+
+
+//0616開始刪除線
+
+
+
 #if ENABLE_DEBUG_FRAME_SAVE
     auto save_debug_jpg = [&](const char* event_name, const MotionObject& obj) 
     {
@@ -4328,147 +4525,18 @@ StatusCode FallDetector::Detect(const Image& frame, bool& is_fall)
     long long t1 = pImpl->get_now_us(); // Wrapper Init (Part of Motion Est prep)
     #endif
 
-    // --- 0. Face Detection Integration ---
-    // Face variables declared in outer scope
-    #if ENABLE_PERF_PROFILING
-    long long t_face_start = pImpl->get_now_us();
-    #endif
+    
+    
 
-    bool has_face = pImpl->last_has_face;
-    FaceROI face_roi = pImpl->last_face_roi;
-
-    bool should_run_face_detect = pImpl->config.enable_face_detection;
-    if (should_run_face_detect && pImpl->config.face_detect_interval_frames > 1) {
-        if (pImpl->frame_idx % pImpl->config.face_detect_interval_frames != 0) {
-            should_run_face_detect = false;
-        }
-    }
-
-    // Retry Init if failed in Config
-    if (should_run_face_detect && !pImpl->face_model_inited) {
-         std::string path = pImpl->config.model_path.empty() ? "res/blaze_face_detect_nnp310_128x128.ty" : pImpl->config.model_path;
-         StatusCode ret = pImpl->faceDetector.Init(path);
-         if (ret == StatusCode::OK) {
-              pImpl->face_model_inited = true;
-         } 
-         else 
-         {
-             if (ENABLE_DEBUG_PRINT) std::cout << "[FallDetector::Detect] FaceDetector not initialized (Retry Failed: " << (int)ret << ")" << std::endl;
-         }
-    }
-
-    // Resize for Face Detection (Uses RGB frame)
-    Image faceInput;
-    {
-    TimerGuard t_face(g_perf_timer, "1_2_FaceDetect");
-    if (should_run_face_detect) {
-        has_face = false; // Reset before detection explicitly
-        
-        // [CROP LOWER HALF OF BED REGION INTO A SQUARE]
-        int bed_min_x = frame.width - 1, bed_max_x = 0;
-        int bed_min_y = frame.height - 1, bed_max_y = 0;
-        if (!pImpl->bed_region.empty()) {
-            for (auto const& p : pImpl->bed_region) {
-                if (p.first < bed_min_x) bed_min_x = p.first;
-                if (p.first > bed_max_x) bed_max_x = p.first;
-                if (p.second < bed_min_y) bed_min_y = p.second;
-                if (p.second > bed_max_y) bed_max_y = p.second;
-            }
-        } else {
-            bed_min_x = 0; bed_max_x = frame.width - 1;
-            bed_min_y = 0; bed_max_y = frame.height - 1;
-        }
-
-        // Lower half of bed region
-        int mid_y = (bed_min_y + bed_max_y) / 2;
-        int bw = bed_max_x - bed_min_x;
-        int bh = bed_max_y - mid_y;
-
-        // Make it a square
-        int s = std::max(bw, bh);
-        if (s <= 0) s = 128; // Fallback
-        
-        // --- VMM ALIGNMENT FIX ---
-        // Hardware Image Resizer (TY_CV) requires width/stride to be 16-byte aligned.
-        // If 's' is an odd number, the driver may calculate false strides,
-        // read past the allocated mmz buffer, and cause Kernel NULL Pointer Dereference.
-        if (s % 16 != 0) {
-            s += (16 - (s % 16));
-        }
-        
-        int cx = bed_min_x + bw / 2;
-        int cy = mid_y + bh / 2;
-        
-        int crop_min_x = cx - s / 2;
-        int crop_min_y = cy - s / 2;
-
-        std::vector<unsigned char> crop_buf(s * s * frame.channels, 0); // zero padded outside
-
-        for (int y = 0; y < s; ++y) {
-            int src_y = crop_min_y + y;
-            if (src_y >= 0 && src_y < (int)frame.height) {
-                unsigned char* dst_row = crop_buf.data() + y * s * frame.channels;
-                const unsigned char* src_row = frame.data + src_y * frame.width * frame.channels;
-                
-                int x_start = std::max(0, -crop_min_x);
-                int x_end = std::min(s, (int)frame.width - crop_min_x);
-                if (x_end > x_start) {
-                    memcpy(dst_row + x_start * frame.channels, 
-                           src_row + (crop_min_x + x_start) * frame.channels, 
-                           (x_end - x_start) * frame.channels);
-                }
-            }
-        }
-
-        Image cropInput;
-        cropInput.width = s;
-        cropInput.height = s;
-        cropInput.channels = frame.channels;
-        cropInput.data = crop_buf.data();
-        cropInput.timestamp = frame.timestamp;
-
-        // Note: FaceDetector::Resize internally applies a vertical flip (vflip=true) as requested.
-        //std::cout<<"[FallDetector::Detect] FaceDetector::Resize GO"<<std::endl;
-        if (pImpl->faceDetector.Resize(cropInput, faceInput)) 
-        {
-             std::vector<FaceROI> faces;
-             //std::cout<<"[FallDetector::Detect] FaceDetector::Detect GO"<<std::endl;
-             //int ret = pImpl->faceDetector.Detect(faceInput, faces);//disable for debug
-             int ret = -1;
-             //std::cout<<"[FallDetector::Detect] FaceDetector::Detect End"<<std::endl;
-             if (ret == 0 && !faces.empty()) {
-                 has_face = true;
-                 
-                 // Map the detected ROI back to the original full frame coordinates.
-                 // FaceDetector::Detect returns coordinates relative to cropInput scaled to 128x128.
-                 FaceROI roi_128 = faces[0];
-                 float scale = (float)s / 128.0f;
-                 
-                 face_roi.x1 = crop_min_x + roi_128.x1 * scale;
-                 face_roi.y1 = crop_min_y + roi_128.y1 * scale;
-                 face_roi.x2 = crop_min_x + roi_128.x2 * scale;
-                 face_roi.y2 = crop_min_y + roi_128.y2 * scale;
-                 face_roi.score = roi_128.score;
-                 //std::cout<<"[FallDetector::Detect] FaceDetector::Detect Get Face"<<face_roi.x1<<", "<<face_roi.y1<<", "<<face_roi.x2<<", "<<face_roi.y2<<", "<<face_roi.score<<std::endl;
-             }
-        } else {
-            // std::cout << "[FallDetector] Resize failed!" << std::endl;
-        }
-        
-        pImpl->last_has_face = has_face;
-        pImpl->last_face_roi = face_roi;
-    }
-    }
-
-    // End Face logic
     
     #if ENABLE_PERF_PROFILING
-    long long t_face_end = pImpl->get_now_us();
-    pImpl->prof.face_detect_time += (t_face_end - t_face_start);
+    long long t_me_start = 0;
+    long long t_logic_start = 0;
     #endif
-    
+
+    if (pImpl->config.enable_fall_and_bed_exit) {
     #if ENABLE_PERF_PROFILING
-    long long t_me_start = pImpl->get_now_us();
+    t_me_start = pImpl->get_now_us();
     #endif
 
     // Run    // 2. Motion Estimation Execute
@@ -7084,6 +7152,7 @@ StatusCode FallDetector::Detect(const Image& frame, bool& is_fall)
         
         //if (ENABLE_DEBUG_PRINT) std::cout << "[FallDetector] " << warning << std::endl;
     }
+    }
 
     // 7. Invoke Callback
     if (pImpl->callback) 
@@ -7141,7 +7210,7 @@ StatusCode FallDetector::Detect(const Image& frame, bool& is_fall)
 
     // 8. Background Update (Selective)
     // Runs here to use the latest pImpl->current_objects found in this frame
-    if (pImpl->config.bg_update_interval_frames > 0) {
+    if (pImpl->config.enable_fall_and_bed_exit && pImpl->config.bg_update_interval_frames > 0) {
         
         // isInitPhase: Only applies when background is NOT externally set.
         // If background_initialized_externally=true (e.g. edge board loads a BG image),

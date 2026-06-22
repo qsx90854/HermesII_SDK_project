@@ -123,6 +123,9 @@ struct FallDetection_v3 {
     
     // NEW: Edge Drop Filter
     bool enable_edge_drop_filter = false;
+    
+    // NEW: Control fall & bed exit detection logic
+    bool enable_fall_and_bed_exit = true;
 };
 
 struct BedExitDetection_v1 {

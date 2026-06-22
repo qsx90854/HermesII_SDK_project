@@ -8,6 +8,7 @@
 #include <ctime>
 #include <chrono>
 #include <thread>
+#include <cstring>
 
 // Note: Do not wrap entire file in namespace VisionSDK
 // to avoid "VisionSDK::VisionSDK::" confusion if using prefix.
@@ -29,6 +30,9 @@ namespace VisionSDK {
         int input_channels = 0;
         uint64_t input_timestamp = 0;
 
+        // Internal Deep Copy Buffer
+        std::vector<unsigned char> internal_input_copy;
+
         // Stored fusion params (for MapROI)
         FusionParams stored_fusion_params;
         bool has_stored_fusion_params = false;
@@ -41,7 +45,7 @@ using namespace VisionSDK;
 VisionSDK::VisionSDK::VisionSDK() : pImpl(std::unique_ptr<Impl>(new Impl())) {}
 VisionSDK::VisionSDK::~VisionSDK() = default;
 
-#define VISION_SDK_VERSION_INTERNAL "2.0.4k_20260615"
+#define VISION_SDK_VERSION_INTERNAL "2.0.4y_20260622_timedelay"
 
 const char* VisionSDK::VisionSDK::GetVersion() {
     return VISION_SDK_VERSION_INTERNAL;
@@ -179,7 +183,7 @@ StatusCode VisionSDK::VisionSDK::SetConfig(const void* config) {
             pImpl->config.fall_acceleration_threshold = c->fall_acceleration_threshold;
             pImpl->config.fall_window_size = c->fall_window_size;
             pImpl->config.fall_duration = c->fall_duration;
-            pImpl->config.enable_face_detection = c->enable_face_detection;
+            pImpl->config.enable_face_detection = false;//c->enable_face_detection;
             pImpl->config.face_detect_interval_frames = (c->face_detect_interval_frames > 0) ? c->face_detect_interval_frames : 30;
             pImpl->config.bg_update_interval_frames = 12;//c->bg_update_interval_frames; //orig is 8
             pImpl->config.bg_update_alpha = 0.08;//c->bg_update_alpha; // orig is 0.1
@@ -204,6 +208,7 @@ StatusCode VisionSDK::VisionSDK::SetConfig(const void* config) {
             pImpl->config.post_bed_exit_threshold_multiplier = c->post_bed_exit_threshold_multiplier;
             pImpl->config.projection_use_foreground = c->projection_use_foreground;
             pImpl->config.enable_edge_drop_filter = c->enable_edge_drop_filter; // NEW
+            pImpl->config.enable_fall_and_bed_exit = c->enable_fall_and_bed_exit; // NEW
             break;
         }
         case ConfigType::BedExitDetection_v1: {
@@ -300,6 +305,7 @@ StatusCode VisionSDK::VisionSDK::SetConfig(const void* config) {
     // Area / Momentum
     printf("[PARAM-DUMP]  min_trigger_area                  = %d\n", cfg.min_trigger_area);
     printf("[PARAM-DUMP]  momentum_calc_type                = %d\n", cfg.momentum_calc_type);
+    printf("[PARAM-DUMP]  enable_fall_and_bed_exit          = %d\n", (int)cfg.enable_fall_and_bed_exit);
     printf("[PARAM-DUMP] ==========================================\n");
     // ---- [PARAM-DUMP] end ----
 
@@ -349,7 +355,14 @@ StatusCode VisionSDK::VisionSDK::FuseImages3D(const Image& imgA, const CameraInt
 StatusCode VisionSDK::VisionSDK::SetInputMemory(unsigned char* buffer, int width, int height, int channels, uint64_t timestamp) {
     if (!buffer) return StatusCode::ERROR_INVALID_INPUT;
     
-    pImpl->input_buffer = buffer;
+    // Perform deep copy to internal buffer to prevent memory corruption or lifetime issues from external buffers
+    int size = width * height * channels;
+    if (pImpl->internal_input_copy.size() != (size_t)size) {
+        pImpl->internal_input_copy.resize(size);
+    }
+    std::memcpy(pImpl->internal_input_copy.data(), buffer, size);
+
+    pImpl->input_buffer = pImpl->internal_input_copy.data();
     pImpl->input_width = width;
     pImpl->input_height = height;
     pImpl->input_channels = channels;
@@ -391,15 +404,16 @@ StatusCode VisionSDK::VisionSDK::ProcessNextFrame() {
     bool is_fall = false;
     
     // Performance Profiling
-    //auto t0 = std::chrono::high_resolution_clock::now();
+    auto t0 = std::chrono::high_resolution_clock::now();
     StatusCode ret = pImpl->fall_detector.Detect(internal_img, is_fall);
-    //auto t1 = std::chrono::high_resolution_clock::now();
-    //auto duration = std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count();
+    auto t1 = std::chrono::high_resolution_clock::now();
+    auto duration = std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count();
     
-    //long long duration_ms = duration / 1000;
-    //if (duration_ms < 110) {
-    //    std::this_thread::sleep_for(std::chrono::milliseconds(110 - duration_ms));
-    //}
+    long long duration_ms = duration / 1000;
+    long long want_time_cost = 550;
+    if (duration_ms < want_time_cost) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(want_time_cost - duration_ms));
+    }
     
     //std::cout << "[SDK] Detect() Execution Time: " << duration << " us" << std::endl;
 

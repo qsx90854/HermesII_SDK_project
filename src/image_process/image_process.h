@@ -30,7 +30,7 @@ public:
     // Let's assume input is standard VisionSDK::Image (which is usually INTERLEAVED RGB/BGR in memory).
     // Returns status.
     // Convert & Resize (with optional V-Flip)
-    bool Resize(const Image& src, Image& dst, int dst_w, int dst_h, bool vflip = false);
+    bool Resize(const Image& src, Image& dst, int dst_w, int dst_h, bool vflip = false, int crop_x = 0, int crop_y = 0, int crop_w = 0, int crop_h = 0);
 
 private:
    class Impl;

@@ -43,7 +43,7 @@ public:
     // Resize function (placeholder as requested)
     // Takes input image and fills output (128x128 pre-allocated internally or passed in?)
     // User said: "function內留空, 先預設會回傳128x128的圖片"
-    bool Resize(const Image& src, Image& dst);
+    bool Resize(const Image& src, Image& dst, int crop_x = 0, int crop_y = 0, int crop_w = 0, int crop_h = 0);
 
 private:
    class Impl;

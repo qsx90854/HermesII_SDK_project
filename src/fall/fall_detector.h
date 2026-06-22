@@ -105,6 +105,7 @@ struct InternalConfig {
     int momentum_calc_type = 0; // 0: Avg (Default), 1: Peak Block
     bool enable_edge_drop_filter = false; // NEW: Enable edge drop filter
     bool only_save_raw = false; // NEW: Skip detection and save raw image
+    bool enable_fall_and_bed_exit = true; // NEW: Control fall & bed exit detection
 };
 
 class FallDetector {

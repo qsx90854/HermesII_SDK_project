@@ -1,5 +1,6 @@
 # 指定交叉編譯器 (User's Toolchain)
 CXX = /home/mark/arm-fhva12c-linux-uclibcgnueabihf-b5.3/arm-fhva12c-linux-uclibcgnueabihf-b5/bin/arm-fhva12c-linux-uclibcgnueabihf-g++
+AR = /home/mark/arm-fhva12c-linux-uclibcgnueabihf-b5.3/arm-fhva12c-linux-uclibcgnueabihf-b5/bin/arm-fhva12c-linux-uclibcgnueabihf-ar
 #CXX = g++
 
 # 設定編譯參數
@@ -44,6 +45,8 @@ SDK_OBJS = $(SDK_SRCS:.cpp=.o)
 BUILD_DIR = build
 LIB_NAME = libHermesII_sdk.so
 LIB_TARGET = $(BUILD_DIR)/$(LIB_NAME)
+STATIC_LIB_NAME = libHermesII_sdk.a
+STATIC_LIB_TARGET = $(BUILD_DIR)/$(STATIC_LIB_NAME)
 
 FALL_DEMO_TARGET = fall_demo_edge
 FALL_CALLBACK_TARGET = fall_callback_demo_edge
@@ -59,7 +62,7 @@ SDK_DEMO_LOOP_TEST_TARGET = SDK_DemoCode_LoopTest_edge
 FALL_ACCURACY_TEST_TARGET = fall_accuracy_test
 
 # 預設規則
-all: $(LIB_TARGET) $(FALL_DEMO_TARGET) $(FALL_CALLBACK_TARGET) $(SDK_DEMO_CODE_V1_TARGET) $(SDK_DEMO_CODE_V2_TARGET) $(SDK_DEMO_CODE_V2_SAVE_FALL_RESULT_TARGET) $(SDK_DEMO_TEST_ACCURACY_TARGET) $(STREAMING_DEMO_TARGET) $(FALL_ACCURACY_TEST_TARGET) $(SDK_DEMO_BG_TEST_TARGET) $(SDK_DEMO_LOOP_TEST_TARGET)
+all: $(LIB_TARGET) $(STATIC_LIB_TARGET) $(FALL_DEMO_TARGET) $(FALL_CALLBACK_TARGET) $(SDK_DEMO_CODE_V1_TARGET) $(SDK_DEMO_CODE_V2_TARGET) $(SDK_DEMO_CODE_V2_SAVE_FALL_RESULT_TARGET) $(SDK_DEMO_TEST_ACCURACY_TARGET) $(STREAMING_DEMO_TARGET) $(FALL_ACCURACY_TEST_TARGET) $(SDK_DEMO_BG_TEST_TARGET) $(SDK_DEMO_LOOP_TEST_TARGET)
 
 # 建立 build 目錄
 $(BUILD_DIR):
@@ -68,6 +71,10 @@ $(BUILD_DIR):
 # 編譯共用函式庫 (.so) - ARM (Edge)
 $(LIB_TARGET): $(SDK_OBJS) | $(BUILD_DIR)
 	$(CXX) -shared -o $@ $(SDK_OBJS) $(LDFLAGS_NPU)
+
+# 編譯靜態函式庫 (.a) - ARM (Edge)
+$(STATIC_LIB_TARGET): $(SDK_OBJS) | $(BUILD_DIR)
+	$(AR) rcs $@ $(SDK_OBJS)
 
 # 編譯 Fall Demo
 $(FALL_DEMO_TARGET): examples/fall_demo.cpp $(LIB_TARGET)

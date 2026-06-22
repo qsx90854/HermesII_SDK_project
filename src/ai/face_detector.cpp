@@ -439,10 +439,10 @@ public:
 
          
          // disable on v204e
-         //int ret = TY_NPU_Forward(task_handle, E_TY_NPU_ID_0, 
-         //                         model_desc.ioDesc.inputNum, task_inputs, 
-         //                         model_desc.ioDesc.outputNum, task_outputs);
-         int ret = -1;
+         int ret = TY_NPU_Forward(task_handle, E_TY_NPU_ID_0, 
+                                  model_desc.ioDesc.inputNum, task_inputs, 
+                                  model_desc.ioDesc.outputNum, task_outputs);
+        // int ret = -1;
          if (ret != 0) {
              std::cout << "[FaceDetector] NPU Forward failed: " << ret << std::endl;
              return ret;
@@ -506,7 +506,7 @@ public:
         return 0;
     }
 
-    bool Resize(const Image& src, Image& dst) {
+    bool Resize(const Image& src, Image& dst, int crop_x = 0, int crop_y = 0, int crop_w = 0, int crop_h = 0) {
         if (!src.data) {
             std::cout << "[FaceDetector::Resize] Error: Source data is NULL" << std::endl;
             return false;
@@ -520,7 +520,7 @@ public:
         // We know we want 128x128 output
         // Also enable V-Flip because reference demo does it (input data is likely flipped)
         // printf("before call ImageProcess Resize\n");
-        return imageProcess.Resize(src, dst, 128, 128, true);
+        return imageProcess.Resize(src, dst, 128, 128, true, crop_x, crop_y, crop_w, crop_h);
     }
 #else
     // MOCK IMPLEMENTATION
@@ -535,7 +535,7 @@ public:
         faces.clear();
         return 0; // 0 faces
     }
-    bool Resize(const Image& src, Image& dst) {
+    bool Resize(const Image& src, Image& dst, int crop_x = 0, int crop_y = 0, int crop_w = 0, int crop_h = 0) {
         // Mock resize if needed, or just allow it if ImageProcess is pure CPU?
         // ImageProcess includes might pull in NPU, check ImageProcess.
         // Assuming ImageProcess might fail if it uses NPU. But previous code uses imageProcess.Resize which uses pure CPU (stb_image_resize or manual).
@@ -559,7 +559,7 @@ StatusCode FaceDetector::Init(const std::string& model_path) {
 }
 
 int FaceDetector::Detect(const Image& img, std::vector<FaceROI>& faces) {
-    printf("[FaceDetector] Detect: Starting face detection... Image resolution: %dx%d\n", img.width, img.height);
+    // printf("[FaceDetector] Detect: Starting face detection... Image resolution: %dx%d\n", img.width, img.height);
     
     pImpl->call_count++;
     int ret = pImpl->Detect(img, faces);
@@ -568,14 +568,14 @@ int FaceDetector::Detect(const Image& img, std::vector<FaceROI>& faces) {
         pImpl->success_count++;
     }
     
-    printf("[FaceDetector] Detect: Finished face detection. Results count: %d | Total calls (since init): %u | Successful detections (since init): %u\n",
-           (int)faces.size(), pImpl->call_count, pImpl->success_count);
+    // printf("[FaceDetector] Detect: Finished face detection. Results count: %d | Total calls (since init): %u | Successful detections (since init): %u\n",
+    //        (int)faces.size(), pImpl->call_count, pImpl->success_count);
            
     return ret;
 }
 
-bool FaceDetector::Resize(const Image& src, Image& dst) {
-    return pImpl->Resize(src, dst);
+bool FaceDetector::Resize(const Image& src, Image& dst, int crop_x, int crop_y, int crop_w, int crop_h) {
+    return pImpl->Resize(src, dst, crop_x, crop_y, crop_w, crop_h);
 }
 
 StatusCode FaceDetector::Release() {
