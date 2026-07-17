@@ -23,6 +23,13 @@ ARM_FLAGS += -ffunction-sections -mno-unaligned-access -fno-aggressive-loop-opti
 # Combine for ARM (Edge)
 CXXFLAGS = $(COMMON_FLAGS) $(ARM_FLAGS)
 
+# DEBUG: 除錯符號，供 core dump 配合 cross-gdb 使用（不影響執行效能，只增加檔案大小）
+CXXFLAGS += -g
+
+# DEBUG: AddressSanitizer（找出是誰踩壞 main 的堆疊；除錯完移除）
+# 板子 RAM 小，執行時務必帶 ASAN_OPTIONS 降低記憶體用量，見下：
+#   ASAN_OPTIONS=quarantine_size_mb=4:malloc_context_size=2:redzone=16:detect_leaks=0 ./SDK_DemoCode_v2_save_fall_result_edge app_config_data2.ini
+# CXXFLAGS += -fsanitize=address -fno-omit-frame-pointer -static-libasan -static-libstdc++
 # NPU Libraries
 LDFLAGS_NPU += -Wl,--start-group
 LDFLAGS_NPU += $(wildcard $(SDK_LIBRARY)/npu/*.a)
@@ -37,7 +44,8 @@ SDK_SRCS = src/HermesII_sdk.cpp \
            src/ai/blaze_face_detect_parser.cpp \
            src/fusion/image_fusion.cpp \
            src/fall/fall_detector.cpp \
-           src/image_process/image_process.cpp
+           src/image_process/image_process.cpp \
+           src/event_recorder.cpp
 
 SDK_OBJS = $(SDK_SRCS:.cpp=.o)
 
@@ -60,9 +68,11 @@ SDK_DEMO_LOOP_TEST_TARGET = SDK_DemoCode_LoopTest_edge
 
 # 編譯 Batch Accuracy Test
 FALL_ACCURACY_TEST_TARGET = fall_accuracy_test
+SDK_ERRORLOG_VERIFIER_TARGET = sdk_errorlog_verifier_edge
+SDK_GRAY_TEST_EDGE_TARGET = sdk_gray_test_edge
 
 # 預設規則
-all: $(LIB_TARGET) $(STATIC_LIB_TARGET) $(FALL_DEMO_TARGET) $(FALL_CALLBACK_TARGET) $(SDK_DEMO_CODE_V1_TARGET) $(SDK_DEMO_CODE_V2_TARGET) $(SDK_DEMO_CODE_V2_SAVE_FALL_RESULT_TARGET) $(SDK_DEMO_TEST_ACCURACY_TARGET) $(STREAMING_DEMO_TARGET) $(FALL_ACCURACY_TEST_TARGET) $(SDK_DEMO_BG_TEST_TARGET) $(SDK_DEMO_LOOP_TEST_TARGET)
+all: $(LIB_TARGET) $(STATIC_LIB_TARGET) $(FALL_DEMO_TARGET) $(FALL_CALLBACK_TARGET) $(SDK_DEMO_CODE_V1_TARGET) $(SDK_DEMO_CODE_V2_TARGET) $(SDK_DEMO_CODE_V2_SAVE_FALL_RESULT_TARGET) $(SDK_DEMO_TEST_ACCURACY_TARGET) $(STREAMING_DEMO_TARGET) $(FALL_ACCURACY_TEST_TARGET) $(SDK_DEMO_BG_TEST_TARGET) $(SDK_DEMO_LOOP_TEST_TARGET) $(SDK_ERRORLOG_VERIFIER_TARGET) $(SDK_GRAY_TEST_EDGE_TARGET)
 
 # 建立 build 目錄
 $(BUILD_DIR):
@@ -70,55 +80,62 @@ $(BUILD_DIR):
 
 # 編譯共用函式庫 (.so) - ARM (Edge)
 $(LIB_TARGET): $(SDK_OBJS) | $(BUILD_DIR)
-	$(CXX) -shared -o $@ $(SDK_OBJS) $(LDFLAGS_NPU)
+	$(CXX) -shared -o $@ $(SDK_OBJS) $(LDFLAGS_NPU) -lpthread
 
 # 編譯靜態函式庫 (.a) - ARM (Edge)
 $(STATIC_LIB_TARGET): $(SDK_OBJS) | $(BUILD_DIR)
 	$(AR) rcs $@ $(SDK_OBJS)
 
 # 編譯 Fall Demo
-$(FALL_DEMO_TARGET): examples/fall_demo.cpp $(LIB_TARGET)
-	$(CXX) $(CXXFLAGS) -o $@ $< -L$(BUILD_DIR) -lHermesII_sdk -Wl,-rpath,'$$ORIGIN/$(BUILD_DIR)'
+$(FALL_DEMO_TARGET): examples/fall_demo.cpp $(STATIC_LIB_TARGET)
+	$(CXX) $(CXXFLAGS) -o $@ $< $(STATIC_LIB_TARGET) $(LDFLAGS_NPU) -lpthread -lm -ldl
 
 # 編譯 Callback Demo
-$(FALL_CALLBACK_TARGET): examples/fall_callback_demo.cpp $(LIB_TARGET)
-	$(CXX) $(CXXFLAGS) -o $@ $< -L$(BUILD_DIR) -lHermesII_sdk -Wl,-rpath,'$$ORIGIN/$(BUILD_DIR)' -lpthread
+$(FALL_CALLBACK_TARGET): examples/fall_callback_demo.cpp $(STATIC_LIB_TARGET)
+	$(CXX) $(CXXFLAGS) -o $@ $< $(STATIC_LIB_TARGET) $(LDFLAGS_NPU) -lpthread -lm -ldl
 
 # 編譯 SDK Demo Code v1
-$(SDK_DEMO_CODE_V1_TARGET): examples/SDK_DemoCode_v1.cpp $(LIB_TARGET)
-	$(CXX) $(CXXFLAGS) -o $@ $< -L$(BUILD_DIR) -lHermesII_sdk -Wl,-rpath,'$$ORIGIN/$(BUILD_DIR)' -lpthread
+$(SDK_DEMO_CODE_V1_TARGET): examples/SDK_DemoCode_v1.cpp $(STATIC_LIB_TARGET)
+	$(CXX) $(CXXFLAGS) -o $@ $< $(STATIC_LIB_TARGET) $(LDFLAGS_NPU) -lpthread -lm -ldl
 
 # 編譯 SDK Demo Code v2
-$(SDK_DEMO_CODE_V2_TARGET): examples/SDK_DemoCode_v2.cpp $(LIB_TARGET)
-	$(CXX) $(CXXFLAGS) -o $@ $< -L$(BUILD_DIR) -lHermesII_sdk -Wl,-rpath,'$$ORIGIN/$(BUILD_DIR)' -lpthread
+$(SDK_DEMO_CODE_V2_TARGET): examples/SDK_DemoCode_v2.cpp $(STATIC_LIB_TARGET)
+	$(CXX) $(CXXFLAGS) -o $@ $< $(STATIC_LIB_TARGET) $(LDFLAGS_NPU) -lpthread -lm -ldl
 
 # 編譯 SDK Demo Code v2 Save Result
-$(SDK_DEMO_CODE_V2_SAVE_FALL_RESULT_TARGET): examples/SDK_DemoCode_v2_save_fall_result.cpp $(LIB_TARGET)
-	$(CXX) $(CXXFLAGS) -o $@ $< -L$(BUILD_DIR) -lHermesII_sdk -Wl,-rpath,'$$ORIGIN/$(BUILD_DIR)' -lpthread
+$(SDK_DEMO_CODE_V2_SAVE_FALL_RESULT_TARGET): examples/SDK_DemoCode_v2_save_fall_result.cpp $(STATIC_LIB_TARGET)
+	$(CXX) $(CXXFLAGS) -o $@ $< $(STATIC_LIB_TARGET) $(LDFLAGS_NPU) -lpthread -lm -ldl
 
 # 編譯 SDK Demo Code v1 Accuracy Test
-$(SDK_DEMO_TEST_ACCURACY_TARGET): examples/SDK_DemoCode_v1_test_accuracy.cpp $(LIB_TARGET)
-	$(CXX) $(CXXFLAGS) -o $@ $< -L$(BUILD_DIR) -lHermesII_sdk -Wl,-rpath,'$$ORIGIN/$(BUILD_DIR)' -lpthread
+$(SDK_DEMO_TEST_ACCURACY_TARGET): examples/SDK_DemoCode_v1_test_accuracy.cpp $(STATIC_LIB_TARGET)
+	$(CXX) $(CXXFLAGS) -o $@ $< $(STATIC_LIB_TARGET) $(LDFLAGS_NPU) -lpthread -lm -ldl
 
 # 編譯 SDK Demo Code BG Test
-$(SDK_DEMO_BG_TEST_TARGET): examples/SDK_DemoCode_BG_Test.cpp $(LIB_TARGET)
-	$(CXX) $(CXXFLAGS) -o $@ $< -L$(BUILD_DIR) -lHermesII_sdk -Wl,-rpath,'$$ORIGIN/$(BUILD_DIR)' -lpthread
+$(SDK_DEMO_BG_TEST_TARGET): examples/SDK_DemoCode_BG_Test.cpp $(STATIC_LIB_TARGET)
+	$(CXX) $(CXXFLAGS) -o $@ $< $(STATIC_LIB_TARGET) $(LDFLAGS_NPU) -lpthread -lm -ldl
 
 # 編譯 Streaming Demo
-$(STREAMING_DEMO_TARGET): examples/streaming_demo.cpp $(LIB_TARGET)
-	$(CXX) $(CXXFLAGS) -o $@ $< -L$(BUILD_DIR) -lHermesII_sdk -Wl,-rpath,'$$ORIGIN/$(BUILD_DIR)' -lpthread
+$(STREAMING_DEMO_TARGET): examples/streaming_demo.cpp $(STATIC_LIB_TARGET)
+	$(CXX) $(CXXFLAGS) -o $@ $< $(STATIC_LIB_TARGET) $(LDFLAGS_NPU) -lpthread -lm -ldl
 
-$(FALL_ACCURACY_TEST_TARGET): examples/fall_callback_demo_test_accuracy.cpp $(LIB_TARGET)
-	$(CXX) $(CXXFLAGS) -o $@ $< -L$(BUILD_DIR) -lHermesII_sdk -Wl,-rpath,'$$ORIGIN/$(BUILD_DIR)' -lpthread
+$(FALL_ACCURACY_TEST_TARGET): examples/fall_callback_demo_test_accuracy.cpp $(STATIC_LIB_TARGET)
+	$(CXX) $(CXXFLAGS) -o $@ $< $(STATIC_LIB_TARGET) $(LDFLAGS_NPU) -lpthread -lm -ldl
 
 # 編譯 SDK Demo Loop Test
-$(SDK_DEMO_LOOP_TEST_TARGET): examples/SDK_DemoCode_LoopTest.cpp $(LIB_TARGET)
-	$(CXX) $(CXXFLAGS) -o $@ $< -L$(BUILD_DIR) -lHermesII_sdk -Wl,-rpath,'$$ORIGIN/$(BUILD_DIR)' -lpthread
+$(SDK_DEMO_LOOP_TEST_TARGET): examples/SDK_DemoCode_LoopTest.cpp $(STATIC_LIB_TARGET)
+	$(CXX) $(CXXFLAGS) -o $@ $< $(STATIC_LIB_TARGET) $(LDFLAGS_NPU) -lpthread -lm -ldl
+
+$(SDK_ERRORLOG_VERIFIER_TARGET): examples/sdk_errorlog_verifier.cpp $(STATIC_LIB_TARGET)
+	$(CXX) $(CXXFLAGS) -o $@ $< $(STATIC_LIB_TARGET) $(LDFLAGS_NPU) -lpthread -lm -ldl
+
+$(SDK_GRAY_TEST_EDGE_TARGET): examples/sdk_gray_test.cpp $(STATIC_LIB_TARGET)
+	$(CXX) $(CXXFLAGS) -o $@ $< $(STATIC_LIB_TARGET) $(LDFLAGS_NPU) -lpthread -lm -ldl
+
 # 編譯 .o 檔
 %.o: %.cpp
 	$(CXX) $(CXXFLAGS) -c $< -o $@
 
 # 清除規則
 clean:
-	rm -f $(SDK_OBJS) $(FALL_DEMO_TARGET) $(FALL_CALLBACK_TARGET) $(SDK_DEMO_CODE_V1_TARGET) $(SDK_DEMO_CODE_V2_TARGET) $(SDK_DEMO_TEST_ACCURACY_TARGET) $(STREAMING_DEMO_TARGET) $(FALL_ACCURACY_TEST_TARGET) $(SDK_DEMO_BG_TEST_TARGET) $(SDK_DEMO_CODE_V2_SAVE_FALL_RESULT_TARGET) $(SDK_DEMO_LOOP_TEST_TARGET)
+	rm -f $(SDK_OBJS) $(FALL_DEMO_TARGET) $(FALL_CALLBACK_TARGET) $(SDK_DEMO_CODE_V1_TARGET) $(SDK_DEMO_CODE_V2_TARGET) $(SDK_DEMO_TEST_ACCURACY_TARGET) $(STREAMING_DEMO_TARGET) $(FALL_ACCURACY_TEST_TARGET) $(SDK_DEMO_BG_TEST_TARGET) $(SDK_DEMO_CODE_V2_SAVE_FALL_RESULT_TARGET) $(SDK_DEMO_LOOP_TEST_TARGET) $(SDK_ERRORLOG_VERIFIER_TARGET) $(SDK_GRAY_TEST_EDGE_TARGET)
 	rm -rf $(BUILD_DIR)

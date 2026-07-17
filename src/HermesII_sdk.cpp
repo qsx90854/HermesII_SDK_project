@@ -2,6 +2,7 @@
 #include "ai/model_runner.h"
 #include "fusion/image_fusion.h"
 #include "fall/fall_detector.h"
+#include "event_recorder.h"
 #include "Image.h"
 #include <iostream>
 #include <fstream>
@@ -36,6 +37,40 @@ namespace VisionSDK {
         // Stored fusion params (for MapROI)
         FusionParams stored_fusion_params;
         bool has_stored_fusion_params = false;
+
+        // Event-triggered raw frame recording (mmap ring on SD card)
+        EventRecorder event_recorder;
+        VisionSDKCallback user_callback;
+        bool internal_callback_registered = false;
+
+        // Recorder self-test: FORCED ON for bring-up testing (no sdk.ini
+        // needed). Once more than kSelfTestTriggerFrame frames have been
+        // processed, fire one synthetic event to verify the whole
+        // trigger/save pipeline; afterwards normal event logic applies.
+        static const uint64_t kSelfTestTriggerFrame = 300;
+        bool event_record_self_test = true;
+        bool self_test_triggered = false;
+        uint64_t recorder_frame_count = 0;
+
+        // FallDetector fires events synchronously inside Detect(). This wrapper
+        // feeds fall / bed-exit events into the recorder before forwarding them
+        // to the user's callback. Idempotent: SetConfig(EventRecording_v1) and
+        // RegisterVisionSDKCallback may arrive in any order.
+        static void EnsureInternalCallback(Impl* impl) {
+            if (impl->internal_callback_registered) return;
+            impl->internal_callback_registered = true;
+            impl->fall_detector.RegisterCallback([impl](const VisionSDKEvent& e) {
+                if (e.is_fall_detected || e.is_bed_exit) {
+                    std::vector<uint8_t> bg;
+                    if (!impl->event_recorder.IsCapturing()) {
+                        // Only the first trigger of a capture needs the background.
+                        impl->fall_detector.GetBackgroundImage(bg);
+                    }
+                    impl->event_recorder.OnEvent(e, std::move(bg));
+                }
+                if (impl->user_callback) impl->user_callback(e);
+            });
+        }
     };
 }
 
@@ -45,7 +80,7 @@ using namespace VisionSDK;
 VisionSDK::VisionSDK::VisionSDK() : pImpl(std::unique_ptr<Impl>(new Impl())) {}
 VisionSDK::VisionSDK::~VisionSDK() = default;
 
-#define VISION_SDK_VERSION_INTERNAL "2.0.4y_20260622_timedelay"
+#define VISION_SDK_VERSION_INTERNAL "2.0.5a_20260717"
 
 const char* VisionSDK::VisionSDK::GetVersion() {
     return VISION_SDK_VERSION_INTERNAL;
@@ -105,11 +140,24 @@ StatusCode VisionSDK::VisionSDK::Init(const std::string& model_path, int num_thr
     // Pass merged config to FallDetector
     pImpl->fall_detector.SetConfig(pImpl->config);
 
+    // Event recording is default-on: hook the recorder into the detector even
+    // if the caller never registers a callback or sends EventRecording_v1.
+    Impl::EnsureInternalCallback(pImpl.get());
+
+    if (pImpl->event_record_self_test) {
+        std::cout << "[SDK][SELF-TEST] Event recording self-test is FORCED ON: "
+                  << "one TEST recording will start automatically after "
+                  << Impl::kSelfTestTriggerFrame << " frames. "
+                  << "Test files are named evt_selftest_* / event_type=self_test. "
+                  << "Normal fall/bed-exit recording continues afterwards." << std::endl;
+    }
+
     std::cout << "VisionSDK Initialized." << std::endl;
     return StatusCode::OK;
 }
 
 StatusCode VisionSDK::VisionSDK::Release() {
+    pImpl->event_recorder.Shutdown(); // flush pending event recording first
     pImpl->fall_detector.Release();
     std::cout << "VisionSDK Released." << std::endl;
     return StatusCode::OK;
@@ -183,7 +231,7 @@ StatusCode VisionSDK::VisionSDK::SetConfig(const void* config) {
             pImpl->config.fall_acceleration_threshold = c->fall_acceleration_threshold;
             pImpl->config.fall_window_size = c->fall_window_size;
             pImpl->config.fall_duration = c->fall_duration;
-            pImpl->config.enable_face_detection = false;//c->enable_face_detection;
+            pImpl->config.enable_face_detection = c->enable_face_detection;
             pImpl->config.face_detect_interval_frames = (c->face_detect_interval_frames > 0) ? c->face_detect_interval_frames : 30;
             pImpl->config.bg_update_interval_frames = 12;//c->bg_update_interval_frames; //orig is 8
             pImpl->config.bg_update_alpha = 0.08;//c->bg_update_alpha; // orig is 0.1
@@ -226,6 +274,13 @@ StatusCode VisionSDK::VisionSDK::SetConfig(const void* config) {
             pImpl->config.enable_save_images = c->enable_save_images;
             pImpl->config.save_image_path = c->save_image_path;
             break;
+        }
+        case ConfigType::EventRecording_v1: {
+            const auto* c = static_cast<const EventRecording_v1*>(config);
+            pImpl->event_recorder.Configure(c->enable, c->pre_frames, c->post_frames);
+            if (c->enable) Impl::EnsureInternalCallback(pImpl.get());
+            // Recorder is independent of InternalConfig; nothing to merge.
+            return StatusCode::OK;
         }
         default:
             return StatusCode::ERROR_INVALID_INPUT;
@@ -400,7 +455,20 @@ StatusCode VisionSDK::VisionSDK::ProcessNextFrame() {
     internal_img.height = pImpl->input_height;
     internal_img.channels = pImpl->input_channels;
     internal_img.timestamp = pImpl->input_timestamp;
-    
+
+    // Spool the frame into the SD-card ring before Detect(): when the event
+    // callback fires inside Detect(), the ring's newest frame is this frame.
+    pImpl->event_recorder.PushFrame(internal_img);
+
+    pImpl->recorder_frame_count++;
+    if (pImpl->event_record_self_test && !pImpl->self_test_triggered &&
+        pImpl->recorder_frame_count > Impl::kSelfTestTriggerFrame) {
+        pImpl->self_test_triggered = true;
+        std::vector<uint8_t> bg;
+        pImpl->fall_detector.GetBackgroundImage(bg);
+        pImpl->event_recorder.TriggerSelfTest(std::move(bg));
+    }
+
     bool is_fall = false;
     
     // Performance Profiling
@@ -408,12 +476,50 @@ StatusCode VisionSDK::VisionSDK::ProcessNextFrame() {
     StatusCode ret = pImpl->fall_detector.Detect(internal_img, is_fall);
     auto t1 = std::chrono::high_resolution_clock::now();
     auto duration = std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count();
-    
-    long long duration_ms = duration / 1000;
-    long long want_time_cost = 550;
-    if (duration_ms < want_time_cost) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(want_time_cost - duration_ms));
+
+    // Back-fill this frame's processing time into its ring slot so event
+    // recordings can report per-frame Detect() duration in the meta json.
+    pImpl->event_recorder.RecordProcessTime((uint64_t)duration);
+
+    // Snapshot the decision-relevant state (objects, blocks, momentum, ...)
+    // for this frame so event recordings can explain WHY a fall / bed-exit
+    // was decided (dumped to <event>.analysis.jsonl at finalize).
+    if (pImpl->event_recorder.IsActive()) {
+        const int kMaxAnalysisObjects = 8;
+        EventRecorder::FrameAnalysis fa;
+        fa.timestamp_ms = pImpl->input_timestamp;
+        fa.grid_cols = pImpl->config.grid_cols;
+        fa.grid_rows = pImpl->config.grid_rows;
+        fa.block_size = pImpl->config.block_size;
+        const std::vector<MotionObject>& objs = pImpl->fall_detector.GetMotionObjects();
+        for (const MotionObject& o : objs) {
+            if ((int)fa.objects.size() >= kMaxAnalysisObjects) break;
+            EventRecorder::FrameAnalysisObject ao;
+            ao.id = o.id;
+            ao.cx = o.centerX;
+            ao.cy = o.centerY;
+            ao.dx = o.avgDx;
+            ao.dy = o.avgDy;
+            ao.strength = o.strength;
+            ao.acceleration = o.acceleration;
+            ao.pixel_count = o.pixel_count;
+            ao.safe_area_ratio = o.safe_area_ratio;
+            ao.direction_variance = o.direction_variance;
+            ao.in_observation = o.is_in_observation_mode;
+            ao.blocks.reserve(o.blocks.size());
+            for (int b : o.blocks) {
+                if (b >= 0 && b <= 65535) ao.blocks.push_back((uint16_t)b);
+            }
+            if (fa.total_fg_pixels == 0) fa.total_fg_pixels = o.total_frame_pixel_count;
+            fa.objects.push_back(std::move(ao));
+        }
+        pImpl->event_recorder.RecordFrameAnalysis(std::move(fa));
     }
+    
+    //long long want_time_cost = 550;
+    //if (duration_ms < want_time_cost) {
+    //    std::this_thread::sleep_for(std::chrono::milliseconds(want_time_cost - duration_ms));
+    //}
     
     //std::cout << "[SDK] Detect() Execution Time: " << duration << " us" << std::endl;
 
@@ -423,11 +529,14 @@ StatusCode VisionSDK::VisionSDK::ProcessNextFrame() {
 }
 
 void VisionSDK::VisionSDK::RegisterVisionSDKCallback(VisionSDKCallback callback) {
-    pImpl->fall_detector.RegisterCallback(callback);
+    pImpl->user_callback = callback;
+    Impl::EnsureInternalCallback(pImpl.get());
 }
 
 void VisionSDK::VisionSDK::SetBedRegion(const std::vector<std::pair<int, int>>& points) {
     pImpl->fall_detector.SetBedRegion(points);
+    // Keep a copy for event recordings: written into each event's meta json.
+    pImpl->event_recorder.SetBedRegion(points);
 }
 
 std::vector<std::pair<int, int>> VisionSDK::VisionSDK::GetBedRegion() {

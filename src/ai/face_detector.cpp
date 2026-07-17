@@ -91,14 +91,32 @@ static int alloc_mmz_memory(T_TY_Mem *mem, uint32_t size, E_TY_MemAllocType type
     if (!mem || size == 0) return -1;
     int ret = 0;
     const char *tag = (type == E_TY_MEM_VMM_CACHED) ? "NPU_CACHED" : "NPU";
-    
+
     if (type == E_TY_MEM_VMM_NO_CACHED) {
         ret = FH_SYS_VmmAllocEx64((FH_UINT64*)&mem->phyAddr, (void **)&mem->virAddr, tag, "anonymous", size, 128);
     } else {
         ret = FH_SYS_VmmAllocEx_Cached64((FH_UINT64*)&mem->phyAddr, (void **)&mem->virAddr, tag, "anonymous", size, 128);
-        if (ret == 0) FH_SYS_VmmFlushCache64(mem->phyAddr, (void *)mem->virAddr, size);
+        if (ret == 0) {
+            int flush_ret = FH_SYS_VmmFlushCache64(mem->phyAddr, (void *)mem->virAddr, size);
+            if (flush_ret != 0) {
+                printf("[MMZ] Alloc (FaceDetector) Error: flush cache failed, ret=%d\n", flush_ret);
+                FH_SYS_VmmFreeOne64(mem->phyAddr);
+                mem->phyAddr = 0;
+                mem->virAddr = 0;
+                mem->size = 0;
+                return -3;
+            }
+        }
     }
     if (ret != 0) return ret;
+
+    if (mem->phyAddr == 0 || mem->virAddr == 0) {
+        printf("[MMZ] Alloc (FaceDetector) Error: invalid address after alloc (phyAddr=0x%llx virAddr=0x%llx)\n",
+               (unsigned long long)mem->phyAddr, (unsigned long long)mem->virAddr);
+        mem->size = 0;
+        return -2;
+    }
+
     mem->size = size;
     printf("[MMZ] Alloc (FaceDetector) Size: %u bytes, PhyAddr: 0x%llx, VirAddr: 0x%llx\n", size, (unsigned long long)mem->phyAddr, (unsigned long long)mem->virAddr);
     return 0;
@@ -524,6 +542,9 @@ public:
     }
 #else
     // MOCK IMPLEMENTATION
+    uint32_t call_count = 0;
+    uint32_t success_count = 0;
+
     Impl() {}
     ~Impl() {}
     StatusCode Init(const std::string& model_path) {

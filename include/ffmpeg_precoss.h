@@ -65,23 +65,25 @@ private:
 
 public:
     // 預設建構子
-    VideoReader(int targetWidth = 800, int targetHeight = 450) 
-        : pipe(nullptr), width(targetWidth), height(targetHeight), channels(3), is_async(false), new_frame_ready(false), running(false), stopped(true) {
+    VideoReader(int targetWidth = 800, int targetHeight = 450, const std::string& pix_fmt = "rgb24") 
+        : pipe(nullptr), width(targetWidth), height(targetHeight), is_async(false), new_frame_ready(false), running(false), stopped(true) {
+        channels = (pix_fmt == "gray") ? 1 : 3;
         frameSize = width * height * channels;
     }
 
     // 建構子
-    VideoReader(const std::string& videoPath, int targetWidth = 800, int targetHeight = 450) 
-        : pipe(nullptr), width(targetWidth), height(targetHeight), channels(3), is_async(false), new_frame_ready(false), running(false), stopped(true) {
+    VideoReader(const std::string& videoPath, int targetWidth = 800, int targetHeight = 450, const std::string& pix_fmt = "rgb24") 
+        : pipe(nullptr), width(targetWidth), height(targetHeight), is_async(false), new_frame_ready(false), running(false), stopped(true) {
         
+        channels = (pix_fmt == "gray") ? 1 : 3;
         frameSize = width * height * channels;
         
         if (videoPath.find("rtsp://") == 0) {
-            if (!openRtsp(videoPath)) {
+            if (!openRtsp(videoPath, pix_fmt)) {
                 throw std::runtime_error("無法開啟 FFmpeg RTSP pipe！");
             }
         } else {
-            std::string cmd = "ffmpeg -i \"" + videoPath + "\" -f image2pipe -pix_fmt rgb24 -s " + 
+            std::string cmd = "ffmpeg -i \"" + videoPath + "\" -f image2pipe -pix_fmt " + pix_fmt + " -s " + 
                               std::to_string(width) + "x" + std::to_string(height) + 
                               " -vcodec rawvideo - 2>/dev/null";
             pipe = popen(cmd.c_str(), "r");
@@ -92,7 +94,7 @@ public:
     }
 
         // 專門開啟 RTSP 串流的 Function
-    bool openRtsp(const std::string& rtspUrl) {
+    bool openRtsp(const std::string& rtspUrl, const std::string& pix_fmt = "rgb24") {
         if (is_async) {
             stopAsync();
         } else if (pipe) {
@@ -100,7 +102,7 @@ public:
             pipe = nullptr;
         }
 
-        std::string cmd = "ffmpeg -rtsp_transport tcp -i \"" + rtspUrl + "\" -f image2pipe -pix_fmt rgb24 -s " + 
+        std::string cmd = "ffmpeg -rtsp_transport tcp -i \"" + rtspUrl + "\" -f image2pipe -pix_fmt " + pix_fmt + " -s " + 
                           std::to_string(width) + "x" + std::to_string(height) + 
                           " -vcodec rawvideo - 2>/dev/null";
         

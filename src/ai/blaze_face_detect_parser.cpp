@@ -179,14 +179,15 @@ int blaze_face_parse(float *regressors, float *classifiers,
     for (int i = 0; i < FACE_NUM_ANCHORS; i++) {
         // 1. Decode Score
         float raw_score = classifiers[i];
+        if (isnan(raw_score)) {
+            continue;
+        }
         float score = sigmoid(raw_score); 
 
-        if (score < FACE_CONF_THRESHOLD) {
+        if (isnan(score) || score < FACE_CONF_THRESHOLD) {
             continue;
         }
 
-        // 2. Decode Box & Keypoints
-        // Regressor shape [896, 16]
         // 2. Decode Box & Keypoints
         // Regressor shape [896, 16]
         // Standard TF/MediaPipe order is usually [y, x, h, w]
@@ -196,6 +197,10 @@ int blaze_face_parse(float *regressors, float *classifiers,
         float dx = regressors[offset + 1]; 
         float dh = regressors[offset + 2];
         float dw = regressors[offset + 3];
+
+        if (isnan(dy) || isnan(dx) || isnan(dh) || isnan(dw)) {
+            continue;
+        }
 
         Anchor anchor = g_anchors[i];
         

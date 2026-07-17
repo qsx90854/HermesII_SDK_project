@@ -427,7 +427,7 @@ public:
         return true;
     }
 
-    std::string getString(const std::string& key, const std::string& defaultVal) {
+    std::string getString(const std::string& key, std::string defaultVal) {
         if (data.find(key) != data.end()) return data[key];
         return defaultVal;
     }
@@ -589,6 +589,13 @@ struct ObjStatsHistory {
 std::map<int, ObjStatsHistory> obj_histories;
 
 int main(int argc, char** argv) {
+
+    // 2. Initialize SDK
+    VisionSDK::VisionSDK sdk;
+    sdk.Init("models/blaze_face_detect_nnp310_128x128.ty", 4); // Default Init
+
+
+
     std::cout << "Starting Fall Callback Demo v2 SAVE (30FPS Sim)..." << std::endl;
     std::cout << "SDK Version: " << VisionSDK::VisionSDK::GetVersion() << std::endl;
     // 1. Load Configs
@@ -631,9 +638,6 @@ int main(int argc, char** argv) {
         std::cerr << "Warning: parameter.ini not found, using defaults." << std::endl;
     }
 
-    // 2. Initialize SDK
-    VisionSDK::VisionSDK sdk;
-    sdk.Init("", 4); // Default Init
 
     // 1. Motion Estimation Config
     VisionSDK::MotionEstimation_v1 motionCfg;
@@ -945,17 +949,20 @@ int main(int argc, char** argv) {
     };
     std::vector<FallInterval> detected_intervals_vec;
 
-
     // Check input type: Video (mp4/avi/etc), RTSP, or RAW Sequence
-    std::string rtsp_url = appCfg.getString("Demo.Demo_RTSP_URL", ""); 
+    std::string rtsp_url = appCfg.getString("Demo.Demo_RTSP_URL", "");
+
     std::string lower_format = imgFormat;
     std::transform(lower_format.begin(), lower_format.end(), lower_format.begin(), ::tolower);
-    
+
     bool is_video_file = (lower_format.find(".mp4") != std::string::npos || 
                           lower_format.find(".avi") != std::string::npos || 
                           lower_format.find(".mkv") != std::string::npos || 
                           lower_format.find(".mov") != std::string::npos);
+
+
     bool is_rtsp = (rtsp_url.find("rtsp://") == 0);
+
     bool is_raw_sequence = (lower_format.find(".raw") != std::string::npos || lower_format.find("%") != std::string::npos);
 
     std::unique_ptr<VideoReader> videoReader = nullptr;
@@ -1111,9 +1118,10 @@ int main(int argc, char** argv) {
             }
         }
 
+
         auto t1 = std::chrono::steady_clock::now();
         sdk.SetInputMemory(file_buffer.data(), W, H, 3);
-        
+
         is_fall_in_current_frame = false; // Reset for custom logic
         sdk.ProcessNextFrame();
 
@@ -1127,7 +1135,7 @@ int main(int argc, char** argv) {
         // Accumulate Average Time
         total_process_time_ms += ms;
         frame_count_time++;
-        
+
 
         // 1. Get Objects (Deep Copy)
         // std::vector<MotionObject> objects = sdk.GetMotionObjects();

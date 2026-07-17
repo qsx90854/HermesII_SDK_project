@@ -14,7 +14,7 @@ SDK_LIBRARY = $(SDK_INCLUDE)/linux/va12c/lib
 
 # 通用編譯參數 (+ -fPIC for shared library)
 CXXFLAGS = -Wall -O3 -fPIC -DNDEBUG
-CXXFLAGS += -Iinclude -Isrc 
+CXXFLAGS += -Iinclude -Isrc
 CXXFLAGS += -I$(SDK_INCLUDE)/include -I$(SDK_INCLUDE)/drv_include
 
 # 如果使用 g++ (Host) 編譯，可能需要移除 ARM 特定參數以避免錯誤
@@ -22,6 +22,9 @@ CXXFLAGS += -I$(SDK_INCLUDE)/include -I$(SDK_INCLUDE)/drv_include
 CXXFLAGS += $(TARGET_ARCH)
 CXXFLAGS += -ffunction-sections -fno-aggressive-loop-optimizations
 CXXFLAGS += -DDISABLE_NPU
+
+# DEBUG: AddressSanitizer (找記憶體/堆疊寫壞用，除錯完記得移除)
+CXXFLAGS += -fsanitize=address -fno-omit-frame-pointer -g
 
 # NPU Libraries
 # LDFLAGS_NPU += -Wl,--start-group
@@ -45,7 +48,8 @@ SDK_SRCS = src/HermesII_sdk.cpp \
            src/ai/blaze_face_detect_parser.cpp \
            src/fusion/image_fusion.cpp \
            src/fall/fall_detector.cpp \
-           src/image_process/image_process.cpp
+           src/image_process/image_process.cpp \
+           src/event_recorder.cpp
 
 SDK_OBJS = $(SDK_SRCS:.cpp=.o)
 
@@ -74,10 +78,11 @@ RTSP_DEMO_TARGET = rtsp_demo_pc
 FALL_ACCURACY_TEST_TARGET = fall_accuracy_test_pc
 
 MAP_POINT_V2_EXAMPLE_TARGET = MapPointV2_example_pc
+SDK_GRAY_TEST_PC_TARGET = sdk_gray_test_pc
 
 # 預設規則
 # 預設規則
-all: $(LIB_TARGET) $(FALL_DEMO_TARGET) $(FALL_CALLBACK_TARGET) $(SDK_DEMO_CODE_V1_TARGET) $(SDK_DEMO_CODE_V2_TARGET) $(SDK_DEMO_CODE_V2_SAVE_FALL_RESULT_TARGET) $(SDK_DEMO_TEST_ACCURACY_TARGET) $(STREAMING_DEMO_TARGET) $(RTSP_DEMO_TARGET) $(FALL_ACCURACY_TEST_TARGET) $(SDK_DEMO_BG_TEST_TARGET) $(MAP_POINT_V2_EXAMPLE_TARGET)
+all: $(LIB_TARGET) $(FALL_DEMO_TARGET) $(FALL_CALLBACK_TARGET) $(SDK_DEMO_CODE_V1_TARGET) $(SDK_DEMO_CODE_V2_TARGET) $(SDK_DEMO_CODE_V2_SAVE_FALL_RESULT_TARGET) $(SDK_DEMO_TEST_ACCURACY_TARGET) $(STREAMING_DEMO_TARGET) $(RTSP_DEMO_TARGET) $(FALL_ACCURACY_TEST_TARGET) $(SDK_DEMO_BG_TEST_TARGET) $(MAP_POINT_V2_EXAMPLE_TARGET) $(SDK_GRAY_TEST_PC_TARGET)
 
 # 建立 build 目錄
 $(BUILD_DIR):
@@ -85,7 +90,7 @@ $(BUILD_DIR):
 
 # 編譯共用函式庫 (.so)
 $(LIB_TARGET): $(SDK_OBJS) | $(BUILD_DIR)
-	$(CXX) -shared -o $@ $(SDK_OBJS) $(LDFLAGS_NPU)
+	$(CXX) -shared -fsanitize=address -o $@ $(SDK_OBJS) $(LDFLAGS_NPU) -lpthread
 
 # 編譯 Fall Demo
 $(FALL_DEMO_TARGET): examples/fall_demo.cpp $(LIB_TARGET)
@@ -139,6 +144,8 @@ $(FALL_ACCURACY_TEST_TARGET): examples/fall_callback_demo_test_accuracy.cpp $(LI
 $(MAP_POINT_V2_EXAMPLE_TARGET): examples/MapPointV2_example.cpp $(LIB_TARGET)
 	$(CXX) $(CXXFLAGS) -o $@ $< -L$(BUILD_DIR) -lHermesII_sdk -Wl,-rpath,'$$ORIGIN/$(BUILD_DIR)'
 
+$(SDK_GRAY_TEST_PC_TARGET): examples/sdk_gray_test.cpp $(LIB_TARGET)
+	$(CXX) $(CXXFLAGS) -o $@ $< -L$(BUILD_DIR) -lHermesII_sdk -Wl,-rpath,'$$ORIGIN/$(BUILD_DIR)' -lpthread
 
 # 編譯 .o 檔
 %.o: %.cpp
@@ -146,5 +153,5 @@ $(MAP_POINT_V2_EXAMPLE_TARGET): examples/MapPointV2_example.cpp $(LIB_TARGET)
 
 # 清除規則
 clean:
-	rm -f $(SDK_OBJS) $(FALL_DEMO_TARGET) $(FALL_CALLBACK_TARGET) $(SDK_DEMO_CODE_V1_TARGET) $(SDK_DEMO_CODE_V2_TARGET) $(SDK_DEMO_TEST_ACCURACY_TARGET) $(STREAMING_DEMO_TARGET) $(RTSP_DEMO_TARGET) $(FALL_ACCURACY_TEST_TARGET) $(SDK_DEMO_BG_TEST_TARGET) $(SDK_DEMO_CODE_V2_SAVE_FALL_RESULT_TARGET) $(MAP_POINT_V2_EXAMPLE_TARGET)
+	rm -f $(SDK_OBJS) $(FALL_DEMO_TARGET) $(FALL_CALLBACK_TARGET) $(SDK_DEMO_CODE_V1_TARGET) $(SDK_DEMO_CODE_V2_TARGET) $(SDK_DEMO_TEST_ACCURACY_TARGET) $(STREAMING_DEMO_TARGET) $(RTSP_DEMO_TARGET) $(FALL_ACCURACY_TEST_TARGET) $(SDK_DEMO_BG_TEST_TARGET) $(SDK_DEMO_CODE_V2_SAVE_FALL_RESULT_TARGET) $(MAP_POINT_V2_EXAMPLE_TARGET) $(SDK_GRAY_TEST_PC_TARGET)
 	rm -rf $(BUILD_DIR)

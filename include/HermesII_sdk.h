@@ -19,7 +19,8 @@ enum class ConfigType {
     FallDetection_v2,
     FallDetection_v3,
     BedExitDetection_v1,
-    ImageRelated_v1
+    ImageRelated_v1,
+    EventRecording_v1
 };
 
 struct ConfigHeader {
@@ -142,6 +143,18 @@ struct ImageRelated_v1 {
     bool enable_draw_bg_noise = false; 
     bool enable_save_images = false;
     std::string save_image_path = ""; 
+};
+
+// Event-triggered raw frame recording (mmap ring buffer on SD card).
+// When enabled, every frame fed via SetInputMemory/ProcessNextFrame is spooled
+// to an on-disk ring; on a fall / bed-exit event the SDK saves
+// [event - pre_frames, event + post_frames] as a standalone .raw file, plus a
+// background snapshot, a .meta.json and an append-only event_record.jsonl log.
+struct EventRecording_v1 {
+    ConfigHeader header;
+    bool enable = false;
+    int pre_frames = 300;    // frames kept before the event
+    int post_frames = 300;   // frames recorded after the event
 };
 
 struct Image {

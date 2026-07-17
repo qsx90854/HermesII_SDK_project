@@ -47,6 +47,7 @@ using namespace std;
 #include <arm_neon.h>
 #endif
 
+#define STB_IMAGE_WRITE_STATIC
 #define STB_IMAGE_WRITE_IMPLEMENTATION
 #include "../../include/stb_image_write.h"
 
@@ -566,6 +567,9 @@ std::vector<::VisionSDK::ObjectFeatures> find_objects_optimized(const uint8_t* m
             
             // 預先分配足夠的記憶體給像素，避免 vector 在 push_back 時不斷 reallocate
             obj.pixels.reserve(blob.count); 
+            obj.pixel_dx.resize(blob.count, 0.0f);
+            obj.pixel_dy.resize(blob.count, 0.0f);
+            obj.pixel_dir.resize(blob.count, 0.0f);
             
             // 建立查表，讓收集像素時可以 $O(1)$ 找到該塞進哪個 result
             for (int r : blob.root_labels) {
@@ -3685,13 +3689,17 @@ void TrackObjects(std::vector<MotionObject>& current, const std::vector<MotionOb
                 expired_ids.push_back(id);
                 
                 // Also remove from the 'current' object list so we don't return duplicates
-                auto it = std::remove_if(current.begin(), current.end(), 
-                                         [id](const MotionObject& obj){ return obj.id == id; });
-                if (it != current.end()) {
-                    current.erase(it, current.end());
-                    // Since 'current' size changed, we should theoretically adjust loops, 
-                    // but we are at the end of the loop over 'current' anyway (controlled by 'cols').
-                    // actually 'cols' is just current.size(), so we are fine.
+                for (size_t k = 0; k < current.size(); ) {
+                    if (current[k].id == id) {
+                        current.erase(current.begin() + k);
+                        if (k < currentMatched.size()) {
+                            currentMatched.erase(currentMatched.begin() + k);
+                        }
+                        // Update cols dynamically to keep in sync with current.size()
+                        cols = current.size();
+                    } else {
+                        k++;
+                    }
                 }
             }
         }
@@ -4232,13 +4240,48 @@ StatusCode FallDetector::Detect(const Image& frame, bool& is_fall)
 
         int crop_x = std::max(0, crop_min_x);
         int crop_y = std::max(0, crop_min_y);
+        
+        // --- UPPER BOUND PROTECTION ---
+        if (crop_x >= (int)frame.width) {
+           // std::cout << "[FallDetector::Detect] Warning: crop_x (" << crop_x 
+            //          << ") exceeds frame width (" << frame.width << "). Clamping to 0." << std::endl;
+            crop_x = 0;
+        }
+        if (crop_y >= (int)frame.height) {
+            //std::cout << "[FallDetector::Detect] Warning: crop_y (" << crop_y 
+            //          << ") exceeds frame height (" << frame.height << "). Clamping to 0." << std::endl;
+            crop_y = 0;
+        }
+
+        // --- 16-BYTE ALIGNMENT FOR HARDWARE ACCELERATOR ---
+        crop_x = (crop_x / 16) * 16;
+        crop_y = (crop_y / 16) * 16;
+
         int crop_w = s;
         int crop_h = s;
         if (crop_x + crop_w > (int)frame.width) {
+            int old_w = crop_w;
             crop_w = (int)frame.width - crop_x;
+            crop_w = (crop_w / 16) * 16;
+            //std::cout << "[FallDetector::Detect] Warning: Crop width out of bounds! Adjusted from " << old_w 
+            //          << " to aligned width " << crop_w << " (crop_x: " << crop_x << ", frame_w: " << frame.width << ")" << std::endl;
         }
         if (crop_y + crop_h > (int)frame.height) {
+            int old_h = crop_h;
             crop_h = (int)frame.height - crop_y;
+            crop_h = (crop_h / 16) * 16;
+            //std::cout << "[FallDetector::Detect] Warning: Crop height out of bounds! Adjusted from " << old_h 
+            //          << " to aligned height " << crop_h << " (crop_y: " << crop_y << ", frame_h: " << frame.height << ")" << std::endl;
+        }
+
+        // Fallback protection if calculation drops to zero
+        if (crop_w <= 0 || crop_h <= 0) {
+            //std::cout << "[FallDetector::Detect] Warning: Invalid aligned crop size (crop_w: " << crop_w 
+            //          << ", crop_h: " << crop_h << "). Triggering fallback protect." << std::endl;
+            crop_w = 128;
+            crop_h = 128;
+            crop_x = 0;
+            crop_y = 0;
         }
 
         
@@ -5083,10 +5126,17 @@ StatusCode FallDetector::Detect(const Image& frame, bool& is_fall)
                                 std::abs((int)currData[idx+1] - (int)bgData[idx+1]) +
                                 std::abs((int)currData[idx+2] - (int)bgData[idx+2])) / 3;
                     } else {
-                        // Fallback to simple grayscale conversion for both
-                        int idx = (y * W + x) * 3;
-                        int bgVal = (bgData[idx] + bgData[idx+1]*2 + bgData[idx+2]) / 4;
-                        int grayVal = (currData[idx] + currData[idx+1]*2 + currData[idx+2]) / 4;
+                        // backgroundFrame is always stored as 1-channel (see SetBackground),
+                        // so bgData must be indexed as grayscale regardless of frame.channels.
+                        int bgIdx = (y * W + x);
+                        int bgVal = bgData[bgIdx];
+                        int grayVal;
+                        if (frame.channels == 3) {
+                            int idx = bgIdx * 3;
+                            grayVal = (currData[idx] * 77 + currData[idx+1] * 150 + currData[idx+2] * 29) >> 8;
+                        } else {
+                            grayVal = currData[bgIdx];
+                        }
                         diff = std::abs(grayVal - bgVal);
                     }
 
@@ -5572,7 +5622,13 @@ StatusCode FallDetector::Detect(const Image& frame, bool& is_fall)
                     hist_dy.push_back(h_obj.avgDy);
                     hist_dx.push_back(h_obj.avgDx);
                     hist_str.push_back(h_obj.strength);
-                    hist_fg.push_back(pImpl->fg_count_history_buffer[i]); // Revert to global FG count
+                    int offset = (h_size - 1) - i;
+                    int target_idx = (int)pImpl->global_pixel_history.size() - 1 - offset;
+                    if (target_idx >= 0 && target_idx < (int)pImpl->global_pixel_history.size()) {
+                        hist_fg.push_back(pImpl->global_pixel_history[target_idx]);
+                    } else {
+                        hist_fg.push_back(0);
+                    }
                     found = true;
                     break;
                 }
@@ -7152,6 +7208,35 @@ StatusCode FallDetector::Detect(const Image& frame, bool& is_fall)
         
         //if (ENABLE_DEBUG_PRINT) std::cout << "[FallDetector] " << warning << std::endl;
     }
+    
+    // 8. Background Update (Selective)
+    // Runs here to use the latest pImpl->current_objects found in this frame
+    if (pImpl->config.bg_update_interval_frames > 0) {
+        
+        // isInitPhase: Only applies when background is NOT externally set.
+        // If background_initialized_externally=true (e.g. edge board loads a BG image),
+        // there is no accumulation init phase, so always use Periodic Update counting.
+        bool isInitPhase = (!pImpl->background_initialized_externally) &&
+                           (pImpl->frame_idx >= pImpl->config.bg_init_start_frame &&
+                            pImpl->frame_idx <= pImpl->config.bg_init_end_frame);
+        
+        // Logic:
+        // 1. If Init Phase -> Always Run (Accumulation)
+        // 2. If Periodic Phase -> Run every N frames
+        
+        pImpl->bg_update_counter++;
+
+        if (isInitPhase || (pImpl->bg_update_counter >= pImpl->config.bg_update_interval_frames)) 
+        {
+             TimerGuard t_bg(g_perf_timer, "5_BackgroundUpdate");
+             // DEBUG_PRINT("[Debug] Calling updateBackground (end-of-frame)...\n");
+             
+             // Pass CURRENT objects for selective update
+             pImpl->updateBackground(wrapper, pImpl->config, pImpl->frame_idx, pImpl->current_objects);
+             
+             if (!isInitPhase) pImpl->bg_update_counter = 0;
+        }
+    }
     }
 
     // 7. Invoke Callback
@@ -7208,35 +7293,7 @@ StatusCode FallDetector::Detect(const Image& frame, bool& is_fall)
 
     // DEBUG_PRINT("[Debug] FallDetector::Detect End Frame %lld\n", pImpl->absolute_frame_count);
 
-    // 8. Background Update (Selective)
-    // Runs here to use the latest pImpl->current_objects found in this frame
-    if (pImpl->config.enable_fall_and_bed_exit && pImpl->config.bg_update_interval_frames > 0) {
-        
-        // isInitPhase: Only applies when background is NOT externally set.
-        // If background_initialized_externally=true (e.g. edge board loads a BG image),
-        // there is no accumulation init phase, so always use Periodic Update counting.
-        bool isInitPhase = (!pImpl->background_initialized_externally) &&
-                           (pImpl->frame_idx >= pImpl->config.bg_init_start_frame &&
-                            pImpl->frame_idx <= pImpl->config.bg_init_end_frame);
-        
-        // Logic:
-        // 1. If Init Phase -> Always Run (Accumulation)
-        // 2. If Periodic Phase -> Run every N frames
-        
-        pImpl->bg_update_counter++;
 
-        if (isInitPhase || (pImpl->bg_update_counter >= pImpl->config.bg_update_interval_frames)) 
-        {
-             TimerGuard t_bg(g_perf_timer, "5_BackgroundUpdate");
-             // DEBUG_PRINT("[Debug] Calling updateBackground (end-of-frame)...\n");
-             
-             // Pass CURRENT objects for selective update
-             pImpl->updateBackground(wrapper, pImpl->config, pImpl->frame_idx, pImpl->current_objects);
-             
-             
-             if (!isInitPhase) pImpl->bg_update_counter = 0;
-        }
-    }
 
 
     // End of Frame
