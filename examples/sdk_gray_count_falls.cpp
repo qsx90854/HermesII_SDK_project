@@ -15,6 +15,13 @@
 //               default here is 1, i.e. every frame, since a bare .gray file
 //               has no known original frame rate).
 //
+// Output: alongside the printed summary, writes <input>.events.json -- one
+// pretty-printed JSON document listing every fall/bed-exit detection, each
+// with the frame index and the bounding region (grid coords) of every
+// currently-tracked object at that moment. Load it together with the .gray
+// file in view_gray_events.py to eyeball whether the detection (and the
+// region that triggered it) is sane.
+//
 // Config file: sdk_gray_count_falls.ini (own file, NOT the shared
 // parameter.ini used by other examples -- keeps this tool's settings
 // independent). Same [Motion]/[Object]/[FallDetect]/[Validation] sections as
@@ -25,6 +32,7 @@
 
 #include "HermesII_sdk.h"
 #include <algorithm>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -72,6 +80,7 @@ public:
         }
         return true;
     }
+    const std::map<std::string, std::string>& all() const { return settings; }
     std::string getStr(const std::string& key, const std::string& def) {
         auto it = settings.find(key);
         return it != settings.end() ? it->second : def;
@@ -91,6 +100,106 @@ struct DetectedEvent {
     std::string type;
     float confidence;
 };
+
+// Bounding box (grid units) of a tracked MotionObject's blocks, for
+// recording "which region triggered this event" alongside the frame index.
+struct ObjBBox {
+    int id;
+    int min_col, min_row, max_col, max_row;
+    float cx, cy;
+    float strength;
+    int pixels;
+};
+
+bool ComputeBBox(const VisionSDK::MotionObject& obj, int grid_cols, ObjBBox& out) {
+    if (obj.blocks.empty()) return false;
+    int min_c = INT32_MAX, max_c = -1, min_r = INT32_MAX, max_r = -1;
+    for (int b : obj.blocks) {
+        int r = b / grid_cols, c = b % grid_cols;
+        if (c < min_c) min_c = c;
+        if (c > max_c) max_c = c;
+        if (r < min_r) min_r = r;
+        if (r > max_r) max_r = r;
+    }
+    out.id = obj.id;
+    out.min_col = min_c; out.max_col = max_c;
+    out.min_row = min_r; out.max_row = max_r;
+    out.cx = obj.centerX; out.cy = obj.centerY;
+    return true;
+}
+
+// Max tracked objects recorded per event (fixed-size array, see
+// DetectedEventFull below -- deliberately NOT a std::vector, for the same
+// reason DetectedEventFull avoids std::string; see its comment).
+static const int kMaxObjectsPerEvent = 8;
+
+// Plain-old-data snapshot of one fall/bed-exit detection, used ONLY to carry
+// data from the callback into RewriteEventsFile(). Deliberately contains NO
+// std::string and NO pre-formatted text: on this board's ARM/uClibc
+// toolchain, std::string append/concatenation (std::string::append(),
+// operator+=) was found to reproducibly corrupt -- every single JSON object
+// previously written via an AppendF()+std::string pipeline came out with an
+// identical, constant-size (389 byte) block of binary garbage prepended to
+// it, 245 times in one real board-generated file, including before the very
+// first byte ever written to a freshly-truncated file. That rules out
+// ordinary occasional stack corruption; it's systematic and tied to the
+// std::string mutation itself. Storing plain ints/floats/fixed char arrays
+// here and writing them out via fprintf() (see RewriteEventsFile) sidesteps
+// the failure mode entirely, since no std::string is ever touched in the
+// write path.
+struct DetectedEventFull {
+    int frame_index;
+    char type[16];   // "fall" or "bed_exit"
+    float confidence;
+    int obj_count;
+    ObjBBox objs[kMaxObjectsPerEvent];
+};
+
+// Rewrites <path> as ONE pretty, multi-line, indented JSON object (matching
+// the style of src/event_recorder.cpp's evt_*.meta.json) containing every
+// event collected so far. Called again after every new event, so the file on
+// disk is always a COMPLETE, valid JSON document as of the last successful
+// call -- never a half-written array missing its closing bracket. Written to
+// a .tmp file and renamed into place (same discipline as event_recorder.cpp):
+// if the process dies mid-rewrite, the previous complete version stays on
+// disk untouched instead of a corrupted new one.
+//
+// Every field is written directly via fprintf(), with NO std::string used to
+// accumulate the JSON content -- see the DetectedEventFull comment for why.
+void RewriteEventsFile(const std::string& path, const std::string& gray_path,
+                       int width, int height, int channels, int grid_cols, int grid_rows,
+                       const std::vector<std::pair<int, int>>& bed_points,
+                       const std::vector<DetectedEventFull>& event_blocks) {
+    std::string tmp_path = path + ".tmp";
+    FILE* f = fopen(tmp_path.c_str(), "w");
+    if (!f) return;
+
+    fprintf(f, "{\n  \"gray_file\": \"%s\",\n  \"width\": %d,\n  \"height\": %d,\n"
+               "  \"channels\": %d,\n  \"grid_cols\": %d,\n  \"grid_rows\": %d,\n  \"bed_points\": [",
+            gray_path.c_str(), width, height, channels, grid_cols, grid_rows);
+    for (size_t i = 0; i < bed_points.size(); ++i) {
+        fprintf(f, "%s[%d, %d]", i ? ", " : "", bed_points[i].first, bed_points[i].second);
+    }
+    fprintf(f, "],\n  \"events\": [");
+    for (size_t i = 0; i < event_blocks.size(); ++i) {
+        const DetectedEventFull& ev = event_blocks[i];
+        fprintf(f, "%s    {\n      \"frame_index\": %d,\n      \"type\": \"%s\",\n"
+                   "      \"confidence\": %.4f,\n      \"objects\": [\n",
+                i ? ",\n" : "\n", ev.frame_index, ev.type, (double)ev.confidence);
+        for (int j = 0; j < ev.obj_count; ++j) {
+            const ObjBBox& bb = ev.objs[j];
+            fprintf(f, "        {\"id\": %d, \"min_col\": %d, \"min_row\": %d, \"max_col\": %d, \"max_row\": %d, "
+                       "\"cx\": %.2f, \"cy\": %.2f, \"strength\": %.2f, \"pixels\": %d}%s\n",
+                    bb.id, bb.min_col, bb.min_row, bb.max_col, bb.max_row, bb.cx, bb.cy,
+                    bb.strength, bb.pixels, (j + 1 < ev.obj_count) ? "," : "");
+        }
+        fprintf(f, "      ]\n    }");
+    }
+    fprintf(f, event_blocks.empty() ? "]\n}\n" : "\n  ]\n}\n");
+
+    fclose(f);
+    rename(tmp_path.c_str(), path.c_str());
+}
 
 // "x1,y1,x2,y2,x3,y3,x4,y4" -> 4 points, in SDK-resolution pixel coords
 // (same format as --bed and the [Bed] Points= ini key).
@@ -130,6 +239,16 @@ int main(int argc, char** argv) {
         else std::cerr << "Warning: unknown argument \"" << a << "\", ignored.\n";
     }
 
+    // Earliest possible checkpoint: right after the argv-parsing loop, before
+    // fopen/banner/cfg.load() run at all. If bed_arg is already garbage HERE,
+    // the corruption happens during/immediately after argv parsing (or
+    // earlier, e.g. pre-main() static init). If it's clean here but garbled
+    // later, something between this point and the later checkpoint did it.
+    // Print length-bounded (not %s / c_str(), which scans for a NUL that a
+    // corrupted string might not have within mapped memory -- that could
+    // crash the diagnostic itself instead of reporting the corruption).
+    std::cerr << "[argv-done] bed_arg = \"" << bed_arg << "\" (" << bed_arg.size() << " bytes)\n";
+
     FILE* fp = fopen(gray_path.c_str(), "rb");
     if (!fp) {
         std::cerr << "Error: cannot open " << gray_path << std::endl;
@@ -151,16 +270,35 @@ int main(int argc, char** argv) {
         std::cerr << "Warning: cannot open " << ini_path << ", using SDK defaults.\n";
     }
 
+    // --- Diagnostic dump: every key/value SimpleConfig parsed from the ini,
+    // printed BEFORE sdk.Init()/SetConfig() run at all. Lets us directly
+    // compare "did bed_arg/bed_str specifically get corrupted, or is the ini
+    // parse itself unreliable here too". ---
+    std::cout << "[pre-Init] cfg.all() (" << cfg.all().size() << " keys parsed from " << ini_path << "):\n";
+    for (const auto& kv : cfg.all()) {
+        std::cout << "[pre-Init]   " << kv.first << " = \"" << kv.second << "\" (" << kv.second.size() << " bytes)\n";
+    }
+
     // --- Bed region: read + parse BEFORE sdk.Init()/SetConfig() run at all. ---
     // Diagnostic checkpoint: this proves whether the parsed value is already
     // wrong right after loading (a parsing bug) or only becomes garbled later
     // once the SDK/NPU init path has run (memory corruption from that path).
-    // --bed on the command line takes priority; otherwise [Bed] Points= in the ini.
-    std::string bed_source = "--bed";
-    std::string bed_str = bed_arg;
+    //
+    // TEMP WORKAROUND (remove once bed_arg corruption root cause is fixed):
+    // bed_arg (populated from --bed on the command line) has been observed
+    // garbled on the edge board even though it's never assigned in this run
+    // (no --bed passed) -- see the [argv-done]/[pre-Init] diagnostics above.
+    // The ini's Bed.Points, by contrast, has consistently read back correct
+    // (heap-backed via SimpleConfig's std::map, unaffected by whatever is
+    // corrupting this stack-local std::string). Until root-caused, prefer the
+    // ini value FIRST so bed region actually gets applied; only fall back to
+    // --bed if the ini has no [Bed] Points at all. Once bed_arg is proven
+    // reliable again, swap this back to "--bed takes priority".
+    std::string bed_source = ini_path + " [Bed] Points";
+    std::string bed_str = cfg.getStr("Bed.Points", "");
     if (bed_str.empty()) {
-        bed_str = cfg.getStr("Bed.Points", "");
-        bed_source = ini_path + " [Bed] Points";
+        bed_str = bed_arg;
+        bed_source = "--bed";
     }
     std::vector<std::pair<int, int>> bed_pts;
     if (!bed_str.empty()) {
@@ -284,17 +422,67 @@ int main(int argc, char** argv) {
         std::cout << "No bed region set (use --bed=... or [Bed] Points= in " << ini_path << ").\n";
     }
 
+    // --- Per-event JSON log: frame index + triggering object region(s), for
+    // the companion Python viewer (view_gray_events.py) to overlay on the
+    // .gray frames and let you eyeball whether the detection is sane. Written
+    // as one pretty-printed, multi-line JSON document (same style as
+    // src/event_recorder.cpp's evt_*.meta.json). The whole file is rewritten
+    // (tmp + rename) after every event, so it's always complete/valid on disk
+    // as of the last successful write, even if the process later crashes. ---
+    std::string events_json_path = gray_path;
+    if (events_json_path.size() >= 5 && events_json_path.compare(events_json_path.size() - 5, 5, ".gray") == 0) {
+        events_json_path.erase(events_json_path.size() - 5);
+    }
+    events_json_path += ".events.json";
+    std::vector<DetectedEventFull> event_blocks;
+    std::cout << "Events JSON: " << events_json_path << "\n";
+
     std::vector<DetectedEvent> events;
     sdk.RegisterVisionSDKCallback([&](const VisionSDKEvent& e) {
+        if (!e.is_fall_detected && !e.is_bed_exit) return;
+
+        // Snapshot the currently-tracked objects' regions right now, while
+        // this frame's motion state is still current (callback runs
+        // synchronously inside ProcessNextFrame()).
+        std::vector<VisionSDK::MotionObject> objects;
+        sdk.GetMotionObjects(objects);
+
+        // Cap the number of objects recorded per event; store as a plain
+        // fixed-size ObjBBox array (see DetectedEventFull), not JSON text.
+        ObjBBox bboxes[kMaxObjectsPerEvent];
+        int obj_count = 0;
+        for (const auto& obj : objects) {
+            if (obj_count >= kMaxObjectsPerEvent) break;
+            ObjBBox bb;
+            if (!ComputeBBox(obj, motionCfg.grid_cols, bb)) continue;
+            bb.strength = obj.strength;
+            bb.pixels = obj.pixel_count;
+            bboxes[obj_count++] = bb;
+        }
+
+        auto write_event = [&](const char* type) {
+            DetectedEventFull ev{};
+            ev.frame_index = e.frame_index;
+            snprintf(ev.type, sizeof(ev.type), "%s", type);
+            ev.confidence = e.confidence;
+            ev.obj_count = obj_count;
+            for (int j = 0; j < obj_count; ++j) ev.objs[j] = bboxes[j];
+            event_blocks.push_back(ev);
+            RewriteEventsFile(events_json_path, gray_path, width, height, channels,
+                              motionCfg.grid_cols, motionCfg.grid_rows, bed_pts, event_blocks);
+        };
+
         if (e.is_fall_detected) {
             events.push_back({e.frame_index, "Fall", e.confidence});
             std::cout << "[Callback] Fall detected at frame " << e.frame_index
-                      << " (confidence " << e.confidence << ")\n";
+                      << " (confidence " << e.confidence << ", " << obj_count << " object(s))\n";
+            write_event("fall");
         }
         if (e.is_bed_exit) {
             events.push_back({e.frame_index, "BedExit", e.confidence});
             std::cout << "[Callback] BedExit detected at frame " << e.frame_index
-                      << " (confidence " << e.confidence << ")\n";
+                      << " (confidence " << e.confidence << ", " << obj_count << " object(s))\n";
+            write_event("bed_exit");
         }
     });
 

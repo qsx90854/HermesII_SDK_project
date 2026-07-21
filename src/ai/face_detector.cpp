@@ -292,20 +292,27 @@ public:
     }
 
     void cleanup() {
-        if (task_handle) TY_NPU_ReleaseTask(task_handle);
-        if (model_handle) TY_NPU_ReleaseModel(model_handle);
-        
+        // Idempotent: this runs once from FaceDetector::Release() and again
+        // from ~Impl() when the object is destroyed. Every resource must be
+        // nulled out after release, otherwise the second call double-frees
+        // (frees task_inputs/task_outputs again, and reads their already-freed
+        // heap memory for the free_mmz_memory loops -> heap corruption/abort).
+        if (task_handle) { TY_NPU_ReleaseTask(task_handle); task_handle = NULL; }
+        if (model_handle) { TY_NPU_ReleaseModel(model_handle); model_handle = NULL; }
+
         if (task_inputs) {
             for (int i=0; i<model_desc.ioDesc.inputNum; i++) free_mmz_memory(&task_inputs[i].dataIn);
             free(task_inputs);
+            task_inputs = NULL;
         }
         if (task_outputs) {
              for (int i=0; i<model_desc.ioDesc.outputNum; i++) free_mmz_memory(&task_outputs[i].dataOut);
              free(task_outputs);
+             task_outputs = NULL;
         }
         for (int i=0; i<model_mem.segNum; i++) free_mmz_memory(&model_mem.memInfo[i].mem);
         for (int i=0; i<task_mem.segNum; i++) free_mmz_memory(&task_mem.memInfo[i].mem);
-        
+
         initialized = false;
     }
 
