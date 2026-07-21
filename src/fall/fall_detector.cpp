@@ -3289,6 +3289,17 @@ void TrackObjects(std::vector<MotionObject>& current, const std::vector<MotionOb
     int grid_cols = config.grid_cols;
     int grid_rows = config.grid_rows;
 
+    // Coordinates in this function are in GRID BLOCK units (whole grid is only
+    // ~10x6 .. 50x28 blocks), NOT pixels. Gates must therefore be block-scale:
+    // a track that cannot find an object within kMaxMatchDistBlocks must go to
+    // coasting/TTL instead of grabbing a blob on the other side of the frame,
+    // and two tracks only count as duplicates when they practically coincide.
+    // (Previously these were 50/100 "pixel-scale" values, which never rejected
+    // anything on a grid: the oldest ID hopped between distinct objects and
+    // the newer ID got killed as a "duplicate" every frame.)
+    const float kMaxMatchDistBlocks = 3.0f;   // same scale as Mode 1's dist<3.0
+    const float kDuplicateDistBlocks = 1.5f;
+
     // Helper lambda to detect edge entry
     auto detectEdgeEntry = [&](const MotionObject& obj, int new_id) {
         // Calculate bounding box from blocks
@@ -3507,8 +3518,8 @@ void TrackObjects(std::vector<MotionObject>& current, const std::vector<MotionOb
                 //DEBUG_PRINT("[TrackDebug] Cost T%d -> Obj%d (%.1f, %.1f) vs (%.1f, %.1f) = Dist %.2f\n", 
                 //        trackIDs[i], j, tx, ty, current[j].centerX, current[j].centerY, cost);
                 
-                // Gating
-                if (cost > 100.0f) cost = 99999.0f;
+                // Gating (block units)
+                if (cost > kMaxMatchDistBlocks) cost = 99999.0f;
                 costMatrix[i][j] = cost;
             }
         }
@@ -3527,7 +3538,7 @@ void TrackObjects(std::vector<MotionObject>& current, const std::vector<MotionOb
                          bestJ = j;
                      }
                  }
-                 if(bestJ != -1 && minC < 50.0f) {
+                 if(bestJ != -1 && minC <= kMaxMatchDistBlocks) {
                      assignment[i] = bestJ;
                      colUsed[bestJ] = true;
                  }
@@ -3549,7 +3560,7 @@ void TrackObjects(std::vector<MotionObject>& current, const std::vector<MotionOb
             
             if (j >= 0 && j < cols) {
                 //DEBUG_PRINT("[TrackDebug] Assignment T%d -> Obj%d. Cost %.2f\n", trackID, j, costMatrix[i][j]);
-                if (costMatrix[i][j] <= 50.0f) {
+                if (costMatrix[i][j] <= kMaxMatchDistBlocks) {
                     matched = true;
                     currentMatched[j] = true;
                     
@@ -3656,7 +3667,7 @@ void TrackObjects(std::vector<MotionObject>& current, const std::vector<MotionOb
                         float dy = cy - ky;
                         float dist = std::sqrt(dx*dx + dy*dy);
                         
-                        if (dist < 50.0f) {
+                        if (dist < kDuplicateDistBlocks) {
                              // COLLISION DETECTED
                              // Scenario: Assigned 1011, but 1010 is also right here.
                              // Prefer Older ID (Smaller)
@@ -6526,8 +6537,9 @@ StatusCode FallDetector::Detect(const Image& frame, bool& is_fall)
                                     }
                                 }
                                 if (cx == -1) {
-                                    cx = (int)(curr.centerX * (frame.width / pImpl->config.grid_cols)); 
-                                    cy = (int)(curr.centerY * (frame.height / pImpl->config.grid_rows));
+                                    // Float division: integer W/cols drifts when cols doesn't divide W
+                                    cx = (int)(curr.centerX * ((float)frame.width / pImpl->config.grid_cols));
+                                    cy = (int)(curr.centerY * ((float)frame.height / pImpl->config.grid_rows));
                                 }
                                 if (cx >= 0 && cx < pImpl->bedMask.width() && cy >= 0 && cy < pImpl->bedMask.height()) {
                                     if (pImpl->bedMask.getData()[cy * pImpl->bedMask.width() + cx] == 0) {
@@ -6828,13 +6840,18 @@ StatusCode FallDetector::Detect(const Image& frame, bool& is_fall)
                     // We use Current Center/Bottom.
                     bool in_bed = false;
                     if (pImpl->hasBedMask) {
+                        // Grid -> pixel must use W/cols (the grid spans the
+                        // whole frame); block_size is the ME block in its own
+                        // downscaled space and lands in the top-left corner.
+                        float blockW_px = (float)W / pImpl->config.grid_cols;
+                        float blockH_px = (float)H / pImpl->config.grid_rows;
                         // Check Bottom Point
-                        int cx = (int)(curr.centerX * pImpl->config.block_size);
+                        int cx = (int)(curr.centerX * blockW_px);
                         // Use max row for bottom
                         int max_r = 0;
                         for(int b : curr.blocks) { int r = b / pImpl->config.grid_cols; if(r>max_r) max_r=r; }
-                        int Cy = (max_r + 1) * pImpl->config.block_size;
-                        
+                        int Cy = (int)((max_r + 1) * blockH_px) - 1; // bottom edge, kept inside frame
+
                         if (cx>=0 && cx<W && Cy>=0 && Cy<H) {
                              // Mask: 0 = Inside Bed
                              if (pImpl->bedMask.getData()[Cy*W + cx] == 0) in_bed = true;
@@ -7247,10 +7264,17 @@ StatusCode FallDetector::Detect(const Image& frame, bool& is_fall)
         event.frame_index = pImpl->frame_idx; // Use frame_idx
         event.is_fall_detected = is_fall;
         
-        // Aggregate Bed Exit Status
+        // Aggregate Bed Exit Status over objects PRESENT in this frame only.
+        // The status map keeps entries until GC/TTL removes the ID; iterating
+        // the whole map kept reporting is_bed_exit=true for objects that had
+        // already left the scene (ghost alarms for up to tracking_ttl frames).
         bool any_bed_exit = false;
-        for(auto const& kv : pImpl->object_bed_exit_status) {
-            if(kv.second) { any_bed_exit = true; break; }
+        for (const auto& obj : pImpl->current_objects) {
+            auto it = pImpl->object_bed_exit_status.find(obj.id);
+            if (it != pImpl->object_bed_exit_status.end() && it->second) {
+                any_bed_exit = true;
+                break;
+            }
         }
         event.is_bed_exit = any_bed_exit;
         // event.is_weak_movement = false; // NOT IN STRUCT
