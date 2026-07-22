@@ -109,22 +109,28 @@ struct ObjBBox {
     float cx, cy;
     float strength;
     int pixels;
+    int total_blocks;       // obj.blocks.size()
+    int bottom_row_blocks;  // # of those blocks in row == grid_rows-1 (frame's bottom edge)
 };
 
-bool ComputeBBox(const VisionSDK::MotionObject& obj, int grid_cols, ObjBBox& out) {
+bool ComputeBBox(const VisionSDK::MotionObject& obj, int grid_cols, int grid_rows, ObjBBox& out) {
     if (obj.blocks.empty()) return false;
     int min_c = INT32_MAX, max_c = -1, min_r = INT32_MAX, max_r = -1;
+    int bottom_row_blocks = 0;
     for (int b : obj.blocks) {
         int r = b / grid_cols, c = b % grid_cols;
         if (c < min_c) min_c = c;
         if (c > max_c) max_c = c;
         if (r < min_r) min_r = r;
         if (r > max_r) max_r = r;
+        if (r == grid_rows - 1) bottom_row_blocks++;
     }
     out.id = obj.id;
     out.min_col = min_c; out.max_col = max_c;
     out.min_row = min_r; out.max_row = max_r;
     out.cx = obj.centerX; out.cy = obj.centerY;
+    out.total_blocks = (int)obj.blocks.size();
+    out.bottom_row_blocks = bottom_row_blocks;
     return true;
 }
 
@@ -189,9 +195,11 @@ void RewriteEventsFile(const std::string& path, const std::string& gray_path,
         for (int j = 0; j < ev.obj_count; ++j) {
             const ObjBBox& bb = ev.objs[j];
             fprintf(f, "        {\"id\": %d, \"min_col\": %d, \"min_row\": %d, \"max_col\": %d, \"max_row\": %d, "
-                       "\"cx\": %.2f, \"cy\": %.2f, \"strength\": %.2f, \"pixels\": %d}%s\n",
+                       "\"cx\": %.2f, \"cy\": %.2f, \"strength\": %.2f, \"pixels\": %d, "
+                       "\"total_blocks\": %d, \"bottom_row_blocks\": %d}%s\n",
                     bb.id, bb.min_col, bb.min_row, bb.max_col, bb.max_row, bb.cx, bb.cy,
-                    bb.strength, bb.pixels, (j + 1 < ev.obj_count) ? "," : "");
+                    bb.strength, bb.pixels, bb.total_blocks, bb.bottom_row_blocks,
+                    (j + 1 < ev.obj_count) ? "," : "");
         }
         fprintf(f, "      ]\n    }");
     }
@@ -454,7 +462,7 @@ int main(int argc, char** argv) {
         for (const auto& obj : objects) {
             if (obj_count >= kMaxObjectsPerEvent) break;
             ObjBBox bb;
-            if (!ComputeBBox(obj, motionCfg.grid_cols, bb)) continue;
+            if (!ComputeBBox(obj, motionCfg.grid_cols, motionCfg.grid_rows, bb)) continue;
             bb.strength = obj.strength;
             bb.pixels = obj.pixel_count;
             bboxes[obj_count++] = bb;

@@ -5888,6 +5888,21 @@ StatusCode FallDetector::Detect(const Image& frame, bool& is_fall)
                 const float threshold2 = 11.0f;  // Relaxed from 9.5 to improve recall for slow transitions
                 const int observation_frames = 45;  // Extended from 60 to 120 frames (4 seconds @ 30fps)
                 const int max_waiting_frames = 15;  // Max frames to wait for deceleration
+                // Minimum moving-region size (pixels) required for a momentum peak to open a
+                // Case5 observation window at all. Without this, a tiny motion blip (e.g. a
+                // hand/head movement, far smaller than a person's silhouette) can cross
+                // threshold1 and, if the person then simply stands still afterward (normal,
+                // non-fall behavior), the "peak then 45 frames of stillness" pattern alone gets
+                // read as a fall. Root-caused 2026-07-22 against Bug_Video/Fall_17/data4.gray
+                // (a no-fall video): ID 1083 lingered near the bed-head/camera end for 280+
+                // frames; the specific false trigger at frame 1565 traced back to a peak_mom
+                // 21.16 sourced from only Area:884 px (0.25% of an 800x450 frame), vs. 11000-
+                // 22000 px for that same object's other, non-triggering-a-false-positive peaks.
+                // 3000 chosen by sweeping 800-12000 against all 18 Bug_Video/Fall_17 videos:
+                // it's the largest value that costs zero recall (removes exactly this class of
+                // small-blip false trigger); above ~3500-4000, real fall triggers start getting
+                // rejected too and recall drops much faster than FP count improves.
+                const int min_trigger_pixel_area = 3000;
                 
                 if (pImpl->config.enable_post_bed_exit_threshold)
                 {
@@ -5934,11 +5949,19 @@ StatusCode FallDetector::Detect(const Image& frame, bool& is_fall)
                 // Step 2: Trigger on high momentum peak
                 if (recent_mom_avg >= threshold1) {
                     bool start_new_trigger = false;
-                    bool suppress_trigger = false;
+                    // Reject peaks sourced from a too-small moving region -- see
+                    // min_trigger_pixel_area comment above. Applied only to a FRESH trigger
+                    // (Scenario A/C below); an already-active wait/observation for this ID is
+                    // untouched by a single small-area frame passing through here.
+                    bool suppress_trigger = (curr.pixel_count < min_trigger_pixel_area);
+                    if (suppress_trigger) {
+                        DEBUG_PRINT("[Case5-AREA-REJECT] ID:%d peak_mom=%.2f but Area:%d < min %d, ignoring peak\n",
+                               curr.id, recent_mom_avg, curr.pixel_count, min_trigger_pixel_area);
+                    }
 
                     // NEW: Edge Object Filter (REMOVED early suppression per USER request)
                     // We now allow triggers at the edge but validate at the END of observation.
-                    
+
                     if (!suppress_trigger) {
                         // Scenario A: First Trigger (Respect Persistence to avoid double detections)
                         if (!state.is_active && !state.waiting_for_deceleration && state.post_fall_counter == 0) {
