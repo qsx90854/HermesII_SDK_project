@@ -6857,7 +6857,7 @@ StatusCode FallDetector::Detect(const Image& frame, bool& is_fall)
 
                 if (potential_fall) {
                     // Common Checks: Bed Region & Leaving Scene & Static
-                    
+
                     // 1-d / 2-c: Check Last Position in Bed?
                     // User: "Check last possible position not in bed".
                     // We use Current Center/Bottom.
@@ -6868,22 +6868,44 @@ StatusCode FallDetector::Detect(const Image& frame, bool& is_fall)
                         // downscaled space and lands in the top-left corner.
                         float blockW_px = (float)W / pImpl->config.grid_cols;
                         float blockH_px = (float)H / pImpl->config.grid_rows;
-                        // Check Bottom Point
-                        int cx = (int)(curr.centerX * blockW_px);
-                        // Use max row for bottom
-                        int max_r = 0;
-                        for(int b : curr.blocks) { int r = b / pImpl->config.grid_cols; if(r>max_r) max_r=r; }
-                        int Cy = (int)((max_r + 1) * blockH_px) - 1; // bottom edge, kept inside frame
+
+                        int cx, Cy;
+                        if (state.last_fg_valid) {
+                            // Prefer the live background-subtraction foreground
+                            // centroid over the motion-block position: motion blocks
+                            // (curr.blocks/curr.centerX) can decay to just 1-2 blocks
+                            // -- or fewer -- once the object stops moving, leaving
+                            // curr.centerX stale/inconsistent with curr.blocks (root-
+                            // caused 2026-07-22 against Bug_Video/Fall_17/data11.gray:
+                            // curr.centerX stayed frozen for 25+ frames while
+                            // curr.blocks kept shrinking, so the "bottom point"
+                            // computed from them no longer matched the object's real
+                            // on-screen position). last_fg_cx/cy (see the "Always run
+                            // the search loop..." FG-match block above) is instead
+                            // re-matched every frame against a freshly recomputed
+                            // background-diff mask, so it keeps tracking correctly
+                            // even while the object is motionless.
+                            cx = (int)(state.last_fg_cx * blockW_px);
+                            Cy = (int)(state.last_fg_cy * blockH_px);
+                        } else {
+                            // Fallback: no FG match yet (e.g. very first frames of a
+                            // trigger, before the search loop above has run) -- use
+                            // the motion-block bottom point as before.
+                            cx = (int)(curr.centerX * blockW_px);
+                            int max_r = 0;
+                            for(int b : curr.blocks) { int r = b / pImpl->config.grid_cols; if(r>max_r) max_r=r; }
+                            Cy = (int)((max_r + 1) * blockH_px) - 1; // bottom edge, kept inside frame
+                        }
 
                         if (cx>=0 && cx<W && Cy>=0 && Cy<H) {
                              // Mask: 0 = Inside Bed
                              if (pImpl->bedMask.getData()[Cy*W + cx] == 0) in_bed = true;
                         }
                     }
-                    
+
                     if (in_bed) {
-                        // DEBUG_PRINT("[NewLogic] ID %d Rejected: In Bed Region\n", curr.id);
-                        // continue; // DISABLED FOR DEBUG
+                        DEBUG_PRINT("[NewLogic] ID %d Rejected: In Bed Region\n", curr.id);
+                        continue;
                     }
                     
                     // 1-f / 2-e: Leaving Scene Guard

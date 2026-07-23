@@ -13,6 +13,36 @@
 
 #include "event_recorder.h"
 
+// Perf-isolation test switch (2026-07-22): set to 1 to disable ALL SD-card
+// raw-frame storage -- no hermes_frame_ring.dat, no per-frame mmap
+// memcpy/msync/madvise in PushFrame(), no evt_*.raw / evt_*_bg.raw on
+// finalize. Only .meta.json / .analysis.jsonl / event_record.jsonl still get
+// written, so the trigger/logging pipeline stays testable while isolating
+// whether the raw-frame ring I/O is what's adding delay to frame feeding.
+// Leave at 0 for normal operation.
+#ifndef EVENT_RECORDER_SKIP_RAW_STORAGE
+#define EVENT_RECORDER_SKIP_RAW_STORAGE 0
+#endif
+
+// Perf switch (2026-07-23): set to 1 to move the per-frame memcpy-into-the-
+// mmap-ring (plus its msync/madvise) OFF the caller's PushFrame thread onto a
+// dedicated spooler thread. On the edge board, raw storage periodically
+// stalled the frame feeder ~250-800ms (confirmed genuine late arrivals, not
+// dropped frames -- seq stayed contiguous), consistent with kernel
+// balance_dirty_pages throttling the thread that dirties the file-backed
+// pages when the SD card can't keep up. With this on, PushFrame only does a
+// RAM->RAM copy into a small bounded queue and returns; the spooler thread
+// takes the throttle hit. Costs ~kMaxSpoolFrames*frame_size RAM of buffering.
+// Mutually exclusive with EVENT_RECORDER_SKIP_RAW_STORAGE (no ring to spool
+// into there). Leave at 0 for the original synchronous behavior.
+#ifndef EVENT_RECORDER_ASYNC_SPOOL
+#define EVENT_RECORDER_ASYNC_SPOOL 0
+#endif
+
+#if EVENT_RECORDER_ASYNC_SPOOL && EVENT_RECORDER_SKIP_RAW_STORAGE
+#error "EVENT_RECORDER_ASYNC_SPOOL and EVENT_RECORDER_SKIP_RAW_STORAGE are mutually exclusive"
+#endif
+
 #include <fcntl.h>
 #include <unistd.h>
 #include <sys/mman.h>
@@ -24,6 +54,7 @@
 #include <cstdio>
 #include <cstring>
 #include <ctime>
+#include <map>
 
 namespace VisionSDK {
 
@@ -38,7 +69,25 @@ const uint32_t kRingVersion = 2;               // v2: slot index gained process_
 const uint32_t kMarginSlots = 64;              // extra slots protecting the copy window
 const size_t kPageSize = 4096;
 const uint64_t kInvalidSeq = UINT64_MAX;
-const int kResidentSlots = 32;                 // madvise(DONTNEED) slots older than this
+// madvise(DONTNEED) slots older than this.
+//
+// Tested bumping 32 -> 128 (2026-07-23) as a diagnostic: hypothesis was that
+// madvise() on a slot whose async writeback hadn't finished yet blocks the
+// calling thread, causing the periodic ~250-800ms frame-arrival stalls seen
+// with raw storage enabled (~20-26 per 600 frames, irregular). Result: zero
+// measurable change in stall count/frequency/magnitude at 128 vs 32 -- ruled
+// out, reverted to 32. The stalls are most likely a lower-level SD
+// card/kernel dirty-page characteristic, not tied to this eviction window.
+const int kResidentSlots = 32;
+
+// Max frames buffered in RAM waiting for the async spooler (EVENT_RECORDER_
+// ASYNC_SPOOL). Sized to absorb a worst-case stall burst: observed stalls are
+// <=~800ms and frames arrive ~every 130ms, so ~6 frames pile up per stall; 24
+// gives ~4x headroom. At gray8 800x480 (~384KB/frame) this bounds the extra
+// RAM to ~9MB. If the queue ever fills (spooler can't keep up on AVERAGE, not
+// just in bursts) the incoming frame is dropped rather than growing RAM
+// without bound -- same "drop, don't block" policy as the synchronous ring.
+const size_t kMaxSpoolFrames = 24;
 
 size_t PageAlign(size_t n) { return (n + kPageSize - 1) & ~(kPageSize - 1); }
 
@@ -140,6 +189,12 @@ void EventRecorder::StartWriterLocked() {
     stop_ = false;
     writer_ = std::thread(&EventRecorder::WriterLoop, this);
     writer_running_ = true;
+#if EVENT_RECORDER_ASYNC_SPOOL
+    if (!spooler_running_) {
+        spooler_ = std::thread(&EventRecorder::SpoolerLoop, this);
+        spooler_running_ = true;
+    }
+#endif
 }
 
 void EventRecorder::Fail(const std::string& why) {
@@ -174,6 +229,21 @@ bool EventRecorder::InitRing(int width, int height, int channels) {
     slot_size_ = (uint32_t)PageAlign(frame_size_);
     capacity_ = (uint32_t)(pre_frames_ + 1 + post_frames_ + kMarginSlots);
 
+#if EVENT_RECORDER_SKIP_RAW_STORAGE
+    // Perf-isolation test mode: no ring file, no mmap, no per-frame SD I/O at
+    // all. Only allocate the RAM-only analysis ring (needed for
+    // .analysis.jsonl) and mark ourselves ready; fd_/map_/hdr_/index_/slots_
+    // all stay null/-1, so every function that touches them must be (and is)
+    // guarded to skip that work in this mode -- see PushFrame, RunFinalize.
+    analysis_ring_.assign(capacity_, FrameAnalysis());
+    write_seq_ = 0;
+    ring_ready_ = true;
+    LogF("[EventRecorder] PERF-TEST MODE: EVENT_RECORDER_SKIP_RAW_STORAGE=1 -- "
+         "no SD ring file, no raw/bg frame storage. Only .meta.json / "
+         ".analysis.jsonl / event_record.jsonl will be written, under %s",
+         event_dir_.c_str());
+    return true;
+#else
     size_t index_bytes = PageAlign((size_t)capacity_ * sizeof(RingSlotIndex));
     size_t data_off = kPageSize + index_bytes;
     map_size_ = data_off + (size_t)capacity_ * slot_size_;
@@ -252,6 +322,7 @@ bool EventRecorder::InitRing(int width, int height, int channels) {
 
     ring_ready_ = true;
     return true;
+#endif // EVENT_RECORDER_SKIP_RAW_STORAGE
 }
 
 void EventRecorder::CloseRing() {
@@ -287,6 +358,40 @@ void EventRecorder::PushFrame(const Image& img) {
         return;
     }
 
+    last_frame_ts_ = img.timestamp;
+
+#if EVENT_RECORDER_SKIP_RAW_STORAGE
+    // Perf-isolation test mode: no ring, no memcpy/msync/madvise -- just
+    // advance the sequence counter so OnEvent/QueueFinalize window
+    // bookkeeping (and thus .meta.json/.analysis.jsonl output) keeps working.
+    last_push_written_ = true;
+    write_seq_++;
+#elif EVENT_RECORDER_ASYNC_SPOOL
+    // Async spooler mode: do NOT touch the mmap ring on this (the caller's)
+    // thread. Copy the frame into a small bounded RAM queue and hand it to
+    // SpoolerLoop(), which does the ring memcpy + msync/madvise -- so the
+    // kernel dirty-page write throttling stalls the spooler, not the feeder.
+    {
+        std::lock_guard<std::mutex> lk(mtx_);
+        if (spool_q_.size() >= kMaxSpoolFrames) {
+            // Spooler is behind even with the buffer: drop this frame rather
+            // than grow RAM without bound. seq is NOT consumed (matches the
+            // synchronous ring's "retry the same seq on the next frame").
+            dropped_frames_++;
+            last_push_written_ = false;
+            return;
+        }
+        SpoolFrame sf;
+        sf.seq = write_seq_;
+        sf.timestamp = img.timestamp;
+        sf.data.assign(reinterpret_cast<const uint8_t*>(img.data),
+                       reinterpret_cast<const uint8_t*>(img.data) + frame_size_);
+        spool_q_.push_back(std::move(sf));
+    }
+    cv_.notify_one();
+    last_push_written_ = true;
+    write_seq_++;
+#else
     // Never overwrite a slot the writer has not copied out yet: drop instead.
     if (write_seq_ >= capacity_) {
         uint64_t overwritten_seq = write_seq_ - capacity_;
@@ -322,6 +427,7 @@ void EventRecorder::PushFrame(const Image& img) {
         uint32_t old_slot = (uint32_t)((write_seq_ - 1 - kResidentSlots) % capacity_);
         madvise(slots_ + (size_t)old_slot * slot_size_, slot_size_, MADV_DONTNEED);
     }
+#endif // EVENT_RECORDER_SKIP_RAW_STORAGE
 
     // Post-window bookkeeping: latest written seq is write_seq_ - 1.
     if (capturing_ && (write_seq_ - 1) >= event_seq_ + (uint64_t)post_frames_) {
@@ -335,7 +441,7 @@ void EventRecorder::OnEvent(const VisionSDKEvent& event, std::vector<uint8_t>&& 
 
     Trigger t;
     t.seq = write_seq_ - 1;                // frame currently being processed
-    t.timestamp_ms = index_[(uint32_t)(t.seq % capacity_)].timestamp_ms;
+    t.timestamp_ms = last_frame_ts_;       // == index_[t.seq % capacity_].timestamp_ms when the ring exists
     t.frame_index = event.frame_index;
     t.is_fall = event.is_fall_detected;
     t.is_bed_exit = event.is_bed_exit;
@@ -370,7 +476,7 @@ void EventRecorder::TriggerSelfTest(std::vector<uint8_t>&& bg_image) {
 
     Trigger t;
     t.seq = write_seq_ - 1;
-    t.timestamp_ms = index_[(uint32_t)(t.seq % capacity_)].timestamp_ms;
+    t.timestamp_ms = last_frame_ts_;
     t.frame_index = (int)t.seq;
     t.is_fall = false;
     t.is_bed_exit = false;
@@ -395,14 +501,48 @@ void EventRecorder::RecordProcessTime(uint64_t process_time_us) {
     std::lock_guard<std::mutex> api_lk(api_mtx_);
     if (shutdown_ || !enabled_ || failed_ || !ring_ready_ || write_seq_ == 0) return;
     if (!last_push_written_) return;   // last frame was dropped, nothing to annotate
+#if EVENT_RECORDER_ASYNC_SPOOL
+    // The just-pushed frame may still be in the spool queue (not yet in the
+    // ring), so we can't back-fill its ring slot here. Process time is carried
+    // by the analysis snapshot (RecordFrameAnalysis stores it too) and sourced
+    // from there in RunFinalize.
+    (void)process_time_us;
+    return;
+#else
+    if (!index_) return;   // no ring in EVENT_RECORDER_SKIP_RAW_STORAGE mode -- nothing to annotate
     uint32_t slot = (uint32_t)((write_seq_ - 1) % capacity_);
     index_[slot].process_time_us =
         (process_time_us > UINT32_MAX) ? UINT32_MAX : (uint32_t)process_time_us;
+#endif
 }
 
 void EventRecorder::SetBedRegion(const std::vector<std::pair<int, int>>& points) {
     std::lock_guard<std::mutex> api_lk(api_mtx_);
     bed_region_ = points;
+}
+
+void EventRecorder::SetMotionConfig(const MotionEstimation_v1& c) {
+    std::lock_guard<std::mutex> api_lk(api_mtx_);
+    cfg_motion_ = c;
+    has_motion_cfg_ = true;
+}
+
+void EventRecorder::SetObjectConfig(const ObjectExtraction_v1& c) {
+    std::lock_guard<std::mutex> api_lk(api_mtx_);
+    cfg_object_ = c;
+    has_object_cfg_ = true;
+}
+
+void EventRecorder::SetFallConfig(const FallDetection_v3& c) {
+    std::lock_guard<std::mutex> api_lk(api_mtx_);
+    cfg_fall_ = c;
+    has_fall_cfg_ = true;
+}
+
+void EventRecorder::SetImageConfig(const ImageRelated_v1& c) {
+    std::lock_guard<std::mutex> api_lk(api_mtx_);
+    cfg_image_ = c;
+    has_image_cfg_ = true;
 }
 
 void EventRecorder::RecordFrameAnalysis(FrameAnalysis&& fa) {
@@ -425,6 +565,17 @@ void EventRecorder::QueueFinalize(bool complete) {
     job.triggers = triggers_;
     job.bg_image = std::move(event_bg_);
     job.bed_region = bed_region_;
+    job.cfg_motion = cfg_motion_;
+    job.cfg_object = cfg_object_;
+    job.cfg_fall = cfg_fall_;
+    job.cfg_image = cfg_image_;
+    job.has_motion_cfg = has_motion_cfg_;
+    job.has_object_cfg = has_object_cfg_;
+    job.has_fall_cfg = has_fall_cfg_;
+    job.has_image_cfg = has_image_cfg_;
+    job.event_recording_enabled = enabled_;
+    job.event_recording_pre_frames = pre_frames_;
+    job.event_recording_post_frames = post_frames_;
 
     // Copy the window's analysis snapshots now (caller holds api_mtx_): the
     // RAM ring keeps mutating after we return, the writer must not touch it.
@@ -461,6 +612,17 @@ void EventRecorder::WriterLoop() {
             jobs_.pop_front();
             copy_cursor_ = job.first_seq;   // protect window from overwrite
             copy_last_ = job.last_seq;
+#if EVENT_RECORDER_ASYNC_SPOOL
+            // Wait until the spooler has written every frame of this window
+            // into the ring before we read it. The spooler advances
+            // spooled_seq_ for each dequeued frame (even ones it drops for
+            // overwrite protection), and the last_seq frame was enqueued
+            // before this job, so spooled_seq_ is guaranteed to reach
+            // last_seq+1 -- this cannot hang. Intentionally NOT gated on stop_:
+            // on shutdown the spooler drains fully before it exits, so waiting
+            // purely on spooled_seq_ still reads a complete window.
+            cv_.wait(lk, [this, &job] { return spooled_seq_ > job.last_seq; });
+#endif
         }
 
         RunFinalize(job);
@@ -470,6 +632,66 @@ void EventRecorder::WriterLoop() {
             copy_cursor_ = kInvalidSeq;
         }
     }
+}
+
+void EventRecorder::SpoolerLoop() {
+#if EVENT_RECORDER_ASYNC_SPOOL
+    for (;;) {
+        SpoolFrame sf;
+        {
+            std::unique_lock<std::mutex> lk(mtx_);
+            cv_.wait(lk, [this] { return stop_ || !spool_q_.empty(); });
+            if (spool_q_.empty()) {
+                if (stop_) return;   // fully drained and asked to stop
+                continue;
+            }
+            sf = std::move(spool_q_.front());
+            spool_q_.pop_front();
+        }
+
+        // Overwrite protection (same rule as the synchronous ring, just run on
+        // this thread): writing sf.seq's slot overwrites the frame that lived
+        // there capacity_ frames ago; skip (drop) if that older frame is inside
+        // a window the writer is currently finalizing.
+        uint32_t slot = (uint32_t)(sf.seq % capacity_);
+        bool do_write = true;
+        if (sf.seq >= capacity_) {
+            uint64_t overwritten_seq = sf.seq - capacity_;
+            std::lock_guard<std::mutex> lk(mtx_);
+            if (copy_cursor_ != kInvalidSeq &&
+                overwritten_seq >= copy_cursor_ && overwritten_seq <= copy_last_) {
+                dropped_frames_++;
+                do_write = false;
+            }
+        }
+
+        if (do_write && slots_ && index_) {
+            uint8_t* dst = slots_ + (size_t)slot * slot_size_;
+            memcpy(dst, sf.data.data(), frame_size_);   // dirty-page throttle lands HERE now
+            index_[slot].seq = sf.seq;
+            index_[slot].timestamp_ms = sf.timestamp;
+            index_[slot].process_time_us = 0;   // sourced from analysis in async mode
+            if (hdr_) hdr_->write_seq = sf.seq + 1;
+            msync(dst, slot_size_, MS_ASYNC);
+            if (((sf.seq + 1) & 63) == 0) {
+                msync(map_, kPageSize, MS_ASYNC);
+                msync(reinterpret_cast<uint8_t*>(index_),
+                      PageAlign((size_t)capacity_ * sizeof(RingSlotIndex)), MS_ASYNC);
+            }
+            if (sf.seq + 1 > (uint64_t)kResidentSlots) {
+                uint32_t old_slot = (uint32_t)((sf.seq - kResidentSlots) % capacity_);
+                madvise(slots_ + (size_t)old_slot * slot_size_, slot_size_, MADV_DONTNEED);
+            }
+        }
+
+        {
+            std::lock_guard<std::mutex> lk(mtx_);
+            spooled_seq_ = sf.seq + 1;   // advance even on drop, so WriterLoop's
+                                         // spooled_seq_ wait can never hang
+        }
+        cv_.notify_all();
+    }
+#endif
 }
 
 void EventRecorder::RunFinalize(const FinalizeJob& job) {
@@ -489,6 +711,21 @@ void EventRecorder::RunFinalize(const FinalizeJob& job) {
     std::string raw_tmp = event_dir_ + "/.tmp_" + raw_name;
     std::string raw_final = event_dir_ + "/" + raw_name;
 
+    uint64_t written = 0;
+    uint64_t missing = (job.last_seq >= job.first_seq) ? (job.last_seq - job.first_seq + 1) : 0;
+    uint64_t first_ts = 0, last_ts = 0;
+    // Per-frame input timestamps (from SetInputMemory) and Detect() durations,
+    // same order as the frames written into the .raw file.
+    std::vector<uint64_t> frame_ts;
+    std::vector<uint32_t> frame_proc_us;
+    bool raw_saved = false;
+    bool bg_saved = false;
+
+#if EVENT_RECORDER_SKIP_RAW_STORAGE
+    LogF("[EventRecorder] PERF-TEST MODE: skipping raw/bg file write for %s "
+         "(EVENT_RECORDER_SKIP_RAW_STORAGE=1) -- meta/analysis/log JSON still written.",
+         base_name);
+#else
     // --- 1. Frame window: ring -> .raw (write to .tmp, fsync, rename) ---
     int out = open(raw_tmp.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
     if (out < 0) {
@@ -497,14 +734,16 @@ void EventRecorder::RunFinalize(const FinalizeJob& job) {
         return;
     }
 
-    uint64_t written = 0, missing = 0;
-    uint64_t first_ts = 0, last_ts = 0;
-    // Per-frame input timestamps (from SetInputMemory) and Detect() durations,
-    // same order as the frames written into the .raw file.
-    std::vector<uint64_t> frame_ts;
-    std::vector<uint32_t> frame_proc_us;
+    missing = 0;
     frame_ts.reserve((size_t)(job.last_seq - job.first_seq + 1));
     frame_proc_us.reserve((size_t)(job.last_seq - job.first_seq + 1));
+#if EVENT_RECORDER_ASYNC_SPOOL
+    // In async mode the ring slots' process_time_us aren't back-filled (the
+    // frame was already spooled by the time RecordProcessTime ran), so source
+    // it from the analysis snapshots by seq instead.
+    std::map<uint64_t, uint32_t> proc_by_seq;
+    for (const FrameAnalysis& fa : job.analysis) proc_by_seq[fa.seq] = fa.process_time_us;
+#endif
     bool ok = true;
     for (uint64_t seq = job.first_seq; seq <= job.last_seq; ++seq) {
         uint32_t slot = (uint32_t)(seq % capacity_);
@@ -520,7 +759,12 @@ void EventRecorder::RunFinalize(const FinalizeJob& job) {
             if (written == 0) first_ts = index_[slot].timestamp_ms;
             last_ts = index_[slot].timestamp_ms;
             frame_ts.push_back(index_[slot].timestamp_ms);
+#if EVENT_RECORDER_ASYNC_SPOOL
+            auto pit = proc_by_seq.find(seq);
+            frame_proc_us.push_back(pit != proc_by_seq.end() ? pit->second : 0);
+#else
             frame_proc_us.push_back(index_[slot].process_time_us);
+#endif
             written++;
         }
         std::lock_guard<std::mutex> lk(mtx_);
@@ -536,9 +780,9 @@ void EventRecorder::RunFinalize(const FinalizeJob& job) {
         LogF("[EventRecorder] ERROR: finalize rename failed: %s", strerror(errno));
         return;
     }
+    raw_saved = true;
 
     // --- 2. Background snapshot taken at the event start ---
-    bool bg_saved = false;
     if (!job.bg_image.empty()) {
         std::string bg_tmp = event_dir_ + "/.tmp_" + bg_name;
         int bfd = open(bg_tmp.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
@@ -551,6 +795,23 @@ void EventRecorder::RunFinalize(const FinalizeJob& job) {
             }
             if (!bg_saved) unlink(bg_tmp.c_str());
         }
+    }
+#endif // EVENT_RECORDER_SKIP_RAW_STORAGE
+
+    // Raw storage skipped (or otherwise yielded nothing): fall back to the
+    // RAM-only analysis snapshots for per-frame timestamps/process-time, so
+    // .meta.json's own frame_timestamps_ms/frame_process_time_us/
+    // process_time_us_avg/max are populated directly instead of staying
+    // empty/zero and forcing a reader to go open the sibling .analysis.jsonl.
+    if (frame_ts.empty() && !job.analysis.empty()) {
+        frame_ts.reserve(job.analysis.size());
+        frame_proc_us.reserve(job.analysis.size());
+        for (const FrameAnalysis& fa : job.analysis) {
+            frame_ts.push_back(fa.timestamp_ms);
+            frame_proc_us.push_back(fa.process_time_us);
+        }
+        first_ts = frame_ts.front();
+        last_ts = frame_ts.back();
     }
 
     // --- 2.5 Per-frame analysis snapshots -> <base>.analysis.jsonl ---
@@ -580,10 +841,11 @@ void EventRecorder::RunFinalize(const FinalizeJob& job) {
                 const FrameAnalysis& fa = job.analysis[f];
                 buf.clear();
                 AppendF(buf, "{\"seq\":%llu,\"frame_in_file\":%lld,\"ts\":%llu,"
-                             "\"total_fg\":%d,\"objects\":[",
+                             "\"proc_us\":%u,\"total_fg\":%d,\"objects\":[",
                         (unsigned long long)fa.seq,
                         (long long)(fa.seq - job.first_seq),
-                        (unsigned long long)fa.timestamp_ms, fa.total_fg_pixels);
+                        (unsigned long long)fa.timestamp_ms, fa.process_time_us,
+                        fa.total_fg_pixels);
                 for (size_t o = 0; o < fa.objects.size(); ++o) {
                     const FrameAnalysisObject& ob = fa.objects[o];
                     AppendF(buf, "%s{\"id\":%d,\"cx\":%.2f,\"cy\":%.2f,"
@@ -643,7 +905,9 @@ void EventRecorder::RunFinalize(const FinalizeJob& job) {
     {
         std::string js;
         js.reserve(4096 + frame_ts.size() * 14 + job.triggers.size() * 110);
-        AppendF(js, "{\n  \"file\": \"%s\",\n", raw_name.c_str());
+        js += "{\n";
+        if (raw_saved) AppendF(js, "  \"file\": \"%s\",\n", raw_name.c_str());
+        else           js += "  \"file\": null,\n";
         if (bg_saved) AppendF(js, "  \"bg_file\": \"%s\",\n", bg_name.c_str());
         else          js += "  \"bg_file\": null,\n";
         if (analysis_saved) {
@@ -676,6 +940,120 @@ void EventRecorder::RunFinalize(const FinalizeJob& job) {
                     job.bed_region[i].first, job.bed_region[i].second);
         }
         js += "],\n";
+
+        // --- Config snapshot: exactly what the caller last passed to
+        // SetConfig() for each of these types, in effect when this event
+        // fired. Purely informational -- EventRecorder never reads these
+        // itself. A type the caller never set is written as null rather
+        // than a struct of zero-valued defaults, so it is not mistaken for
+        // "explicitly configured to 0/false". ---
+        js += "  \"config\": {\n";
+        if (job.has_motion_cfg) {
+            const MotionEstimation_v1& c = job.cfg_motion;
+            AppendF(js,
+                "    \"motion_estimation_v1\": {\"grid_cols\": %d, \"grid_rows\": %d, "
+                "\"block_size\": %d, \"search_range\": %d, \"history_size\": %d, "
+                "\"search_mode\": %d, \"block_change_threshold\": %.6f, "
+                "\"enable_block_decay\": %s, \"block_decay_frames\": %d, "
+                "\"enable_block_dilation\": %s, \"block_dilation_threshold\": %d},\n",
+                c.grid_cols, c.grid_rows, c.block_size, c.search_range, c.history_size,
+                c.search_mode, c.block_change_threshold,
+                c.enable_block_decay ? "true" : "false", c.block_decay_frames,
+                c.enable_block_dilation ? "true" : "false", c.block_dilation_threshold);
+        } else {
+            js += "    \"motion_estimation_v1\": null,\n";
+        }
+        if (job.has_object_cfg) {
+            const ObjectExtraction_v1& c = job.cfg_object;
+            AppendF(js,
+                "    \"object_extraction_v1\": {\"object_extraction_threshold\": %.4f, "
+                "\"object_merge_radius\": %d, \"foreground_merge_radius\": %d, "
+                "\"tracking_overlap_threshold\": %.4f, \"tracking_mode\": %d, "
+                "\"tracking_ttl\": %d},\n",
+                (double)c.object_extraction_threshold, c.object_merge_radius,
+                c.foreground_merge_radius, (double)c.tracking_overlap_threshold,
+                c.tracking_mode, c.tracking_ttl);
+        } else {
+            js += "    \"object_extraction_v1\": null,\n";
+        }
+        if (job.has_fall_cfg) {
+            // Split across several AppendF calls: AppendF's internal buffer
+            // (see its definition above) is 512 bytes, and this struct alone
+            // has 31 fields -- one single call silently truncates mid-string,
+            // corrupting the rest of the JSON document after it.
+            const FallDetection_v3& c = job.cfg_fall;
+            AppendF(js,
+                "    \"fall_detection_v3\": {\"fall_movement_threshold\": %.4f, "
+                "\"fall_strong_threshold\": %.4f, \"safe_area_ratio_threshold\": %.4f, "
+                "\"fall_acceleration_threshold\": %.4f, \"fall_window_size\": %d, "
+                "\"fall_duration\": %d, \"enable_face_detection\": %s, ",
+                (double)c.fall_movement_threshold, (double)c.fall_strong_threshold,
+                (double)c.safe_area_ratio_threshold, (double)c.fall_acceleration_threshold,
+                c.fall_window_size, c.fall_duration,
+                c.enable_face_detection ? "true" : "false");
+            AppendF(js,
+                "\"face_detect_interval_frames\": %d, \"enable_save_bg_mask\": %s, "
+                "\"bg_init_start_frame\": %d, \"bg_init_end_frame\": %d, "
+                "\"bg_diff_threshold\": %d, \"bg_update_interval_frames\": %d, "
+                "\"bg_update_alpha\": %.4f, ",
+                c.face_detect_interval_frames, c.enable_save_bg_mask ? "true" : "false",
+                c.bg_init_start_frame, c.bg_init_end_frame, c.bg_diff_threshold,
+                c.bg_update_interval_frames, (double)c.bg_update_alpha);
+            AppendF(js,
+                "\"fall_acceleration_upper_threshold\": %.4f, "
+                "\"fall_acceleration_lower_threshold\": %.4f, "
+                "\"post_fall_distance_threshold\": %.4f, \"post_fall_check_frames\": %d, "
+                "\"enable_bed_exit_verification\": %s, "
+                "\"enable_block_shrink_verification\": %s, ",
+                (double)c.fall_acceleration_upper_threshold,
+                (double)c.fall_acceleration_lower_threshold,
+                (double)c.post_fall_distance_threshold, c.post_fall_check_frames,
+                c.enable_bed_exit_verification ? "true" : "false",
+                c.enable_block_shrink_verification ? "true" : "false");
+            AppendF(js,
+                "\"bed_update_alpha_multiplier\": %.4f, \"opt_flow_frame_distance\": %d, "
+                "\"perspective_point_x\": %d, \"perspective_point_y\": %d, "
+                "\"min_trigger_area\": %d, \"bed_pixel_ratio_threshold\": %.4f, "
+                "\"momentum_calc_type\": %d, ",
+                (double)c.bed_update_alpha_multiplier, c.opt_flow_frame_distance,
+                c.perspective_point_x, c.perspective_point_y, c.min_trigger_area,
+                (double)c.bed_pixel_ratio_threshold, c.momentum_calc_type);
+            AppendF(js,
+                "\"enable_post_bed_exit_threshold\": %s, "
+                "\"post_bed_exit_threshold_multiplier\": %.4f, "
+                "\"projection_use_foreground\": %s, \"enable_edge_drop_filter\": %s, "
+                "\"enable_fall_and_bed_exit\": %s},\n",
+                c.enable_post_bed_exit_threshold ? "true" : "false",
+                (double)c.post_bed_exit_threshold_multiplier,
+                c.projection_use_foreground ? "true" : "false",
+                c.enable_edge_drop_filter ? "true" : "false",
+                c.enable_fall_and_bed_exit ? "true" : "false");
+        } else {
+            js += "    \"fall_detection_v3\": null,\n";
+        }
+        if (job.has_image_cfg) {
+            const ImageRelated_v1& c = job.cfg_image;
+            AppendF(js,
+                "    \"image_related_v1\": {\"expected_frame_interval_ms\": %d, "
+                "\"frame_interval_tolerance_ms\": %d, \"enable_draw_bg_noise\": %s, "
+                "\"enable_save_images\": %s, ",
+                c.expected_frame_interval_ms, c.frame_interval_tolerance_ms,
+                c.enable_draw_bg_noise ? "true" : "false",
+                c.enable_save_images ? "true" : "false");
+            // save_image_path is caller-controlled and unbounded in length;
+            // give it its own call (with a defensive %.400s cap) rather than
+            // risk overflowing AppendF's 512-byte buffer together with the
+            // other fields above.
+            AppendF(js, "\"save_image_path\": \"%.400s\"},\n", c.save_image_path.c_str());
+        } else {
+            js += "    \"image_related_v1\": null,\n";
+        }
+        AppendF(js,
+            "    \"event_recording_v1\": {\"enable\": %s, \"pre_frames\": %d, "
+            "\"post_frames\": %d}\n",
+            job.event_recording_enabled ? "true" : "false",
+            job.event_recording_pre_frames, job.event_recording_post_frames);
+        js += "  },\n";
         uint64_t proc_sum = 0;
         uint32_t proc_max = 0;
         for (size_t i = 0; i < frame_proc_us.size(); ++i) {
@@ -728,7 +1106,9 @@ void EventRecorder::RunFinalize(const FinalizeJob& job) {
     {
         std::string line;
         line.reserve(512);
-        AppendF(line, "{\"datetime\":\"%s\",\"file\":\"%s\",", time_human, raw_name.c_str());
+        AppendF(line, "{\"datetime\":\"%s\",", time_human);
+        if (raw_saved) AppendF(line, "\"file\":\"%s\",", raw_name.c_str());
+        else           line += "\"file\":null,";
         if (bg_saved) AppendF(line, "\"bg_file\":\"%s\",", bg_name.c_str());
         else          line += "\"bg_file\":null,";
         uint64_t proc_sum = 0;
@@ -766,7 +1146,8 @@ void EventRecorder::RunFinalize(const FinalizeJob& job) {
 
     LogF("[EventRecorder]%s%s (%llu frames, type=%s, triggers=%llu)",
          started_by_self_test ? "[SELF-TEST] TEST recording saved: " : " Saved ",
-         raw_final.c_str(), (unsigned long long)written, event_type,
+         raw_saved ? raw_final.c_str() : "(json-only, no raw file)",
+         (unsigned long long)written, event_type,
          (unsigned long long)job.triggers.size());
 }
 
@@ -789,7 +1170,19 @@ void EventRecorder::Shutdown() {
             std::lock_guard<std::mutex> lk(mtx_);
             stop_ = true;
         }
-        cv_.notify_one();
+        cv_.notify_all();
+#if EVENT_RECORDER_ASYNC_SPOOL
+        // Join the spooler FIRST: it drains all remaining queued frames into
+        // the ring (advancing spooled_seq_) and then exits on stop_. Only once
+        // it is done can the writer's spooled_seq_ wait complete and read a
+        // fully-populated window. Both threads only touch mtx_, never api_mtx_,
+        // so joining while holding api_mtx_ cannot deadlock.
+        if (spooler_running_) {
+            if (spooler_.joinable()) spooler_.join();
+            spooler_running_ = false;
+            cv_.notify_all();   // wake the writer's spooled_seq_ wait if pending
+        }
+#endif
         // Drains queued finalize jobs; the writer only touches mtx_, never
         // api_mtx_, so joining while holding api_mtx_ cannot deadlock.
         if (writer_.joinable()) writer_.join();

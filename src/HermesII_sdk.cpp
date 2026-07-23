@@ -80,7 +80,7 @@ using namespace VisionSDK;
 VisionSDK::VisionSDK::VisionSDK() : pImpl(std::unique_ptr<Impl>(new Impl())) {}
 VisionSDK::VisionSDK::~VisionSDK() = default;
 
-#define VISION_SDK_VERSION_INTERNAL "2.0.5a_20260717"
+#define VISION_SDK_VERSION_INTERNAL "2.0.5_20260723"
 
 const char* VisionSDK::VisionSDK::GetVersion() {
     return VISION_SDK_VERSION_INTERNAL;
@@ -188,6 +188,7 @@ StatusCode VisionSDK::VisionSDK::SetConfig(const void* config) {
             pImpl->config.block_decay_frames = c->block_decay_frames;
             pImpl->config.enable_block_dilation = c->enable_block_dilation;
             pImpl->config.block_dilation_threshold = c->block_dilation_threshold;
+            pImpl->event_recorder.SetMotionConfig(*c);
             break;
         }
         case ConfigType::ObjectExtraction_v1: {
@@ -199,6 +200,7 @@ StatusCode VisionSDK::VisionSDK::SetConfig(const void* config) {
             pImpl->config.tracking_mode = c->tracking_mode;
             pImpl->config.tracking_ttl = c->tracking_ttl; // NEW
             if (pImpl->config.tracking_ttl <= 0) pImpl->config.tracking_ttl = 1000; // Force default if user passed 0
+            pImpl->event_recorder.SetObjectConfig(*c);
             break;
         }
         case ConfigType::FallDetection_v1: {
@@ -257,6 +259,7 @@ StatusCode VisionSDK::VisionSDK::SetConfig(const void* config) {
             pImpl->config.projection_use_foreground = c->projection_use_foreground;
             pImpl->config.enable_edge_drop_filter = c->enable_edge_drop_filter; // NEW
             pImpl->config.enable_fall_and_bed_exit = c->enable_fall_and_bed_exit; // NEW
+            pImpl->event_recorder.SetFallConfig(*c);
             break;
         }
         case ConfigType::BedExitDetection_v1: {
@@ -273,6 +276,7 @@ StatusCode VisionSDK::VisionSDK::SetConfig(const void* config) {
             pImpl->config.enable_draw_bg_noise = c->enable_draw_bg_noise;
             pImpl->config.enable_save_images = c->enable_save_images;
             pImpl->config.save_image_path = c->save_image_path;
+            pImpl->event_recorder.SetImageConfig(*c);
             break;
         }
         case ConfigType::EventRecording_v1: {
@@ -488,6 +492,7 @@ StatusCode VisionSDK::VisionSDK::ProcessNextFrame() {
         const int kMaxAnalysisObjects = 8;
         EventRecorder::FrameAnalysis fa;
         fa.timestamp_ms = pImpl->input_timestamp;
+        fa.process_time_us = (duration > 0 && duration <= UINT32_MAX) ? (uint32_t)duration : 0;
         fa.grid_cols = pImpl->config.grid_cols;
         fa.grid_rows = pImpl->config.grid_rows;
         fa.block_size = pImpl->config.block_size;

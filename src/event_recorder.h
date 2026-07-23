@@ -47,6 +47,7 @@ public:
     struct FrameAnalysis {
         uint64_t seq = UINT64_MAX;         // filled in by RecordFrameAnalysis
         uint64_t timestamp_ms = 0;
+        uint32_t process_time_us = 0;      // Detect() duration for this frame
         int grid_cols = 0, grid_rows = 0, block_size = 0;
         int total_fg_pixels = 0;
         std::vector<FrameAnalysisObject> objects;
@@ -87,6 +88,18 @@ public:
     // coords) in effect at event time is written into the meta json.
     void SetBedRegion(const std::vector<std::pair<int, int>>& points);
 
+    // Called from VisionSDK::SetConfig() each time the corresponding versioned
+    // config struct is set: keeps a last-known snapshot so it can be written
+    // into <event>.meta.json's "config" object at finalize time (what
+    // parameters were actually in effect when this decision was made).
+    // EventRecorder does not interpret these values itself. EventRecording_v1
+    // itself needs no separate setter: enabled_/pre_frames_/post_frames_
+    // already hold it (see Configure()).
+    void SetMotionConfig(const MotionEstimation_v1& c);
+    void SetObjectConfig(const ObjectExtraction_v1& c);
+    void SetFallConfig(const FallDetection_v3& c);
+    void SetImageConfig(const ImageRelated_v1& c);
+
     // True while a capture window is collecting its post frames. The glue
     // layer uses this to grab the background image only at the event start.
     bool IsCapturing() const { return capturing_.load(std::memory_order_relaxed); }
@@ -114,6 +127,14 @@ private:
         std::vector<uint8_t> bg_image;
         std::vector<FrameAnalysis> analysis;  // snapshots for the window
         std::vector<std::pair<int, int>> bed_region;  // polygon at event time
+        // Config snapshot at event time (see cfg_motion_ etc. below).
+        MotionEstimation_v1 cfg_motion;
+        ObjectExtraction_v1 cfg_object;
+        FallDetection_v3 cfg_fall;
+        ImageRelated_v1 cfg_image;
+        bool has_motion_cfg, has_object_cfg, has_fall_cfg, has_image_cfg;
+        bool event_recording_enabled;
+        int event_recording_pre_frames, event_recording_post_frames;
     };
 
     bool InitRing(int width, int height, int channels);
@@ -148,12 +169,31 @@ private:
     bool ring_ready_ = false;
     bool failed_ = false;
 
+    // Timestamp of the most recently pushed frame (write_seq_ - 1). Kept as a
+    // plain field rather than re-reading it back out of index_[] so OnEvent/
+    // TriggerSelfTest work identically whether or not the mmap ring exists
+    // (see EVENT_RECORDER_SKIP_RAW_STORAGE in event_recorder.cpp).
+    uint64_t last_frame_ts_ = 0;
+
     // RAM ring of per-frame analysis snapshots, same slot layout as the frame
     // ring (~1-2 MB total). Guarded by api_mtx_. Lost on restart (best effort).
     std::vector<FrameAnalysis> analysis_ring_;
 
     // Bed region polygon currently in effect (guarded by api_mtx_).
     std::vector<std::pair<int, int>> bed_region_;
+
+    // Last-known snapshot of each versioned config struct (guarded by
+    // api_mtx_), written into <event>.meta.json's "config" object. The
+    // has_*_cfg_ flags distinguish "never set" (field omitted from the JSON)
+    // from "set to its struct default".
+    MotionEstimation_v1 cfg_motion_{};
+    ObjectExtraction_v1 cfg_object_{};
+    FallDetection_v3 cfg_fall_{};
+    ImageRelated_v1 cfg_image_{};
+    bool has_motion_cfg_ = false;
+    bool has_object_cfg_ = false;
+    bool has_fall_cfg_ = false;
+    bool has_image_cfg_ = false;
 
     std::string base_dir_;           // /mnt/mmcblk1p1 or fallback
     std::string event_dir_;          // <base>/event_record
@@ -180,6 +220,26 @@ private:
     uint64_t copy_cursor_ = UINT64_MAX;
     uint64_t copy_last_ = 0;
     uint64_t dropped_frames_ = 0;
+
+    // --- async spooler thread (only used when EVENT_RECORDER_ASYNC_SPOOL=1;
+    // see event_recorder.cpp). Offloads the memcpy-into-the-mmap-ring plus
+    // msync/madvise off the caller's PushFrame thread onto this thread, so the
+    // kernel's dirty-page write throttling (balance_dirty_pages, which fires
+    // on the thread that dirties file-backed pages when the SD card can't
+    // absorb writes fast enough) stalls the spooler instead of the frame
+    // feeder. PushFrame then only does a RAM->RAM copy into spool_q_ and
+    // returns. Members are compiled unconditionally (unused when the flag is
+    // off, which is harmless) to keep the header free of the switch. ---
+    struct SpoolFrame {
+        uint64_t seq;
+        uint64_t timestamp;
+        std::vector<uint8_t> data;
+    };
+    void SpoolerLoop();
+    std::thread spooler_;
+    bool spooler_running_ = false;
+    std::deque<SpoolFrame> spool_q_;   // guarded by mtx_ (shared with writer)
+    uint64_t spooled_seq_ = 0;         // every seq < spooled_seq_ is now in the ring
 };
 
 } // namespace VisionSDK
