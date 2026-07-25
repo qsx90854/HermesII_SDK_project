@@ -66,7 +66,17 @@ const char* kRingFileName = "hermes_frame_ring.dat";
 const char* kLogFileName = "event_record.jsonl";
 const uint32_t kRingMagic = 0x48524731;        // "HRG1"
 const uint32_t kRingVersion = 2;               // v2: slot index gained process_time_us
-const uint32_t kMarginSlots = 64;              // extra slots protecting the copy window
+// Extra ring slots beyond the pre+1+post window, so frames arriving DURING a
+// finalize (which copies the ~230MB window out, ~19s on the board's async SD)
+// have somewhere to land instead of wrapping into and overwriting the window
+// still being copied -- overwrite protection drops them otherwise. Bumped
+// 64 -> 256 (2026-07-25): at ~7fps a 19s finalize sees ~130 new frames; 64
+// only buffered ~9s so ~40 got dropped (the ring_dropped_frames seen on the
+// board), which would surface as MISSING frames in a back-to-back second
+// event's recording. 256 (~37s buffer) covers a full finalize with headroom.
+// Cost: larger ring FILE on SD (~330MB vs 256MB); no extra RAM (resident set
+// is bounded by kResidentSlots).
+const uint32_t kMarginSlots = 256;             // extra slots protecting the copy window
 const size_t kPageSize = 4096;
 const uint64_t kInvalidSeq = UINT64_MAX;
 // madvise(DONTNEED) slots older than this.

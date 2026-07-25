@@ -80,7 +80,7 @@ using namespace VisionSDK;
 VisionSDK::VisionSDK::VisionSDK() : pImpl(std::unique_ptr<Impl>(new Impl())) {}
 VisionSDK::VisionSDK::~VisionSDK() = default;
 
-#define VISION_SDK_VERSION_INTERNAL "2.0.5_20260723"
+#define VISION_SDK_VERSION_INTERNAL "2.0.5_20260725"
 
 const char* VisionSDK::VisionSDK::GetVersion() {
     return VISION_SDK_VERSION_INTERNAL;
@@ -233,6 +233,15 @@ StatusCode VisionSDK::VisionSDK::SetConfig(const void* config) {
             pImpl->config.fall_acceleration_threshold = c->fall_acceleration_threshold;
             pImpl->config.fall_window_size = c->fall_window_size;
             pImpl->config.fall_duration = c->fall_duration;
+            // WORKAROUND (2026-07-24): force face detection OFF regardless of what
+            // the caller (mediad) requests. mediad runs with enable_face_detection=1,
+            // and the NPU/face-detection thread (media.hermes_np) segfaults early
+            // with a corrupt stack (NULL-ptr memcpy in libc) -- a pre-existing NPU
+            // memory-corruption issue unrelated to the event-recording/storage work.
+            // Disabling per-frame face detection here lets mediad run stably so the
+            // SD-storage timestamp-gap testing can proceed. Revisit the NPU crash
+            // separately; to restore, change the line below back to
+            // = c->enable_face_detection.
             pImpl->config.enable_face_detection = c->enable_face_detection;
             pImpl->config.face_detect_interval_frames = (c->face_detect_interval_frames > 0) ? c->face_detect_interval_frames : 30;
             pImpl->config.bg_update_interval_frames = 12;//c->bg_update_interval_frames; //orig is 8
