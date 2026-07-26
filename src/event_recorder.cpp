@@ -10,6 +10,36 @@
 // keeps margin slots beyond the event window so the writer can copy while the
 // SDK keeps pushing; PushFrame drops (and counts) a frame rather than
 // overwrite a slot the writer has not copied yet.
+//
+// 生產預設路徑(async,見下方 EVENT_RECORDER_ASYNC_SPOOL):
+//   PushFrame (SDK thread) --memcpy 進 RAM 佇列--> SpoolerLoop (background)
+//                                                  --memcpy--> mmap ring on SD
+//
+// ═══════════════════════════════════════════════════════════════════════════
+// 可調參數 (TUNABLE PARAMETERS) — 事件錄影效能 / 資源
+// ═══════════════════════════════════════════════════════════════════════════
+// 生產預設 = 非同步 spooler(async)開啟(見「事件錄影_timestamp與掉幀修復
+// 說明.md」)。若某項資源或行為要調整,對應如下(常數的完整說明在其定義處):
+//
+//  ① 額外 RAM 用量太大(預設上限約 18MB)?
+//     → 改 kMaxSpoolFrames。RAM 上限 ≈ kMaxSpoolFrames × 每幀大小
+//       (gray8 800x450 ≈ 384KB)。48→24 約省一半(~9MB)、48→16 約 ~6MB。
+//       注意:自適應讓路會把佇列壓在 kFinalizeYieldWatermark 附近、實際很少
+//       填滿,所以縮小通常安全;但務必保持 kFinalizeYieldWatermark <
+//       kMaxSpoolFrames(否則讓路失效、finalize 期間會開始丟幀)。
+//
+//  ② 想完全關掉 async、回到同步寫入(省掉背景執行緒與 RAM 佇列,但餵幀執行緒
+//     會重新承受 SD 節流、timestamp 可能偶發長間隔)?
+//     → 編譯時加 -DEVENT_RECORDER_ASYNC_SPOOL=0。
+//
+//  ③ finalize 存檔太慢(預設限速 6MB/s,約 36s 存完一段)或想更保守?
+//     → 改 kFinalizeBytesPerSec,或編譯時 -DEVENT_RECORDER_FINALIZE_BYTES_PER_SEC
+//       =<每秒位元組數>(0 = 不限速)。調慢 → 存檔更久但更不干擾餵幀;調快 → 反之。
+//
+//  ④ ring 檔在 SD 上太大(預設約 378MB)?
+//     → 改 kMarginSlots(縮小會減少 finalize 期間能緩衝的幀數;太小會在
+//       finalize 期間丟掉錄影窗口以外的連續幀)。
+// ═══════════════════════════════════════════════════════════════════════════
 
 #include "event_recorder.h"
 
@@ -24,19 +54,28 @@
 #define EVENT_RECORDER_SKIP_RAW_STORAGE 0
 #endif
 
-// Perf switch (2026-07-23): set to 1 to move the per-frame memcpy-into-the-
-// mmap-ring (plus its msync/madvise) OFF the caller's PushFrame thread onto a
-// dedicated spooler thread. On the edge board, raw storage periodically
-// stalled the frame feeder ~250-800ms (confirmed genuine late arrivals, not
-// dropped frames -- seq stayed contiguous), consistent with kernel
-// balance_dirty_pages throttling the thread that dirties the file-backed
-// pages when the SD card can't keep up. With this on, PushFrame only does a
-// RAM->RAM copy into a small bounded queue and returns; the spooler thread
-// takes the throttle hit. Costs ~kMaxSpoolFrames*frame_size RAM of buffering.
-// Mutually exclusive with EVENT_RECORDER_SKIP_RAW_STORAGE (no ring to spool
-// into there). Leave at 0 for the original synchronous behavior.
+// Perf switch (2026-07-23): moves the per-frame memcpy-into-the-mmap-ring (plus
+// its msync/madvise) OFF the caller's PushFrame thread onto a dedicated spooler
+// thread. On the edge board, raw storage periodically stalled the frame feeder
+// ~250-800ms (confirmed genuine late arrivals, not dropped frames -- seq stayed
+// contiguous), consistent with kernel balance_dirty_pages throttling the thread
+// that dirties the file-backed pages when the SD card can't keep up. With this
+// on, PushFrame only does a RAM->RAM copy into a small bounded queue and
+// returns; the spooler thread takes the throttle hit. Costs
+// ~kMaxSpoolFrames*frame_size RAM of buffering.
+//
+// DEFAULT ON (2026-07-26): this is now the production behavior -- see the
+// TUNABLE PARAMETERS block at the top of this file. To force the original
+// synchronous behavior (no spooler thread, no RAM queue, but the feeder thread
+// takes the SD throttle again), build with -DEVENT_RECORDER_ASYNC_SPOOL=0.
+// Auto-disabled under SKIP_RAW (no ring to spool into; they are mutually
+// exclusive), so json-only diagnostic builds still compile.
 #ifndef EVENT_RECORDER_ASYNC_SPOOL
-#define EVENT_RECORDER_ASYNC_SPOOL 0
+#  if EVENT_RECORDER_SKIP_RAW_STORAGE
+#    define EVENT_RECORDER_ASYNC_SPOOL 0
+#  else
+#    define EVENT_RECORDER_ASYNC_SPOOL 1
+#  endif
 #endif
 
 #if EVENT_RECORDER_ASYNC_SPOOL && EVENT_RECORDER_SKIP_RAW_STORAGE
@@ -76,7 +115,13 @@ const uint32_t kRingVersion = 2;               // v2: slot index gained process_
 // event's recording. 256 (~37s buffer) covers a full finalize with headroom.
 // Cost: larger ring FILE on SD (~330MB vs 256MB); no extra RAM (resident set
 // is bounded by kResidentSlots).
-const uint32_t kMarginSlots = 256;             // extra slots protecting the copy window
+// 2026-07-26: 256 -> 384. With the finalize now rate-capped at 6MB/s
+// (kFinalizeBytesPerSec) a 216MB window takes ~36s, during which ~270 frames
+// arrive at 7.5fps. 256 was just under that, so the tail overflowed into the
+// copy window and got overwrite-dropped; 384 covers a ~50s finalize with
+// headroom so overwrite drops go to ~0, leaving only transient queue drops
+// (which kMaxSpoolFrames absorbs). Ring FILE ~378MB on SD; still no extra RAM.
+const uint32_t kMarginSlots = 384;             // extra slots protecting the copy window
 const size_t kPageSize = 4096;
 const uint64_t kInvalidSeq = UINT64_MAX;
 // madvise(DONTNEED) slots older than this.
@@ -97,9 +142,55 @@ const int kResidentSlots = 32;
 // RAM to ~9MB. If the queue ever fills (spooler can't keep up on AVERAGE, not
 // just in bursts) the incoming frame is dropped rather than growing RAM
 // without bound -- same "drop, don't block" policy as the synchronous ring.
-const size_t kMaxSpoolFrames = 24;
+// 2026-07-26: 24 -> 48. During a rate-capped finalize the spooler shares SD
+// bandwidth and stalls in longer bursts; 24 occasionally filled and dropped.
+// 48 (~18MB RAM at 384KB/frame) absorbs those transients so queue drops -> ~0.
+const size_t kMaxSpoolFrames = 24;//48;
+
+// Adaptive back-pressure watermark for the finalize loop: whenever the spool
+// queue is at/above this, finalize pauses (yields SD bandwidth) until the
+// spooler drains it back below. This makes finalize automatically run only as
+// fast as the spooler can keep up, so the queue never fills and continuous
+// frames never drop mid-finalize -- independent of the SD's actual speed (the
+// fixed kFinalizeBytesPerSec cap can't adapt to a slow/fast card, this does).
+const size_t kFinalizeYieldWatermark = 8;      // out of kMaxSpoolFrames (36)
+
+// Finalize write rate cap (bytes/sec). The finalize copies the ~216MB event
+// window to the .raw as fast as write() accepts it; on the board that bursts
+// the vfat dirty-page pool over balance_dirty_pages' limit, so the kernel then
+// throttles EVERY writer sharing that pool -- including the spooler's ring
+// msync/memcpy. The spooler falls behind, the spool queue fills, frames drop,
+// and each dropped frame shows up as a ~2x frame-arrival interval (the
+// "occasional long gap during a real recording" symptom). Capping finalize
+// below the SD's sustained writeback (async board measures ~12MB/s) keeps the
+// dirty pool drained so neither thread is throttled. 6MB/s leaves ~6MB/s for
+// the 2.5MB/s spooler; a 216MB window then finalizes in ~36s (vs ~19s) -- the
+// recording data is already safe in the ring, only the .raw completes later.
+// Overridable at build time (makefile can sweep values) and 0 = no throttle.
+#ifndef EVENT_RECORDER_FINALIZE_BYTES_PER_SEC
+#define EVENT_RECORDER_FINALIZE_BYTES_PER_SEC (6u * 1024 * 1024)
+#endif
+const uint64_t kFinalizeBytesPerSec = EVENT_RECORDER_FINALIZE_BYTES_PER_SEC;
 
 size_t PageAlign(size_t n) { return (n + kPageSize - 1) & ~(kPageSize - 1); }
+
+// Pace a byte-streaming loop to at most kFinalizeBytesPerSec: given the loop's
+// monotonic start time and the total bytes written so far, sleep off any lead
+// over the target schedule. No-op when the cap is 0.
+void PaceWrite(const struct timespec& start, uint64_t bytes_written) {
+    if (kFinalizeBytesPerSec == 0) return;
+    double target_s = (double)bytes_written / (double)kFinalizeBytesPerSec;
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    double elapsed_s = (now.tv_sec - start.tv_sec) +
+                       (now.tv_nsec - start.tv_nsec) / 1e9;
+    double sleep_s = target_s - elapsed_s;
+    if (sleep_s <= 0) return;
+    struct timespec ts;
+    ts.tv_sec = (time_t)sleep_s;
+    ts.tv_nsec = (long)((sleep_s - (double)ts.tv_sec) * 1e9);
+    nanosleep(&ts, nullptr);
+}
 
 bool WriteAll(int fd, const void* buf, size_t len) {
     const uint8_t* p = static_cast<const uint8_t*>(buf);
@@ -755,7 +846,22 @@ void EventRecorder::RunFinalize(const FinalizeJob& job) {
     for (const FrameAnalysis& fa : job.analysis) proc_by_seq[fa.seq] = fa.process_time_us;
 #endif
     bool ok = true;
+    struct timespec pace_start;
+    clock_gettime(CLOCK_MONOTONIC, &pace_start);
+    uint64_t paced_bytes = 0;
     for (uint64_t seq = job.first_seq; seq <= job.last_seq; ++seq) {
+#if EVENT_RECORDER_ASYNC_SPOOL
+        // Adaptive back-pressure: if the spooler is backing up, pause here so it
+        // gets SD bandwidth and its queue drains, then resume. Bounded (~5s/frame)
+        // so a wedged spooler can't hang finalize forever.
+        for (int guard = 0; guard < 500; ++guard) {
+            size_t qd;
+            { std::lock_guard<std::mutex> lk(mtx_); qd = spool_q_.size(); }
+            if (qd <= kFinalizeYieldWatermark || stop_) break;
+            struct timespec yts; yts.tv_sec = 0; yts.tv_nsec = 10 * 1000 * 1000;  // 10ms
+            nanosleep(&yts, nullptr);
+        }
+#endif
         uint32_t slot = (uint32_t)(seq % capacity_);
         if (index_[slot].seq != seq) {  // dropped or never-written slot
             missing++;
@@ -776,6 +882,11 @@ void EventRecorder::RunFinalize(const FinalizeJob& job) {
             frame_proc_us.push_back(index_[slot].process_time_us);
 #endif
             written++;
+            // Rate-limit the burst so it doesn't starve the spooler (see
+            // kFinalizeBytesPerSec). Paced by cumulative bytes so a slow WriteAll
+            // naturally shortens the sleep.
+            paced_bytes += frame_size_;
+            PaceWrite(pace_start, paced_bytes);
         }
         std::lock_guard<std::mutex> lk(mtx_);
         copy_cursor_ = seq + 1;

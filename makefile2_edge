@@ -55,16 +55,22 @@ SDK_OBJS = $(SDK_SRCS:.cpp=.o)
 # 互相覆蓋。
 SDK_OBJS_NORECORD = $(filter-out src/event_recorder.o,$(SDK_OBJS)) src/event_recorder.norecord.o
 
-# 效能診斷用 SDK_OBJS 變體: event_recorder 帶 -DEVENT_RECORDER_ASYNC_SPOOL=1
-# 編譯(把每幀 memcpy 進 mmap ring 的動作搬到背景 spooler 執行緒,讓 SD 卡
-# dirty-page 寫入節流卡的是 spooler 而不是餵 frame 的主執行緒;見
-# src/event_recorder.cpp 開頭註解)。其餘物件檔跟正常編譯共用。
-SDK_OBJS_ASYNC = $(filter-out src/event_recorder.o,$(SDK_OBJS)) src/event_recorder.async.o
+# 註:async spooler(把每幀 memcpy 進 mmap ring 搬到背景執行緒)自 2026-07-26
+# 起已是 src/event_recorder.cpp 的「預設編譯行為」(見該檔開頭的可調參數註解),
+# 所以正常編出的 libHermesII_sdk.so 就是 async 生產版,不再需要獨立的
+# SDK_OBJS_ASYNC / *_async.so 變體。要臨時關掉 async 做 A/B,編譯時加
+# -DEVENT_RECORDER_ASYNC_SPOOL=0 即可,不必再維護第二套目標。
 
 # 目標檔案
 BUILD_DIR = build
 LIB_NAME = libHermesII_sdk.so
 LIB_TARGET = $(BUILD_DIR)/$(LIB_NAME)
+
+# 對外交付打包目錄: 內含標頭檔 + 生產版 libHermesII_sdk.so(正常編出的那顆,
+# 已含 async 生產行為 = 修好事件錄影 timestamp 長間隔 / finalize 掉幀,見
+# 「事件錄影_timestamp與掉幀修復說明.md」)。
+PACKAGE_DIR = $(BUILD_DIR)/package
+SDK_HEADER = include/HermesII_sdk.h
 STATIC_LIB_NAME = libHermesII_sdk.a
 STATIC_LIB_TARGET = $(BUILD_DIR)/$(STATIC_LIB_NAME)
 
@@ -77,16 +83,6 @@ LIB_NAME_NORECORD = libHermesII_sdk_norecord.so
 LIB_TARGET_NORECORD = $(BUILD_DIR)/$(LIB_NAME_NORECORD)
 STATIC_LIB_NAME_NORECORD = libHermesII_sdk_norecord.a
 STATIC_LIB_TARGET_NORECORD = $(BUILD_DIR)/$(STATIC_LIB_NAME_NORECORD)
-
-# 效能診斷用 .so/.a 變體: 事件錄影帶 -DEVENT_RECORDER_ASYNC_SPOOL=1(把 raw
-# frame 寫進 SD 卡的 memcpy 搬到背景 spooler 執行緒,不卡餵 frame 的主執行緒;
-# 見 src/event_recorder.cpp 開頭註解及 SDK_OBJS_ASYNC 定義)。一樣有存 raw,
-# 只是寫法不同。跟正常的 libHermesII_sdk.so 檔名不同,可以直接換掉你程式原本
-# 連結的那顆 .so 來 A/B 測試,不用改你的程式。
-LIB_NAME_ASYNC = libHermesII_sdk_async.so
-LIB_TARGET_ASYNC = $(BUILD_DIR)/$(LIB_NAME_ASYNC)
-STATIC_LIB_NAME_ASYNC = libHermesII_sdk_async.a
-STATIC_LIB_TARGET_ASYNC = $(BUILD_DIR)/$(STATIC_LIB_NAME_ASYNC)
 
 FALL_DEMO_TARGET = fall_demo_edge
 FALL_CALLBACK_TARGET = fall_callback_demo_edge
@@ -112,8 +108,10 @@ INI_READ_TEST_EDGE_TARGET = ini_read_test_edge
 # 快速測試用。故意不放進 all,不需要時直接不編即可。
 SDK_GRAY_TEST_EDGE_NORECORD_TARGET = sdk_gray_test_edge_norecord
 
+.PHONY: all clean package
+
 # 預設規則
-all: $(LIB_TARGET) $(STATIC_LIB_TARGET) $(FALL_DEMO_TARGET) $(FALL_CALLBACK_TARGET) $(SDK_DEMO_CODE_V1_TARGET) $(SDK_DEMO_CODE_V2_TARGET) $(SDK_DEMO_CODE_V2_SAVE_FALL_RESULT_TARGET) $(SDK_DEMO_TEST_ACCURACY_TARGET) $(STREAMING_DEMO_TARGET) $(FALL_ACCURACY_TEST_TARGET) $(SDK_DEMO_BG_TEST_TARGET) $(SDK_DEMO_LOOP_TEST_TARGET) $(SDK_ERRORLOG_VERIFIER_TARGET) $(SDK_GRAY_TEST_EDGE_TARGET) $(EVENT_REPLAY_VERIFY_EDGE_TARGET) $(SDK_GRAY_COUNT_FALLS_EDGE_TARGET) $(INI_READ_TEST_EDGE_TARGET)
+all: $(LIB_TARGET) $(STATIC_LIB_TARGET) $(FALL_DEMO_TARGET) $(FALL_CALLBACK_TARGET) $(SDK_DEMO_CODE_V1_TARGET) $(SDK_DEMO_CODE_V2_TARGET) $(SDK_DEMO_CODE_V2_SAVE_FALL_RESULT_TARGET) $(SDK_DEMO_TEST_ACCURACY_TARGET) $(STREAMING_DEMO_TARGET) $(FALL_ACCURACY_TEST_TARGET) $(SDK_DEMO_BG_TEST_TARGET) $(SDK_DEMO_LOOP_TEST_TARGET) $(SDK_ERRORLOG_VERIFIER_TARGET) $(SDK_GRAY_TEST_EDGE_TARGET) $(EVENT_REPLAY_VERIFY_EDGE_TARGET) $(SDK_GRAY_COUNT_FALLS_EDGE_TARGET) $(INI_READ_TEST_EDGE_TARGET) package
 
 # 建立 build 目錄
 $(BUILD_DIR):
@@ -136,14 +134,14 @@ $(LIB_TARGET_NORECORD): $(SDK_OBJS_NORECORD) | $(BUILD_DIR)
 $(STATIC_LIB_TARGET_NORECORD): $(SDK_OBJS_NORECORD) | $(BUILD_DIR)
 	$(AR) rcs $@ $(SDK_OBJS_NORECORD)
 
-# 效能診斷用 .so/.a: 事件錄影一樣有存 raw,但寫入 SD 卡的動作搬到背景 spooler
-# 執行緒(見上面 LIB_TARGET_ASYNC 註解)。直接把你程式原本連結的
-# libHermesII_sdk.so 換成這份就能測,不用改你的程式。
-$(LIB_TARGET_ASYNC): $(SDK_OBJS_ASYNC) | $(BUILD_DIR)
-	$(CXX) -shared -o $@ $(SDK_OBJS_ASYNC) $(LDFLAGS_NPU) -lpthread
-
-$(STATIC_LIB_TARGET_ASYNC): $(SDK_OBJS_ASYNC) | $(BUILD_DIR)
-	$(AR) rcs $@ $(SDK_OBJS_ASYNC)
+# 對外交付打包: 把標頭檔與生產版 .so 複製到 build/package/。$(LIB_TARGET) 就是
+# 正常編出的 libHermesII_sdk.so,已含 async 生產行為(見 src/event_recorder.cpp
+# 開頭可調參數註解)。build/package 在 BUILD_DIR 底下,make clean 會一併清除。
+package: $(LIB_TARGET) $(SDK_HEADER)
+	mkdir -p $(PACKAGE_DIR)
+	cp $(SDK_HEADER) $(PACKAGE_DIR)/
+	cp $(LIB_TARGET) $(PACKAGE_DIR)/$(LIB_NAME)
+	@echo "[package] $(PACKAGE_DIR)/: $(LIB_NAME)(生產版) + $(notdir $(SDK_HEADER))"
 
 # 編譯 Fall Demo
 $(FALL_DEMO_TARGET): examples/fall_demo.cpp $(STATIC_LIB_TARGET)
@@ -194,10 +192,6 @@ $(SDK_GRAY_TEST_EDGE_TARGET): examples/sdk_gray_test.cpp $(STATIC_LIB_TARGET)
 src/event_recorder.norecord.o: src/event_recorder.cpp
 	$(CXX) $(CXXFLAGS) -DEVENT_RECORDER_SKIP_RAW_STORAGE=1 -c $< -o $@
 
-# 效能診斷專用: event_recorder 帶 -DEVENT_RECORDER_ASYNC_SPOOL=1 編譯的物件檔
-src/event_recorder.async.o: src/event_recorder.cpp
-	$(CXX) $(CXXFLAGS) -DEVENT_RECORDER_ASYNC_SPOOL=1 -c $< -o $@
-
 # 效能診斷專用: sdk_gray_test_edge 的變體, 事件錄影只寫 json, 不寫 SD 卡
 # raw frame (見上面 SDK_GRAY_TEST_EDGE_NORECORD_TARGET 註解)。直接連結物件
 # 檔, 不建獨立的 .a/.so。
@@ -224,5 +218,4 @@ $(INI_READ_TEST_EDGE_TARGET): examples/ini_read_test.cpp
 clean:
 	rm -f $(SDK_OBJS) $(FALL_DEMO_TARGET) $(FALL_CALLBACK_TARGET) $(SDK_DEMO_CODE_V1_TARGET) $(SDK_DEMO_CODE_V2_TARGET) $(SDK_DEMO_TEST_ACCURACY_TARGET) $(STREAMING_DEMO_TARGET) $(FALL_ACCURACY_TEST_TARGET) $(SDK_DEMO_BG_TEST_TARGET) $(SDK_DEMO_CODE_V2_SAVE_FALL_RESULT_TARGET) $(SDK_DEMO_LOOP_TEST_TARGET) $(SDK_ERRORLOG_VERIFIER_TARGET) $(SDK_GRAY_TEST_EDGE_TARGET) $(EVENT_REPLAY_VERIFY_EDGE_TARGET) $(SDK_GRAY_COUNT_FALLS_EDGE_TARGET) $(INI_READ_TEST_EDGE_TARGET)
 	rm -f src/event_recorder.norecord.o $(SDK_GRAY_TEST_EDGE_NORECORD_TARGET)
-	rm -f src/event_recorder.async.o
 	rm -rf $(BUILD_DIR)
