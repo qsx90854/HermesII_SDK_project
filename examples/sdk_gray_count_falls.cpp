@@ -399,11 +399,25 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    // This tool is just a counter; it must not create its own event recording.
+    // Event recording: OFF for the plain PC counter and for the edge/SD build.
+    // In the PC analysis build (-DEVENT_RECORDER_PC_ANALYSIS=1, set by makefile2)
+    // we instead turn it on in whole-session sidecar mode, so a <input>.analysis.json
+    // (+ .meta.json) is written next to the input .gray for reviewing detection.
     VisionSDK::EventRecording_v1 recCfg;
     recCfg.header.type = VisionSDK::ConfigType::EventRecording_v1;
     recCfg.header.version = 1;
     recCfg.enable = false;
+#if EVENT_RECORDER_PC_ANALYSIS
+    // Sidecar base = input .gray path with the .gray suffix stripped (same stem
+    // as the .events.json this tool already writes). Must outlive SetConfig().
+    std::string pc_analysis_base = gray_path;
+    if (pc_analysis_base.size() >= 5 &&
+        pc_analysis_base.compare(pc_analysis_base.size() - 5, 5, ".gray") == 0) {
+        pc_analysis_base.erase(pc_analysis_base.size() - 5);
+    }
+    recCfg.enable = true;
+    recCfg.pc_output_base = pc_analysis_base.c_str();
+#endif
     sdk.SetConfig(&recCfg);
 
     sdk.SetConfig(&motionCfg);
@@ -510,6 +524,16 @@ int main(int argc, char** argv) {
     }
     fclose(fp);
     sdk.Release();
+
+    // Always rewrite the events JSON once at the end, even when no fall/bed-exit
+    // was detected. RewriteEventsFile is otherwise only called from inside the
+    // detection callback (see write_event), so a run that detects zero events
+    // would leave a STALE .events.json on disk (old content + old mtime),
+    // masquerading as this run's result. Writing here (idempotent -- same output
+    // as the last in-callback write when events did fire, an empty "events": []
+    // document when they did not) guarantees the file always reflects this run.
+    RewriteEventsFile(events_json_path, gray_path, width, height, channels,
+                      motionCfg.grid_cols, motionCfg.grid_rows, bed_pts, event_blocks);
 
     int fall_count = 0, bedexit_count = 0;
     for (const auto& ev : events) {

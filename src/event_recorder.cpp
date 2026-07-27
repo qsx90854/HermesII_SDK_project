@@ -282,7 +282,23 @@ void EventRecorder::Configure(bool enable, int pre_frames, int post_frames) {
     LogF("[EventRecorder] Configure: enable=%d pre_frames=%d post_frames=%d",
          (int)enable, pre_frames_, post_frames_);
 
+#if EVENT_RECORDER_PC_ANALYSIS
+    // PC analysis-sidecar mode: pure in-RAM whole-session collector. No ring
+    // file, no writer/spooler threads, no SD I/O -- everything is gathered
+    // synchronously on the SDK thread and flushed once at Shutdown().
+    return;
+#else
     if (enabled_) StartWriterLocked();
+#endif
+}
+
+void EventRecorder::SetPcOutputBase(const char* base) {
+#if EVENT_RECORDER_PC_ANALYSIS
+    std::lock_guard<std::mutex> api_lk(api_mtx_);
+    if (base) pc_output_base_ = base;
+#else
+    (void)base;   // edge/SD build: sidecar output is not compiled in
+#endif
 }
 
 void EventRecorder::StartWriterLocked() {
@@ -447,6 +463,15 @@ void EventRecorder::PushFrame(const Image& img) {
     if (shutdown_ || !enabled_ || failed_) return;
     if (!img.data || img.width <= 0 || img.height <= 0 || img.channels <= 0) return;
 
+#if EVENT_RECORDER_PC_ANALYSIS
+    // Whole-session collector: we never store frame pixels (the caller already
+    // owns the input .gray), only remember geometry + advance the frame counter
+    // so RecordFrameAnalysis/OnEvent can stamp the right frame index.
+    pc_w_ = img.width; pc_h_ = img.height; pc_ch_ = img.channels;
+    last_frame_ts_ = img.timestamp;
+    pc_seq_++;
+    return;
+#else
     if (!ring_ready_) {
         if (!InitRing(img.width, img.height, img.channels)) return;
         // Recorder is default-on: nobody may ever call Configure, so make
@@ -534,11 +559,22 @@ void EventRecorder::PushFrame(const Image& img) {
     if (capturing_ && (write_seq_ - 1) >= event_seq_ + (uint64_t)post_frames_) {
         QueueFinalize(true);
     }
+#endif // EVENT_RECORDER_PC_ANALYSIS
 }
 
 void EventRecorder::OnEvent(const VisionSDKEvent& event, std::vector<uint8_t>&& bg_image) {
     std::lock_guard<std::mutex> api_lk(api_mtx_);
-    if (shutdown_ || !enabled_ || failed_ || !ring_ready_ || write_seq_ == 0) return;
+    if (shutdown_ || !enabled_ || failed_) return;
+#if EVENT_RECORDER_PC_ANALYSIS
+    PcEvent pe;
+    pe.frame_index = event.frame_index;
+    pe.type = event.is_fall_detected ? "fall" : (event.is_bed_exit ? "bed_exit" : "unknown");
+    pe.confidence = event.confidence;
+    pc_events_.push_back(std::move(pe));
+    (void)bg_image;   // no background snapshot in sidecar mode
+    return;
+#else
+    if (!ring_ready_ || write_seq_ == 0) return;
 
     Trigger t;
     t.seq = write_seq_ - 1;                // frame currently being processed
@@ -568,6 +604,7 @@ void EventRecorder::OnEvent(const VisionSDKEvent& event, std::vector<uint8_t>&& 
     if (post_frames_ == 0) {
         QueueFinalize(true);
     }
+#endif // EVENT_RECORDER_PC_ANALYSIS
 }
 
 void EventRecorder::TriggerSelfTest(std::vector<uint8_t>&& bg_image) {
@@ -648,11 +685,18 @@ void EventRecorder::SetImageConfig(const ImageRelated_v1& c) {
 
 void EventRecorder::RecordFrameAnalysis(FrameAnalysis&& fa) {
     std::lock_guard<std::mutex> api_lk(api_mtx_);
-    if (shutdown_ || !enabled_ || failed_ || !ring_ready_ || write_seq_ == 0) return;
+    if (shutdown_ || !enabled_ || failed_) return;
+#if EVENT_RECORDER_PC_ANALYSIS
+    fa.seq = pc_seq_ > 0 ? pc_seq_ - 1 : 0;   // index of the frame just pushed
+    pc_frames_.push_back(std::move(fa));
+    return;
+#else
+    if (!ring_ready_ || write_seq_ == 0) return;
     if (!last_push_written_) return;   // last frame was dropped
     uint32_t slot = (uint32_t)((write_seq_ - 1) % capacity_);
     fa.seq = write_seq_ - 1;
     analysis_ring_[slot] = std::move(fa);
+#endif
 }
 
 void EventRecorder::QueueFinalize(bool complete) {
@@ -972,12 +1016,12 @@ void EventRecorder::RunFinalize(const FinalizeJob& job) {
                     AppendF(buf, "%s{\"id\":%d,\"cx\":%.2f,\"cy\":%.2f,"
                                  "\"dx\":%.2f,\"dy\":%.2f,\"strength\":%.2f,"
                                  "\"accel\":%.2f,\"pixels\":%d,\"safe_ratio\":%.3f,"
-                                 "\"dir_var\":%.3f,\"obs\":%d,\"blocks\":[",
+                                 "\"dir_var\":%.3f,\"obs\":%d,\"is_fall\":%d,\"blocks\":[",
                             o ? "," : "", ob.id, (double)ob.cx, (double)ob.cy,
                             (double)ob.dx, (double)ob.dy, (double)ob.strength,
                             (double)ob.acceleration, ob.pixel_count,
                             (double)ob.safe_area_ratio, (double)ob.direction_variance,
-                            ob.in_observation ? 1 : 0);
+                            ob.in_observation ? 1 : 0, ob.is_fall ? 1 : 0);
                     for (size_t b = 0; b < ob.blocks.size(); ++b) {
                         AppendF(buf, b ? ",%u" : "%u", (unsigned)ob.blocks[b]);
                     }
@@ -1278,6 +1322,13 @@ void EventRecorder::Shutdown() {
     // it, and once shutdown_ is set every later entry point is a no-op, so the
     // ring can never be unmapped under an in-flight memcpy.
     std::lock_guard<std::mutex> api_lk(api_mtx_);
+#if EVENT_RECORDER_PC_ANALYSIS
+    if (shutdown_) return;   // idempotent
+    shutdown_ = true;
+    WritePcAnalysis();
+    enabled_ = false;
+    return;
+#endif
     if (shutdown_ && !writer_running_ && !map_) return;   // idempotent
     shutdown_ = true;
 
@@ -1313,5 +1364,111 @@ void EventRecorder::Shutdown() {
     enabled_ = false;
     capturing_ = false;
 }
+
+#if EVENT_RECORDER_PC_ANALYSIS
+// Whole-session sidecar writer (PC accuracy-testing build only). Emits two files
+// next to the input .gray: <base>.analysis.json (header + every frame's detector
+// snapshot -- the same fields as the edge build's .analysis.jsonl, folded into a
+// single JSON document) and <base>.meta.json (geometry / bed / event list). Both
+// via tmp-file + rename, like the edge finalize path. Caller holds api_mtx_.
+void EventRecorder::WritePcAnalysis() {
+    if (pc_output_base_.empty()) {
+        LogF("[EventRecorder] PC analysis: no output base set, nothing written.");
+        return;
+    }
+
+    int gc = 0, gr = 0, bs = 0;
+    if (!pc_frames_.empty()) {
+        gc = pc_frames_.front().grid_cols;
+        gr = pc_frames_.front().grid_rows;
+        bs = pc_frames_.front().block_size;
+    }
+
+    // Shared JSON fragments: bed_points + events (used by both files).
+    std::string bed_js = "[";
+    for (size_t i = 0; i < bed_region_.size(); ++i) {
+        AppendF(bed_js, "%s[%d,%d]", i ? "," : "",
+                bed_region_[i].first, bed_region_[i].second);
+    }
+    bed_js += "]";
+
+    std::string ev_js = "[";
+    for (size_t i = 0; i < pc_events_.size(); ++i) {
+        AppendF(ev_js, "%s{\"frame_index\":%d,\"type\":\"%s\",\"confidence\":%.4f}",
+                i ? "," : "", pc_events_[i].frame_index,
+                pc_events_[i].type.c_str(), (double)pc_events_[i].confidence);
+    }
+    ev_js += "]";
+
+    auto write_file = [](const std::string& path, const std::string& body) -> bool {
+        std::string tmp = path + ".tmp";
+        int fd = open(tmp.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
+        if (fd < 0) return false;
+        bool ok = WriteAll(fd, body.data(), body.size());
+        if (ok) ok = (fsync(fd) == 0);
+        close(fd);
+        if (ok) ok = (rename(tmp.c_str(), path.c_str()) == 0);
+        if (!ok) unlink(tmp.c_str());
+        return ok;
+    };
+
+    // --- <base>.analysis.json ---
+    std::string a;
+    a.reserve(1 << 20);
+    AppendF(a, "{\n  \"width\": %d,\n  \"height\": %d,\n  \"channels\": %d,\n",
+            pc_w_, pc_h_, pc_ch_);
+    AppendF(a, "  \"grid_cols\": %d,\n  \"grid_rows\": %d,\n  \"block_size\": %d,\n",
+            gc, gr, bs);
+    // bed_js / ev_js can exceed AppendF's 512-byte buffer, so append directly.
+    a += "  \"bed_points\": "; a += bed_js; a += ",\n";
+    AppendF(a, "  \"total_frames\": %llu,\n", (unsigned long long)pc_frames_.size());
+    a += "  \"events\": "; a += ev_js; a += ",\n";
+    a += "  \"frames\": [\n";
+    for (size_t f = 0; f < pc_frames_.size(); ++f) {
+        const FrameAnalysis& fa = pc_frames_[f];
+        AppendF(a, "    {\"seq\":%llu,\"ts\":%llu,\"proc_us\":%u,\"total_fg\":%d,\"objects\":[",
+                (unsigned long long)fa.seq, (unsigned long long)fa.timestamp_ms,
+                fa.process_time_us, fa.total_fg_pixels);
+        for (size_t o = 0; o < fa.objects.size(); ++o) {
+            const FrameAnalysisObject& ob = fa.objects[o];
+            AppendF(a, "%s{\"id\":%d,\"cx\":%.2f,\"cy\":%.2f,\"dx\":%.2f,\"dy\":%.2f,"
+                       "\"strength\":%.2f,\"accel\":%.2f,\"pixels\":%d,\"safe_ratio\":%.3f,"
+                       "\"dir_var\":%.3f,\"obs\":%d,\"is_fall\":%d,\"blocks\":[",
+                    o ? "," : "", ob.id, (double)ob.cx, (double)ob.cy,
+                    (double)ob.dx, (double)ob.dy, (double)ob.strength,
+                    (double)ob.acceleration, ob.pixel_count,
+                    (double)ob.safe_area_ratio, (double)ob.direction_variance,
+                    ob.in_observation ? 1 : 0, ob.is_fall ? 1 : 0);
+            for (size_t b = 0; b < ob.blocks.size(); ++b) {
+                AppendF(a, b ? ",%u" : "%u", (unsigned)ob.blocks[b]);
+            }
+            a += "]}";
+        }
+        AppendF(a, "]}%s\n", (f + 1 < pc_frames_.size()) ? "," : "");
+    }
+    a += "  ]\n}\n";
+
+    std::string analysis_path = pc_output_base_ + ".analysis.json";
+    bool a_ok = write_file(analysis_path, a);
+
+    // --- <base>.meta.json (geometry / bed / event list) ---
+    std::string m;
+    AppendF(m, "{\n  \"width\": %d,\n  \"height\": %d,\n  \"channels\": %d,\n",
+            pc_w_, pc_h_, pc_ch_);
+    AppendF(m, "  \"grid_cols\": %d,\n  \"grid_rows\": %d,\n  \"block_size\": %d,\n",
+            gc, gr, bs);
+    m += "  \"bed_points\": "; m += bed_js; m += ",\n";
+    AppendF(m, "  \"total_frames\": %llu,\n", (unsigned long long)pc_frames_.size());
+    AppendF(m, "  \"analysis_file\": \"%s.analysis.json\",\n", pc_output_base_.c_str());
+    m += "  \"events\": "; m += ev_js; m += "\n}\n";
+
+    std::string meta_path = pc_output_base_ + ".meta.json";
+    bool m_ok = write_file(meta_path, m);
+
+    LogF("[EventRecorder] PC analysis written: %s (frames=%llu, events=%llu) [analysis:%s meta:%s]",
+         pc_output_base_.c_str(), (unsigned long long)pc_frames_.size(),
+         (unsigned long long)pc_events_.size(), a_ok ? "ok" : "FAIL", m_ok ? "ok" : "FAIL");
+}
+#endif // EVENT_RECORDER_PC_ANALYSIS
 
 } // namespace VisionSDK

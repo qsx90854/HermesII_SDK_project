@@ -155,6 +155,14 @@ struct EventRecording_v1 {
     bool enable = false;
     int pre_frames = 300;    // frames kept before the event
     int post_frames = 300;   // frames recorded after the event
+    // PC analysis-sidecar mode (only honored by builds compiled with
+    // -DEVENT_RECORDER_PC_ANALYSIS=1, i.e. makefile2 / the PC .so). When set,
+    // the whole-session per-frame analysis is written to
+    // <pc_output_base>.analysis.json (+ <pc_output_base>.meta.json), next to
+    // the input .gray, instead of recording per-event clips to the SD card.
+    // Ignored entirely by the edge/SD build (makefile2_edge). Not owned by the
+    // SDK: the caller must keep the string alive across SetConfig().
+    const char* pc_output_base = nullptr;
 };
 
 struct Image {
@@ -259,6 +267,7 @@ struct MotionObject {
     int matched_fg_obj_id = -1; // ID of the FullFrameObject used for perspective check
     float matched_fg_dist = -1.0f; // NEW: Squared distance to matched FG object
     bool is_in_observation_mode = false; // NEW: True if currently in Case 5 observation (or waiting)
+    bool is_fall_this_frame = false;     // NEW: True if THIS object is being reported as a fall this frame
 };
 
 

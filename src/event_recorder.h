@@ -42,6 +42,7 @@ public:
         float safe_area_ratio = 0;
         float direction_variance = 0;
         bool in_observation = false;       // Case5 observation phase
+        bool is_fall = false;              // this object is reported as a fall this frame
         std::vector<uint16_t> blocks;      // grid block indices of this object
     };
     struct FrameAnalysis {
@@ -107,6 +108,11 @@ public:
     // Flush in-flight capture (as partial), join writer thread, unmap ring.
     void Shutdown();
 
+    // PC analysis-sidecar mode only: set the output path stem. Files are written
+    // to <base>.analysis.json / <base>.meta.json at Shutdown(). No-op in the
+    // edge/SD build. Safe to call before or after Configure().
+    void SetPcOutputBase(const char* base);
+
 private:
     struct Trigger {
         uint64_t seq;
@@ -144,6 +150,18 @@ private:
     void WriterLoop();
     void RunFinalize(const FinalizeJob& job);
     void Fail(const std::string& why);
+
+#if EVENT_RECORDER_PC_ANALYSIS
+    // --- PC analysis-sidecar mode (whole-session, no ring/threads/SD) ---
+    // Populated synchronously on the SDK thread; flushed once at Shutdown().
+    void WritePcAnalysis();          // caller must hold api_mtx_
+    struct PcEvent { int frame_index; std::string type; float confidence; };
+    std::string pc_output_base_;                 // <input> (.gray stripped)
+    std::vector<FrameAnalysis> pc_frames_;       // every frame's analysis
+    std::vector<PcEvent> pc_events_;             // fall / bed_exit triggers
+    int pc_w_ = 0, pc_h_ = 0, pc_ch_ = 0;        // frame geometry (from PushFrame)
+    uint64_t pc_seq_ = 0;                        // count of frames pushed
+#endif
 
     // --- configuration (SDK thread only) ---
     // Default-on for field testing: an old binary running against the new .so

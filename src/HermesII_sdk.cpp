@@ -290,6 +290,7 @@ StatusCode VisionSDK::VisionSDK::SetConfig(const void* config) {
         }
         case ConfigType::EventRecording_v1: {
             const auto* c = static_cast<const EventRecording_v1*>(config);
+            pImpl->event_recorder.SetPcOutputBase(c->pc_output_base);
             pImpl->event_recorder.Configure(c->enable, c->pre_frames, c->post_frames);
             if (c->enable) Impl::EnsureInternalCallback(pImpl.get());
             // Recorder is independent of InternalConfig; nothing to merge.
@@ -520,6 +521,7 @@ StatusCode VisionSDK::VisionSDK::ProcessNextFrame() {
             ao.safe_area_ratio = o.safe_area_ratio;
             ao.direction_variance = o.direction_variance;
             ao.in_observation = o.is_in_observation_mode;
+            ao.is_fall = o.is_fall_this_frame;
             ao.blocks.reserve(o.blocks.size());
             for (int b : o.blocks) {
                 if (b >= 0 && b <= 65535) ao.blocks.push_back((uint16_t)b);

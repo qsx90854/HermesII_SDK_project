@@ -6672,8 +6672,42 @@ StatusCode FallDetector::Detect(const Image& frame, bool& is_fall)
                                            curr.id, med_area, med_ratio, med_h, cur_area);
                                     pImpl->LogTrace(curr.id, pImpl->frame_idx, "PROJ_REJECT", med_area, "Area Out of Range");
                                 }
+
+                                // --- High-and-narrow upright-person filter -----------------------
+                                // A candidate whose centroid sits high in the frame (the far / bed-
+                                // foot end, where perspective compresses a standing or bending person
+                                // into a fall-range projected area) AND whose projected shape is tall-
+                                // and-narrow (aspect W/H below ~0.55) is an upright person, not a flat
+                                // fallen body. Tuned 2026-07-27 against Bug_Video/Fall_17 data4~17:
+                                // both data4 false triggers evaluated to (centroid_row 3.9 / 4.2,
+                                // ratio 0.48); the only two REAL falls in that same high band --
+                                // data17 f409 (ratio 1.64) and data16 f565 (ratio 0.69) -- are wide/
+                                // flat and pass, and every other real fall in the set has centroid_row
+                                // >= 4.8 so the row gate never touches it. Net effect on that set:
+                                // removes data4's 2 FP at zero recall cost.
+                                if (is_fall_case5) {
+                                    const float kHighRowThresh = 4.5f;  // rows above this = upper/far region
+                                    const float kMinFlatRatio  = 0.55f; // require wide/flat shape up there
+                                    float obs_cy_grid = curr.centerY;   // grid-row centroid (0..grid_rows)
+                                    if (curr.matched_fg_obj_id != -1) {
+                                        for (const auto& f_obj : pImpl->full_frame_objects) {
+                                            if (f_obj.id == curr.matched_fg_obj_id) {
+                                                obs_cy_grid = f_obj.cy / ((float)frame.height / pImpl->config.grid_rows);
+                                                break;
+                                            }
+                                        }
+                                    } else if (state.last_fg_cx > 0) {
+                                        obs_cy_grid = state.last_fg_cy / ((float)frame.height / pImpl->config.grid_rows);
+                                    }
+                                    if (obs_cy_grid < kHighRowThresh && med_ratio > 0.001f && med_ratio < kMinFlatRatio) {
+                                        is_fall_case5 = false;
+                                        DEBUG_PRINT("[Case5_HighNarrow_REJECT] ID:%d Suppressed: upright person high in frame (cy_row:%.2f < %.2f, ratio:%.2f < %.2f)\n",
+                                               curr.id, obs_cy_grid, kHighRowThresh, med_ratio, kMinFlatRatio);
+                                        pImpl->LogTrace(curr.id, pImpl->frame_idx, "FILTER_HIGH_NARROW", med_ratio, "Tall-narrow high in frame");
+                                    }
+                                }
                             }
-                            
+
                             // For fallback if no homography, or just bridging old logic slightly
                             if (!pImpl->has_homography && !is_bed_event) {
                                 is_fall_case5 = true; // Fallback to pure momentum if no projection mapping
@@ -6934,22 +6968,24 @@ StatusCode FallDetector::Detect(const Image& frame, bool& is_fall)
                              DEBUG_PRINT("[NewLogic] ID %d Rejected: Leaving Scene\n", curr.id);
                              // continue;
                          } 
-                         else 
+                         else
                          {
                              // Trigger
                              DEBUG_PRINT("[NewLogic] FALL DETECTED ID %d Type: %s. StrTrend: High->Low. FGTrend: High->Low.\n", curr.id, fall_type.c_str());
                              detected_id = curr.id;
                              triggered_objects.push_back(curr.id);
                              warningMsg = fall_type;
+                             curr.is_fall_this_frame = true; // NEW: mark for event-recording analysis
                          }
-                    } 
-                    else 
+                    }
+                    else
                     {
                         // Trigger
                         DEBUG_PRINT("[NewLogic] FALL DETECTED ID %d Type: %s. StrTrend: High->Low. FGTrend: High->Low.\n", curr.id, fall_type.c_str());
                         detected_id = curr.id;
                         triggered_objects.push_back(curr.id);
                         warningMsg = fall_type;
+                        curr.is_fall_this_frame = true; // NEW: mark for event-recording analysis
                     }
                 } // END IF POTENTIAL FALL
             } // END IF RECENT_WINDOW > 0
@@ -7098,7 +7134,14 @@ StatusCode FallDetector::Detect(const Image& frame, bool& is_fall)
                         global_persistence_active = true;
                         persistent_case = st.last_case_num;
                         persistent_type = "Persistent_Fall_ID_" + std::to_string(pair.first);
-                        
+
+                        // Mark the (still-present) object as reported-fall this frame so
+                        // event-recording analysis (FrameAnalysisObject.is_fall) covers the
+                        // whole post-fall persistence window, not just the confirm frame.
+                        for (auto& mo : pImpl->current_objects) {
+                            if (mo.id == pair.first) { mo.is_fall_this_frame = true; break; }
+                        }
+
                         // Per-frame LogTrace for verification report consistency
                         pImpl->LogTrace(pair.first, pImpl->frame_idx, "DETECTED", st.fall_snapshot_mom, "Persistent Fall State");
                     }

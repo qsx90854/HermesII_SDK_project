@@ -22,6 +22,11 @@ CXXFLAGS += -I$(SDK_INCLUDE)/include -I$(SDK_INCLUDE)/drv_include
 CXXFLAGS += $(TARGET_ARCH)
 CXXFLAGS += -ffunction-sections -fno-aggressive-loop-optimizations
 CXXFLAGS += -DDISABLE_NPU
+# PC accuracy-testing build: event recording writes a whole-session
+# <input>.analysis.json (+ .meta.json) sidecar next to the input .gray instead
+# of recording per-event clips to the SD card. makefile2_edge does NOT set this,
+# so the board build keeps its normal SD-card event recording.
+CXXFLAGS += -DEVENT_RECORDER_PC_ANALYSIS=1
 
 # DEBUG: AddressSanitizer (找記憶體/堆疊寫壞用，除錯完記得移除)
 CXXFLAGS += -fsanitize=address -fno-omit-frame-pointer -g
