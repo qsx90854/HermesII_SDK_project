@@ -200,6 +200,16 @@ StatusCode VisionSDK::VisionSDK::SetConfig(const void* config) {
             pImpl->config.tracking_mode = c->tracking_mode;
             pImpl->config.tracking_ttl = c->tracking_ttl; // NEW
             if (pImpl->config.tracking_ttl <= 0) pImpl->config.tracking_ttl = 1000; // Force default if user passed 0
+            pImpl->config.merge_overlapping_enable = c->merge_overlapping_enable; // NEW
+            pImpl->config.merge_overlapping_iou = c->merge_overlapping_iou;       // NEW
+            pImpl->config.merge_tracked_enable = c->merge_tracked_enable;         // NEW 方案4
+            pImpl->config.merge_tracked_overlap = c->merge_tracked_overlap;       // NEW 方案4
+            pImpl->config.merge_tracked_max_dist = c->merge_tracked_max_dist;     // NEW 方案4 距離保護
+            pImpl->config.use_fg_area = c->use_fg_area;                           // NEW fg_area
+            pImpl->config.min_trigger_fg_area = c->min_trigger_fg_area;           // NEW fg_area
+            pImpl->config.still_lying_fg_area = c->still_lying_fg_area;           // NEW fg_area
+            pImpl->config.use_fg_area_trigger = c->use_fg_area_trigger;           // NEW fg_area trigger split
+            pImpl->config.enable_kalman_predict = c->enable_kalman_predict;       // NEW kalman predict fix
             pImpl->event_recorder.SetObjectConfig(*c);
             break;
         }
@@ -246,6 +256,8 @@ StatusCode VisionSDK::VisionSDK::SetConfig(const void* config) {
             pImpl->config.face_detect_interval_frames = (c->face_detect_interval_frames > 0) ? c->face_detect_interval_frames : 30;
             pImpl->config.bg_update_interval_frames = 12;//c->bg_update_interval_frames; //orig is 8
             pImpl->config.bg_update_alpha = 0.08;//c->bg_update_alpha; // orig is 0.1
+            pImpl->config.bg_protect_max_frames = c->bg_protect_max_frames; // NEW anti-ghost (honored from ini)
+            pImpl->config.bg_protect_min_fg = c->bg_protect_min_fg;         // NEW
             pImpl->config.enable_save_bg_mask = c->enable_save_bg_mask;
             pImpl->config.bg_init_start_frame = c->bg_init_start_frame;
             pImpl->config.bg_init_end_frame = c->bg_init_end_frame;
@@ -522,6 +534,8 @@ StatusCode VisionSDK::VisionSDK::ProcessNextFrame() {
             ao.direction_variance = o.direction_variance;
             ao.in_observation = o.is_in_observation_mode;
             ao.is_fall = o.is_fall_this_frame;
+            ao.fg_area = o.fg_area;
+            ao.is_coasting = o.is_coasting;
             ao.blocks.reserve(o.blocks.size());
             for (int b : o.blocks) {
                 if (b >= 0 && b <= 65535) ao.blocks.push_back((uint16_t)b);

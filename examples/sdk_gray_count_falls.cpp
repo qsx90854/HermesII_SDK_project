@@ -347,6 +347,16 @@ int main(int argc, char** argv) {
     objCfg.tracking_overlap_threshold = cfg.getFloat("Tracking.Tracking_Overlap_Threshold", 0.5f);
     objCfg.tracking_mode = cfg.getInt("Tracking.Tracking_Mode", 1);
     objCfg.tracking_ttl = cfg.getInt("Tracking.Tracking_TTL", 60);
+    objCfg.merge_overlapping_enable = (cfg.getInt("Object.Merge_Overlapping_Enable", 0) != 0);
+    objCfg.merge_overlapping_iou = cfg.getFloat("Object.Merge_Overlapping_IoU", 0.3f);
+    objCfg.merge_tracked_enable = (cfg.getInt("Object.Merge_Tracked_Enable", 0) != 0);
+    objCfg.merge_tracked_overlap = cfg.getFloat("Object.Merge_Tracked_Overlap", 0.3f);
+    objCfg.merge_tracked_max_dist = cfg.getFloat("Object.Merge_Tracked_Max_Dist", 0.0f);
+    objCfg.enable_kalman_predict = (cfg.getInt("Tracking.Enable_Kalman_Predict", 0) != 0);
+    objCfg.use_fg_area = (cfg.getInt("Object.Use_FG_Area", 0) != 0);
+    objCfg.min_trigger_fg_area = cfg.getInt("Object.Min_Trigger_FG_Area", 12000);
+    objCfg.still_lying_fg_area = cfg.getInt("Object.Still_Lying_FG_Area", 3000);
+    objCfg.use_fg_area_trigger = (cfg.getInt("Object.Use_FG_Area_Trigger", 0) != 0);
 
     VisionSDK::FallDetection_v3 fallCfg;
     fallCfg.header.type = VisionSDK::ConfigType::FallDetection_v3;
@@ -374,6 +384,8 @@ int main(int argc, char** argv) {
     fallCfg.bg_diff_threshold = cfg.getInt("FallDetect.BG_Diff_Threshold", 18);
     fallCfg.bg_update_interval_frames = cfg.getInt("FallDetect.BG_Update_Interval", 12);
     fallCfg.bg_update_alpha = cfg.getFloat("FallDetect.BG_Update_Alpha", 0.08f);
+    fallCfg.bg_protect_max_frames = cfg.getInt("FallDetect.BG_Protect_Max_Frames", 0);
+    fallCfg.bg_protect_min_fg = cfg.getInt("FallDetect.BG_Protect_Min_FG", 20);
     fallCfg.bed_update_alpha_multiplier = cfg.getFloat("FallDetect.Bed_Update_Alpha_Multiplier", 8.0f);
     fallCfg.enable_post_bed_exit_threshold = (cfg.getInt("FallDetect.Enable_Post_BedExit_Threshold", 1) != 0);
     fallCfg.post_bed_exit_threshold_multiplier = cfg.getFloat("FallDetect.Post_BedExit_Threshold_Multiplier", 0.7f);

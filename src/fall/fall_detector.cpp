@@ -1210,6 +1210,79 @@ private:
 //  Object Detection Logic (from C_V2.cpp)
 // ==================================================================================
 
+// In-frame merge of overlapping motion detections (方案1). Two detections whose
+// block bounding boxes overlap by >= min_iou are fused into one BEFORE tracking, so
+// a single person that the flood-fill split into 2+ blobs does not spawn 2+ track
+// IDs. Repeated passes handle chains (A~B~C). Centroid/momentum are recomputed from
+// the merged block set with the SAME formulas extractMotionObjects uses, so the fall
+// logic downstream sees one coherent object. No-op when disabled or min_iou<=0.
+static void mergeOverlappingObjects(std::vector<MotionObject>& objs, int grid_cols,
+                                    int grid_rows, float min_iou, int momentumCalcType)
+{
+    if (objs.size() < 2 || min_iou <= 0.0f) return;
+    auto bbox = [&](const MotionObject& o, int& mnr, int& mnc, int& mxr, int& mxc) {
+        mnr = grid_rows; mnc = grid_cols; mxr = -1; mxc = -1;
+        for (int b : o.blocks) {
+            int r = b / grid_cols, c = b % grid_cols;
+            mnr = std::min(mnr, r); mxr = std::max(mxr, r);
+            mnc = std::min(mnc, c); mxc = std::max(mxc, c);
+        }
+    };
+    bool merged_any = true;
+    while (merged_any) {
+        merged_any = false;
+        for (size_t i = 0; i < objs.size() && !merged_any; ++i) {
+            if (objs[i].blocks.empty()) continue;
+            int air, aic, axr, axc; bbox(objs[i], air, aic, axr, axc);
+            for (size_t j = i + 1; j < objs.size(); ++j) {
+                if (objs[j].blocks.empty()) continue;
+                int bir, bic, bxr, bxc; bbox(objs[j], bir, bic, bxr, bxc);
+                int ir = std::max(air, bir), ic = std::max(aic, bic);
+                int xr = std::min(axr, bxr), xc = std::min(axc, bxc);
+                if (xr < ir || xc < ic) continue;                 // bboxes disjoint
+                float inter = (float)(xr - ir + 1) * (float)(xc - ic + 1);
+                float areaA = (float)(axr - air + 1) * (float)(axc - aic + 1);
+                float areaB = (float)(bxr - bir + 1) * (float)(bxc - bic + 1);
+                float iou = inter / (areaA + areaB - inter);
+                if (iou < min_iou) continue;
+
+                MotionObject& a = objs[i];
+                MotionObject& b = objs[j];
+                a.blocks.insert(a.blocks.end(), b.blocks.begin(), b.blocks.end());
+                a.block_motion_vectors.insert(a.block_motion_vectors.end(),
+                        b.block_motion_vectors.begin(), b.block_motion_vectors.end());
+                a.pixel_count += b.pixel_count;
+                // Geometric center over ALL merged blocks (matches extractMotionObjects).
+                double sr = 0, sc = 0;
+                for (int blk : a.blocks) { sr += blk / grid_cols; sc += blk % grid_cols; }
+                a.centerX = (float)(sc / a.blocks.size());
+                a.centerY = (float)(sr / a.blocks.size());
+                // Momentum over motion blocks only (skip near-static), as in extraction.
+                double sdx = 0, sdy = 0; int mc = 0;
+                for (const auto& mv : a.block_motion_vectors) {
+                    if (std::abs((float)mv.dx) < 0.1f && std::abs((float)mv.dy) < 0.1f) continue;
+                    sdx += mv.dx; sdy += mv.dy; ++mc;
+                }
+                a.avgDx = mc ? (float)(sdx / mc) : 0.0f;
+                a.avgDy = mc ? (float)(sdy / mc) : 0.0f;
+                if (momentumCalcType == 1) {
+                    float peak = 0.0f;
+                    for (const auto& mv : a.block_motion_vectors) {
+                        float m = std::sqrt((float)mv.dx * mv.dx + (float)mv.dy * mv.dy);
+                        if (m > peak) peak = m;
+                    }
+                    a.strength = peak;
+                } else {
+                    a.strength = std::sqrt(a.avgDx * a.avgDx + a.avgDy * a.avgDy);
+                }
+                objs.erase(objs.begin() + j);
+                merged_any = true;
+                break;
+            }
+        }
+    }
+}
+
 std::vector<MotionObject> extractMotionObjects(
     const std::vector<MotionVector>& blocks,
     const std::vector<bool>& changed_mask,
@@ -2783,6 +2856,8 @@ public:
     std::vector<int32_t> bg_accumulator; // For accumulating frames during init
     int bg_accumulated_count = 0;
     bool background_initialized_externally = false; // NEW
+    std::vector<int> block_fg_scores_;    // NEW: per-block FG pixel count (mirrored for updateBackground)
+    std::vector<int> block_protect_ttl_;  // NEW: consecutive frames each block has been FG-protected
     
     void updateBackground(const ::Image& current, const InternalConfig& cfg, int frame_idx, const std::vector<MotionObject>& objects) {
         // DEBUG_PRINT("[Debug] updateBackground called for frame %d\n", frame_idx);
@@ -2842,6 +2917,31 @@ public:
                 if (b >= 0 && b < (int)is_fg_block.size()) {
                     is_fg_block[b] = true;
                     total_fg_blocks++;
+                }
+            }
+        }
+
+        // NEW anti-ghost: protection based on the FULL foreground coverage
+        // (block_fg_scores_), not just the shrinking motion blocks -- so a person who
+        // pauses stays protected and is not baked into the background. Bounded to
+        // bg_protect_max_frames CONSECUTIVE covered frames per block, after which the
+        // block is allowed to absorb (a permanently-static object still becomes BG).
+        // block_protect_ttl_ counts in real frames (incremented by the update interval).
+        if (cfg.bg_protect_max_frames > 0) {
+            int nblk = cfg.grid_cols * cfg.grid_rows;
+            if ((int)block_protect_ttl_.size() != nblk) block_protect_ttl_.assign(nblk, 0);
+            const int inc = (cfg.bg_update_interval_frames > 0) ? cfg.bg_update_interval_frames : 1;
+            for (int b = 0; b < nblk; ++b) {
+                bool fg_cov = (b < (int)block_fg_scores_.size() &&
+                               block_fg_scores_[b] >= cfg.bg_protect_min_fg);
+                if (fg_cov) {
+                    if (block_protect_ttl_[b] < cfg.bg_protect_max_frames) {
+                        is_fg_block[b] = true;          // still within grace window -> protect
+                        block_protect_ttl_[b] += inc;
+                    }
+                    // else: grace exhausted -> allow absorb (leave is_fg_block unchanged)
+                } else {
+                    block_protect_ttl_[b] = 0;          // coverage gone -> reset grace window
                 }
             }
         }
@@ -3489,8 +3589,12 @@ void TrackObjects(std::vector<MotionObject>& current, const std::vector<MotionOb
             for (auto& kv : kalmanFilters) {
                 trackIDs.push_back(kv.first);
                 KalmanFilter& kf = kv.second;
+                // Restore the predict step (advance by velocity + add process noise so
+                // the covariance/gain stay responsive). A refactor dropped this call,
+                // which made the filter freeze/lag and split continuing tracks.
+                if (config.enable_kalman_predict) kf.Predict();
                 float kx, ky;
-                kf.GetState(kx, ky); 
+                kf.GetState(kx, ky);
                 trackPositions.push_back({kx, ky});
                 //DEBUG_PRINT("[TrackDebug] TrackID %d (TTL %d) Pos (%.1f, %.1f)\n", kv.first, track_ttl[kv.first], kx, ky);
             }
@@ -4712,7 +4816,20 @@ StatusCode FallDetector::Detect(const Image& frame, bool& is_fall)
                                                       pImpl->config.object_extraction_threshold, 
                                                       pImpl->config.object_merge_radius,
                                                       pImpl->config.momentum_calc_type);
-                                                      
+
+        // 方案1: fuse same-frame overlapping detections before tracking (ini-gated).
+        if (pImpl->config.merge_overlapping_enable) {
+            size_t before = pImpl->current_objects.size();
+            mergeOverlappingObjects(pImpl->current_objects, pImpl->config.grid_cols,
+                                    pImpl->config.grid_rows, pImpl->config.merge_overlapping_iou,
+                                    pImpl->config.momentum_calc_type);
+            if (pImpl->current_objects.size() != before) {
+                DEBUG_PRINT("[MergeOverlap] frame %d: %zu -> %zu detections (IoU>=%.2f)\n",
+                       pImpl->frame_idx, before, pImpl->current_objects.size(),
+                       pImpl->config.merge_overlapping_iou);
+            }
+        }
+
         std::vector<int> expired_ids;
         // TRACKING
         TrackObjects(pImpl->current_objects, 
@@ -4867,7 +4984,21 @@ StatusCode FallDetector::Detect(const Image& frame, bool& is_fall)
              if(pImpl->persistent_object_blocks.count(id)) {
                  predObj.blocks = pImpl->persistent_object_blocks[id];
              }
-             
+
+             // Anchor the coasting centroid to its actual (stable) blocks instead of the
+             // Kalman prediction. With the predict step active, a lost track's predicted
+             // centroid extrapolates its velocity every frame and runs off-grid (data15:
+             // cy -> 24.6 on a 16-row grid), which then collapses the homography projection
+             // to a near-zero area. The blocks stay put, so their centroid is the correct,
+             // on-grid position. Paired with Enable_Kalman_Predict.
+             if (pImpl->config.enable_kalman_predict && !predObj.blocks.empty()) {
+                 float sc = 0.0f, sr = 0.0f;
+                 int gcx = pImpl->config.grid_cols;
+                 for (int b : predObj.blocks) { sc += b % gcx; sr += b / gcx; }
+                 predObj.centerX = sc / predObj.blocks.size();
+                 predObj.centerY = sr / predObj.blocks.size();
+             }
+
              // Only inject if it has blocks (history)
              if (!predObj.blocks.empty()) {
                   // Filter by State (Only inject if Falling/Observing or recently fell)
@@ -4876,12 +5007,17 @@ StatusCode FallDetector::Detect(const Image& frame, bool& is_fall)
                       const auto& s = pImpl->observation_states[id];
                       // If state exists, it implies we are observing or handling post-fall.
                       // Check frames_observed to be safe? Or just assumed active.
-                      should_inject = true; 
-                      
-                      // CRITICAL: Propagate observation flag to the predicted object!
-                      predObj.is_in_observation_mode = true; 
+                      should_inject = true;
 
-                      
+                      // Propagate observation flag ONLY when the state is genuinely active
+                      // (waiting-for-deceleration or in the observation window). A bare
+                      // observation_states[id] entry is created just by operator[] access,
+                      // so a coasted remnant (tiny 1-2 stale blocks, no motion) would
+                      // otherwise render as "in observation" (magenta) despite never
+                      // having triggered a real observation.
+                      predObj.is_in_observation_mode = (s.is_active || s.waiting_for_deceleration);
+
+
                   }
 
                   if (should_inject) {
@@ -4906,6 +5042,7 @@ StatusCode FallDetector::Detect(const Image& frame, bool& is_fall)
                           }
                       }
                       if (coast_bbox_ok) {
+                          predObj.is_coasting = true;   // mark as coasting remnant (for viz/inspection)
                           pImpl->current_objects.push_back(predObj);
                           DEBUG_PRINT("[FallDetector] Injected Coasting Object %d (Str: %.2f, Blocks: %zu)\n", id, predObj.strength, predObj.blocks.size());
                       }
@@ -5161,6 +5298,9 @@ StatusCode FallDetector::Detect(const Image& frame, bool& is_fall)
             // Still contribute to global count if it was a motion block
             if (pImpl->changed_mask[i]) global_fg_count += count;
         }
+
+        // Mirror per-block FG scores for updateBackground's anti-ghost protection.
+        pImpl->block_fg_scores_ = block_fg_scores;
 
         int diag_scanned = std::count(blocks_to_scan.begin(), blocks_to_scan.end(), true);
         // printf("[DIAG-PixelStats] blocks_to_scan=%d / %d\n", diag_scanned, grid_rows * grid_cols);
@@ -5550,6 +5690,113 @@ StatusCode FallDetector::Detect(const Image& frame, bool& is_fall)
             obj.pixel_count = count_pixels;
             obj.avg_brightness = (count_pixels > 0) ? (float)sum_brightness / count_pixels : 0.0f;
             } // end if(false) bypass
+        }
+
+        // === 方案4: merge overlapping TRACKED objects (post-association/coasting) ===
+        // Two tracked objects are fused (older ID survives) when they still share a
+        // large fraction of the smaller one's blocks, OR both centroids fall inside
+        // the same foreground blob (handles a person whose body split into 2 blobs).
+        // The survivor takes the STRONGER momentum so a fragment that lost its blocks
+        // to the other ID no longer reads a false "deceleration" and wrongly enters
+        // Case5 observation. Block-persistence itself is untouched -- we only stop the
+        // SAME person being represented by two competing IDs at once.
+        if (pImpl->config.merge_tracked_enable && pImpl->current_objects.size() >= 2) {
+            auto& cobjs = pImpl->current_objects;
+            const float ov_th = pImpl->config.merge_tracked_overlap;
+            const int gcm = pImpl->config.grid_cols;
+            const float pxw = (float)W / gcm, pxh = (float)H / pImpl->config.grid_rows;
+
+            std::vector<std::array<int,4>> fgb;   // FG pixel bboxes for criterion (b)
+            fgb.reserve(pImpl->full_frame_objects.size());
+            for (const auto& f : pImpl->full_frame_objects) {
+                int x0,y0,x1,y1; getObjectFeatureBoundingBox(f, W, H, x0, y0, x1, y1);
+                fgb.push_back({x0,y0,x1,y1});
+            }
+            auto fg_index = [&](float cx_g, float cy_g) -> int {
+                int px = (int)(cx_g * pxw), py = (int)(cy_g * pxh);
+                for (size_t k = 0; k < fgb.size(); ++k)
+                    if (px>=fgb[k][0] && px<=fgb[k][2] && py>=fgb[k][1] && py<=fgb[k][3]) return (int)k;
+                return -1;
+            };
+
+            bool did = true;
+            while (did) {
+                did = false;
+                for (size_t i = 0; i < cobjs.size() && !did; ++i) {
+                    for (size_t j = i + 1; j < cobjs.size(); ++j) {
+                        int shared = 0;
+                        for (int b : cobjs[j].blocks)
+                            if (std::find(cobjs[i].blocks.begin(), cobjs[i].blocks.end(), b) != cobjs[i].blocks.end()) ++shared;
+                        int smaller = (int)std::min(cobjs[i].blocks.size(), cobjs[j].blocks.size());
+                        bool merge_a = (smaller > 0 && (float)shared / smaller >= ov_th);
+                        int fi = fg_index(cobjs[i].centerX, cobjs[i].centerY);
+                        int fj = fg_index(cobjs[j].centerX, cobjs[j].centerY);
+                        bool merge_b = (fi >= 0 && fi == fj);
+                        // Distance guard: a big connected FG blob can span far-apart objects
+                        // (bed-head caregiver + something across the frame). Require the two
+                        // centroids to be within merge_tracked_max_dist before same-FG merging.
+                        if (merge_b && pImpl->config.merge_tracked_max_dist > 0.0f) {
+                            float ddx = cobjs[i].centerX - cobjs[j].centerX;
+                            float ddy = cobjs[i].centerY - cobjs[j].centerY;
+                            if (std::sqrt(ddx*ddx + ddy*ddy) > pImpl->config.merge_tracked_max_dist)
+                                merge_b = false;
+                        }
+                        if (!merge_a && !merge_b) continue;
+
+                        size_t a = (cobjs[i].id <= cobjs[j].id) ? i : j;  // older ID survives
+                        size_t d = (a == i) ? j : i;
+                        MotionObject& A = cobjs[a];
+                        MotionObject& B = cobjs[d];
+                        int deadId = B.id;
+                        for (size_t k = 0; k < B.blocks.size(); ++k) {
+                            if (std::find(A.blocks.begin(), A.blocks.end(), B.blocks[k]) == A.blocks.end()) {
+                                A.blocks.push_back(B.blocks[k]);
+                                if (k < B.block_motion_vectors.size()) A.block_motion_vectors.push_back(B.block_motion_vectors[k]);
+                            }
+                        }
+                        if (B.strength > A.strength) { A.strength = B.strength; A.avgDx = B.avgDx; A.avgDy = B.avgDy; }
+                        A.is_in_observation_mode = A.is_in_observation_mode || B.is_in_observation_mode;
+                        A.is_fall_this_frame = A.is_fall_this_frame || B.is_fall_this_frame;
+                        double sr = 0, sc = 0; A.pixel_count = 0;
+                        for (int blk : A.blocks) {
+                            sr += blk / gcm; sc += blk % gcm;
+                            if (blk >= 0 && blk < (int)block_fg_scores.size()) A.pixel_count += block_fg_scores[blk];
+                        }
+                        if (!A.blocks.empty()) { A.centerX = (float)(sc / A.blocks.size()); A.centerY = (float)(sr / A.blocks.size()); }
+                        pImpl->observation_states.erase(deadId);
+                        pImpl->track_ttl.erase(deadId);
+                        pImpl->kalmanFilters.erase(deadId);
+                        pImpl->persistent_object_blocks.erase(deadId);
+                        pImpl->persistent_object_blocks[A.id] = A.blocks;
+                        DEBUG_PRINT("[MergeTracked] f%d fused ID %d into %d (sharedRatio=%.2f sameFG=%d)\n",
+                               pImpl->frame_idx, deadId, A.id, smaller ? (float)shared/smaller : 0.0f, merge_b?1:0);
+                        cobjs.erase(cobjs.begin() + d);
+                        did = true;
+                        break;
+                    }
+                }
+            }
+        }
+        // === Populate fg_area: the actual pixel count of the foreground blob each
+        // object belongs to (whole-object FG), vs pixel_count = block-local FG only.
+        // An object is assigned to the full_frame_object whose pixel bbox contains
+        // its centroid; falls back to block-local pixel_count when none matches.
+        {
+            const int fgc = pImpl->config.grid_cols;
+            const float fpxw = (float)W / fgc, fpxh = (float)H / pImpl->config.grid_rows;
+            std::vector<std::array<int,4>> fbx; fbx.reserve(pImpl->full_frame_objects.size());
+            std::vector<int> farea; farea.reserve(pImpl->full_frame_objects.size());
+            for (const auto& f : pImpl->full_frame_objects) {
+                int x0,y0,x1,y1; getObjectFeatureBoundingBox(f, W, H, x0, y0, x1, y1);
+                fbx.push_back({x0,y0,x1,y1}); farea.push_back(f.area);
+            }
+            for (auto& o : pImpl->current_objects) {
+                int px = (int)(o.centerX * fpxw), py = (int)(o.centerY * fpxh);
+                int best = -1;
+                for (size_t k = 0; k < fbx.size(); ++k)
+                    if (px>=fbx[k][0] && px<=fbx[k][2] && py>=fbx[k][1] && py<=fbx[k][3]) { best=(int)k; break; }
+                o.fg_area = (best >= 0) ? farea[best] : o.pixel_count;
+            }
         }
     }//if bgdata
     }
@@ -5953,10 +6200,17 @@ StatusCode FallDetector::Detect(const Image& frame, bool& is_fall)
                     // min_trigger_pixel_area comment above. Applied only to a FRESH trigger
                     // (Scenario A/C below); an already-active wait/observation for this ID is
                     // untouched by a single small-area frame passing through here.
-                    bool suppress_trigger = (curr.pixel_count < min_trigger_pixel_area);
+                    // Area gate: block-local pixel_count (default) or whole-blob fg_area.
+                    // Uses its OWN toggle (use_fg_area_trigger), NOT the still-lying one, so
+                    // the trigger keeps rejecting tiny motion blips / inflated-fg_area remnants.
+                    int trig_area_metric = pImpl->config.use_fg_area_trigger ? curr.fg_area : curr.pixel_count;
+                    int trig_area_thresh = pImpl->config.use_fg_area_trigger ? pImpl->config.min_trigger_fg_area : min_trigger_pixel_area;
+                    bool suppress_trigger = (trig_area_metric < trig_area_thresh);
                     if (suppress_trigger) {
-                        DEBUG_PRINT("[Case5-AREA-REJECT] ID:%d peak_mom=%.2f but Area:%d < min %d, ignoring peak\n",
-                               curr.id, recent_mom_avg, curr.pixel_count, min_trigger_pixel_area);
+                        DEBUG_PRINT("[Case5-AREA-REJECT] ID:%d peak_mom=%.2f but %s:%d < min %d, ignoring peak\n",
+                               curr.id, recent_mom_avg,
+                               pImpl->config.use_fg_area ? "fg_area" : "pixel_count",
+                               trig_area_metric, trig_area_thresh);
                     }
 
                     // NEW: Edge Object Filter (REMOVED early suppression per USER request)
@@ -6871,7 +7125,9 @@ StatusCode FallDetector::Detect(const Image& frame, bool& is_fall)
                          // Force Fall Result for visualization
                          // REFINEMENT: Only persist if the object is still substantially visible on the ground (Head/Body projection)
                          // And avoid persisting if the object has likely stood up (Area shrink or Y move)
-                         bool still_lying = (curr.pixel_count > 1000); 
+                         bool still_lying = pImpl->config.use_fg_area
+                                            ? (curr.fg_area > pImpl->config.still_lying_fg_area)
+                                            : (curr.pixel_count > 1000);
                          
                          if (still_lying) {
                              potential_fall = true;

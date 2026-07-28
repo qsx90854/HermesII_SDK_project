@@ -52,6 +52,16 @@ struct InternalConfig {
     float object_extraction_threshold = 2.0f;
     int object_merge_radius = 3;
     int foreground_merge_radius = 1; // NEW: Separate pixel merge radius
+    bool merge_overlapping_enable = false; // NEW: fuse same-frame overlapping detections
+    float merge_overlapping_iou = 0.3f;    // NEW: min bbox IoU to fuse
+    bool merge_tracked_enable = false;     // NEW (方案4): fuse overlapping TRACKED objects
+    float merge_tracked_overlap = 0.3f;    // NEW: min shared-block ratio to fuse
+    float merge_tracked_max_dist = 0.0f;   // NEW: max centroid dist for same-FG merge (0=no limit)
+    bool use_fg_area = false;              // NEW: fg_area for the STILL-LYING gate
+    int min_trigger_fg_area = 12000;       // NEW: trigger gate threshold when use_fg_area_trigger
+    int still_lying_fg_area = 3000;        // NEW: still-lying gate when use_fg_area
+    bool use_fg_area_trigger = false;      // NEW: fg_area for the TRIGGER gate (default block-local)
+    bool enable_kalman_predict = false;    // NEW: restore Kalman Predict() (dropped in refactor)
     float tracking_overlap_threshold = 0.5f;
     int tracking_mode = 1; 
     int tracking_ttl = 1000; // NEW: Object persistence time in frames
@@ -73,6 +83,8 @@ struct InternalConfig {
     // Background Update
     int bg_update_interval_frames = 0;
     float bg_update_alpha = 0.0f;
+    int bg_protect_max_frames = 0;   // NEW: max consecutive frames a FG block is protected (0=off)
+    int bg_protect_min_fg = 20;      // NEW: min FG pixels in a block to count as covered
     bool enable_save_bg_mask = false;
     int bg_init_start_frame = 0;
     int bg_init_end_frame = 0;

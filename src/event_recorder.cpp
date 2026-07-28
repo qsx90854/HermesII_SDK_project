@@ -1016,12 +1016,12 @@ void EventRecorder::RunFinalize(const FinalizeJob& job) {
                     AppendF(buf, "%s{\"id\":%d,\"cx\":%.2f,\"cy\":%.2f,"
                                  "\"dx\":%.2f,\"dy\":%.2f,\"strength\":%.2f,"
                                  "\"accel\":%.2f,\"pixels\":%d,\"safe_ratio\":%.3f,"
-                                 "\"dir_var\":%.3f,\"obs\":%d,\"is_fall\":%d,\"blocks\":[",
+                                 "\"dir_var\":%.3f,\"obs\":%d,\"is_fall\":%d,\"fg_area\":%d,\"coasting\":%d,\"blocks\":[",
                             o ? "," : "", ob.id, (double)ob.cx, (double)ob.cy,
                             (double)ob.dx, (double)ob.dy, (double)ob.strength,
                             (double)ob.acceleration, ob.pixel_count,
                             (double)ob.safe_area_ratio, (double)ob.direction_variance,
-                            ob.in_observation ? 1 : 0, ob.is_fall ? 1 : 0);
+                            ob.in_observation ? 1 : 0, ob.is_fall ? 1 : 0, ob.fg_area, ob.is_coasting ? 1 : 0);
                     for (size_t b = 0; b < ob.blocks.size(); ++b) {
                         AppendF(buf, b ? ",%u" : "%u", (unsigned)ob.blocks[b]);
                     }
@@ -1433,12 +1433,12 @@ void EventRecorder::WritePcAnalysis() {
             const FrameAnalysisObject& ob = fa.objects[o];
             AppendF(a, "%s{\"id\":%d,\"cx\":%.2f,\"cy\":%.2f,\"dx\":%.2f,\"dy\":%.2f,"
                        "\"strength\":%.2f,\"accel\":%.2f,\"pixels\":%d,\"safe_ratio\":%.3f,"
-                       "\"dir_var\":%.3f,\"obs\":%d,\"is_fall\":%d,\"blocks\":[",
+                       "\"dir_var\":%.3f,\"obs\":%d,\"is_fall\":%d,\"fg_area\":%d,\"coasting\":%d,\"blocks\":[",
                     o ? "," : "", ob.id, (double)ob.cx, (double)ob.cy,
                     (double)ob.dx, (double)ob.dy, (double)ob.strength,
                     (double)ob.acceleration, ob.pixel_count,
                     (double)ob.safe_area_ratio, (double)ob.direction_variance,
-                    ob.in_observation ? 1 : 0, ob.is_fall ? 1 : 0);
+                    ob.in_observation ? 1 : 0, ob.is_fall ? 1 : 0, ob.fg_area, ob.is_coasting ? 1 : 0);
             for (size_t b = 0; b < ob.blocks.size(); ++b) {
                 AppendF(a, b ? ",%u" : "%u", (unsigned)ob.blocks[b]);
             }

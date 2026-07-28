@@ -51,8 +51,43 @@ struct ObjectExtraction_v1 {
     int object_merge_radius = 3;
     int foreground_merge_radius = 1; // NEW: Default 1 pixel merge
     float tracking_overlap_threshold = 0.0f;
-    int tracking_mode = 0; 
+    int tracking_mode = 0;
     int tracking_ttl = 60; // NEW
+    // NEW: In-frame overlapping-detection merge. When enabled, two motion
+    // detections in the SAME frame whose block bounding boxes overlap by at
+    // least merge_overlapping_iou (IoU) are fused into one BEFORE tracking, so
+    // a single person that fragments into 2+ blobs does not spawn 2+ IDs.
+    bool merge_overlapping_enable = false;
+    float merge_overlapping_iou = 0.3f;
+    // NEW (方案4): post-tracking merge of overlapping TRACKED objects. After
+    // association+coasting, two objects are fused (older ID kept) when they still
+    // share >= merge_tracked_overlap of the smaller one's blocks, OR both fall
+    // inside the same foreground blob. Fixes a person that fragments into 2 IDs
+    // (old coasting ID left in place + new ID) stealing momentum from each other.
+    bool merge_tracked_enable = false;
+    float merge_tracked_overlap = 0.3f;
+    // NEW: max centroid distance (grid units) for the same-foreground (criterion b)
+    // merge. Two objects in the same FG blob are fused only if also within this
+    // distance -- stops a big connected blob from merging things that are far
+    // apart (e.g. a bed-head caregiver + something across the frame). 0 = no limit.
+    float merge_tracked_max_dist = 0.0f;
+    // NEW: use whole-object foreground area (fg_area) instead of block-local
+    // pixel_count for the Case5 trigger-area gate and the still-lying persistence
+    // gate. fg_area is much larger (whole blob vs moving blocks), so its own
+    // thresholds are needed -- tune these. Default OFF = keep block-local behavior.
+    bool use_fg_area = false;          // fg_area for the STILL-LYING persistence gate
+    int min_trigger_fg_area = 12000;   // trigger-gate threshold when use_fg_area_trigger
+    int still_lying_fg_area = 3000;    // replaces the 1000 block-local still-lying gate
+    // The TRIGGER gate ("is the moving region big enough") is separate: it defaults to
+    // block-local pixel_count so a tiny 2-block remnant whose fg_area got inflated by a
+    // nearby blob can't open an observation. Turn this on to use fg_area there too.
+    bool use_fg_area_trigger = false;
+    // NEW: restore the Kalman Predict() step that a refactor dropped from mode-3/4
+    // tracking. Without it the filter's covariance collapses, its gain -> 0, and the
+    // "predicted" track position freezes/lags behind a moving object -> association
+    // fails and a continuing object spawns a new ID (see data14 id-split). Default
+    // OFF = current (buggy) behavior; the tuned baseline was set with it off.
+    bool enable_kalman_predict = false;
 };
 
 struct FallDetection_v1 {
@@ -96,6 +131,14 @@ struct FallDetection_v3 {
     // Background Update Params
     int bg_update_interval_frames = 0;
     float bg_update_alpha = 0.0f;
+    // NEW: anti-ghost background protection. A grid block covered by foreground is
+    // protected from BG absorption for up to bg_protect_max_frames CONSECUTIVE
+    // frames (so a person who pauses is not baked into the background and does not
+    // leave a ghost when they move on); after that it is allowed to absorb (so a
+    // genuinely static object still becomes background). 0 = disabled (old
+    // behavior: only shrinking motion blocks are protected).
+    int bg_protect_max_frames = 0;
+    int bg_protect_min_fg = 20;   // min foreground pixels in a block to count as covered
     float fall_acceleration_upper_threshold = 2.0f;
     float fall_acceleration_lower_threshold = -2.0f;
     float post_fall_distance_threshold = 10.0f;
@@ -268,6 +311,10 @@ struct MotionObject {
     float matched_fg_dist = -1.0f; // NEW: Squared distance to matched FG object
     bool is_in_observation_mode = false; // NEW: True if currently in Case 5 observation (or waiting)
     bool is_fall_this_frame = false;     // NEW: True if THIS object is being reported as a fall this frame
+    int fg_area = 0;                     // NEW: actual pixel count of the matched foreground blob
+                                         // (whole object), vs pixel_count = block-local FG only
+    bool is_coasting = false;            // NEW: this object is a coasting/predicted remnant this
+                                         // frame (kept alive by persistence, not a fresh detection)
 };
 
 

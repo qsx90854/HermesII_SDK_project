@@ -43,6 +43,8 @@ public:
         float direction_variance = 0;
         bool in_observation = false;       // Case5 observation phase
         bool is_fall = false;              // this object is reported as a fall this frame
+        int fg_area = 0;                   // whole-blob foreground pixel count (vs block-local pixel_count)
+        bool is_coasting = false;          // coasting/predicted remnant (kept alive, not fresh)
         std::vector<uint16_t> blocks;      // grid block indices of this object
     };
     struct FrameAnalysis {
