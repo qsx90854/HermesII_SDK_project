@@ -1,14 +1,21 @@
 // event_replay_verify.cpp
 //
 // Re-validates a SDK-generated event recording (see src/event_recorder.cpp):
-// feeds the exact frames from an evt_*.raw file back into a FRESH SDK
-// instance (same detection config as parameter.ini, same bed region and
-// background the SDK had at event time, both read from the recording's own
-// .meta.json / _bg.raw), and checks whether the SDK still detects the same
-// event type near the same position in the window.
+// feeds the exact frames from an evt_*.raw file back into a FRESH SDK instance
+// configured with the EXACT detection params that were in effect when the event
+// fired -- read from the recording's own .meta.json "config" snapshot (motion /
+// object / fall / image) -- plus the same bed region and the same background
+// (.meta.json / _bg.raw), then checks whether the SDK still detects the same
+// event type near the same position in the window. Because the config comes
+// from the recording itself, a matching SDK build should reproduce the event at
+// the same frame; a mismatch means the build (or its logic) changed.
+//
+// If the meta has no config snapshot (an older recording), it falls back to
+// building the config from parameter.ini (pass --ini=...).
 //
 // Usage:
 //   ./event_replay_verify <path/to/evt_..._fN.raw> [--ini=parameter.ini] [--tolerance=15]
+//   (--ini is only used as a fallback when the meta.json has no config snapshot)
 //
 // Exit code: 0 = re-detected near the original event position (or a
 // self-test recording, nothing to verify), 1 = usage/file error,
@@ -153,6 +160,23 @@ bool GetString(const std::string& js, const std::string& key, std::string& out, 
     return true;
 }
 
+// Extract the brace-delimited object value {…} for `key` into `out` (so its
+// fields can then be read in isolation with the getters above, from=0).
+// Returns false if the key is absent or its value is null (i.e. not an object).
+bool ExtractObject(const std::string& js, const std::string& key, std::string& out, size_t from = 0) {
+    size_t vp;
+    if (!FindValuePos(js, key, from, vp)) return false;
+    if (vp >= js.size() || js[vp] != '{') return false;   // null / non-object
+    int depth = 0;
+    size_t i = vp;
+    for (; i < js.size(); ++i) {
+        if (js[i] == '{') depth++;
+        else if (js[i] == '}') { depth--; if (depth == 0) { ++i; break; } }
+    }
+    out = js.substr(vp, i - vp);
+    return true;
+}
+
 // "bed_region": [[120,80],[680,90],...]
 std::vector<std::pair<int, int>> GetBedRegion(const std::string& js) {
     std::vector<std::pair<int, int>> pts;
@@ -249,16 +273,117 @@ struct ReplayEvent {
     float confidence;
 };
 
+// Populate the four detection-config structs from the meta.json "config" block
+// -- the snapshot the recorder saved of EXACTLY what SetConfig() had in effect
+// when the event fired (src/event_recorder.cpp writes it). Struct headers must
+// already be set by the caller; any field absent from an older meta keeps the
+// struct default. Returns true iff a snapshot containing fall_detection_v3 was
+// found; false means "this meta has no config snapshot, fall back to the ini".
+bool LoadConfigsFromMeta(const std::string& meta,
+                         VisionSDK::MotionEstimation_v1& m,
+                         VisionSDK::ObjectExtraction_v1& o,
+                         VisionSDK::FallDetection_v3& f,
+                         VisionSDK::ImageRelated_v1& img) {
+    using namespace metajson;
+    size_t cpos;
+    if (!FindValuePos(meta, "config", 0, cpos)) return false;  // no snapshot at all
+    std::string s;            // current sub-object
+    long long ll; double d; bool b; std::string str;
+
+    if (ExtractObject(meta, "motion_estimation_v1", s, cpos)) {
+        if (GetLongLong(s, "grid_cols", ll)) m.grid_cols = (int)ll;
+        if (GetLongLong(s, "grid_rows", ll)) m.grid_rows = (int)ll;
+        if (GetLongLong(s, "block_size", ll)) m.block_size = (int)ll;
+        if (GetLongLong(s, "search_range", ll)) m.search_range = (int)ll;
+        if (GetLongLong(s, "history_size", ll)) m.history_size = (int)ll;
+        if (GetLongLong(s, "search_mode", ll)) m.search_mode = (int)ll;
+        if (GetDouble(s, "block_change_threshold", d)) m.block_change_threshold = d;
+        if (GetBool(s, "enable_block_decay", b)) m.enable_block_decay = b;
+        if (GetLongLong(s, "block_decay_frames", ll)) m.block_decay_frames = (int)ll;
+        if (GetBool(s, "enable_block_dilation", b)) m.enable_block_dilation = b;
+        if (GetLongLong(s, "block_dilation_threshold", ll)) m.block_dilation_threshold = (int)ll;
+    }
+
+    if (ExtractObject(meta, "object_extraction_v1", s, cpos)) {
+        if (GetDouble(s, "object_extraction_threshold", d)) o.object_extraction_threshold = (float)d;
+        if (GetLongLong(s, "object_merge_radius", ll)) o.object_merge_radius = (int)ll;
+        if (GetLongLong(s, "foreground_merge_radius", ll)) o.foreground_merge_radius = (int)ll;
+        if (GetDouble(s, "tracking_overlap_threshold", d)) o.tracking_overlap_threshold = (float)d;
+        if (GetLongLong(s, "tracking_mode", ll)) o.tracking_mode = (int)ll;
+        if (GetLongLong(s, "tracking_ttl", ll)) o.tracking_ttl = (int)ll;
+        if (GetBool(s, "merge_overlapping_enable", b)) o.merge_overlapping_enable = b;
+        if (GetDouble(s, "merge_overlapping_iou", d)) o.merge_overlapping_iou = (float)d;
+        if (GetBool(s, "merge_tracked_enable", b)) o.merge_tracked_enable = b;
+        if (GetDouble(s, "merge_tracked_overlap", d)) o.merge_tracked_overlap = (float)d;
+        if (GetDouble(s, "merge_tracked_max_dist", d)) o.merge_tracked_max_dist = (float)d;
+        if (GetBool(s, "use_fg_area", b)) o.use_fg_area = b;
+        if (GetLongLong(s, "min_trigger_fg_area", ll)) o.min_trigger_fg_area = (int)ll;
+        if (GetLongLong(s, "still_lying_fg_area", ll)) o.still_lying_fg_area = (int)ll;
+        if (GetBool(s, "use_fg_area_trigger", b)) o.use_fg_area_trigger = b;
+        if (GetBool(s, "enable_kalman_predict", b)) o.enable_kalman_predict = b;
+    }
+
+    bool have_fall = ExtractObject(meta, "fall_detection_v3", s, cpos);
+    if (have_fall) {
+        if (GetDouble(s, "fall_movement_threshold", d)) f.fall_movement_threshold = (float)d;
+        if (GetDouble(s, "fall_strong_threshold", d)) f.fall_strong_threshold = (float)d;
+        if (GetDouble(s, "safe_area_ratio_threshold", d)) f.safe_area_ratio_threshold = (float)d;
+        if (GetDouble(s, "fall_acceleration_threshold", d)) f.fall_acceleration_threshold = (float)d;
+        if (GetLongLong(s, "fall_window_size", ll)) f.fall_window_size = (int)ll;
+        if (GetLongLong(s, "fall_duration", ll)) f.fall_duration = (int)ll;
+        if (GetBool(s, "enable_face_detection", b)) f.enable_face_detection = b;
+        if (GetLongLong(s, "face_detect_interval_frames", ll)) f.face_detect_interval_frames = (int)ll;
+        if (GetBool(s, "enable_save_bg_mask", b)) f.enable_save_bg_mask = b;
+        if (GetLongLong(s, "bg_init_start_frame", ll)) f.bg_init_start_frame = (int)ll;
+        if (GetLongLong(s, "bg_init_end_frame", ll)) f.bg_init_end_frame = (int)ll;
+        if (GetLongLong(s, "bg_diff_threshold", ll)) f.bg_diff_threshold = (int)ll;
+        if (GetLongLong(s, "bg_update_interval_frames", ll)) f.bg_update_interval_frames = (int)ll;
+        if (GetDouble(s, "bg_update_alpha", d)) f.bg_update_alpha = (float)d;
+        if (GetLongLong(s, "bg_protect_max_frames", ll)) f.bg_protect_max_frames = (int)ll;
+        if (GetLongLong(s, "bg_protect_min_fg", ll)) f.bg_protect_min_fg = (int)ll;
+        if (GetDouble(s, "fall_acceleration_upper_threshold", d)) f.fall_acceleration_upper_threshold = (float)d;
+        if (GetDouble(s, "fall_acceleration_lower_threshold", d)) f.fall_acceleration_lower_threshold = (float)d;
+        if (GetDouble(s, "post_fall_distance_threshold", d)) f.post_fall_distance_threshold = (float)d;
+        if (GetLongLong(s, "post_fall_check_frames", ll)) f.post_fall_check_frames = (int)ll;
+        if (GetBool(s, "enable_bed_exit_verification", b)) f.enable_bed_exit_verification = b;
+        if (GetBool(s, "enable_block_shrink_verification", b)) f.enable_block_shrink_verification = b;
+        if (GetDouble(s, "bed_update_alpha_multiplier", d)) f.bed_update_alpha_multiplier = (float)d;
+        if (GetLongLong(s, "opt_flow_frame_distance", ll)) f.opt_flow_frame_distance = (int)ll;
+        if (GetLongLong(s, "perspective_point_x", ll)) f.perspective_point_x = (int)ll;
+        if (GetLongLong(s, "perspective_point_y", ll)) f.perspective_point_y = (int)ll;
+        if (GetLongLong(s, "min_trigger_area", ll)) f.min_trigger_area = (int)ll;
+        if (GetDouble(s, "bed_pixel_ratio_threshold", d)) f.bed_pixel_ratio_threshold = (float)d;
+        if (GetLongLong(s, "momentum_calc_type", ll)) f.momentum_calc_type = (int)ll;
+        if (GetBool(s, "enable_post_bed_exit_threshold", b)) f.enable_post_bed_exit_threshold = b;
+        if (GetDouble(s, "post_bed_exit_threshold_multiplier", d)) f.post_bed_exit_threshold_multiplier = (float)d;
+        if (GetBool(s, "projection_use_foreground", b)) f.projection_use_foreground = b;
+        if (GetBool(s, "enable_edge_drop_filter", b)) f.enable_edge_drop_filter = b;
+        if (GetBool(s, "enable_fall_and_bed_exit", b)) f.enable_fall_and_bed_exit = b;
+    }
+
+    if (ExtractObject(meta, "image_related_v1", s, cpos)) {
+        if (GetLongLong(s, "expected_frame_interval_ms", ll)) img.expected_frame_interval_ms = (int)ll;
+        if (GetLongLong(s, "frame_interval_tolerance_ms", ll)) img.frame_interval_tolerance_ms = (int)ll;
+        if (GetBool(s, "enable_draw_bg_noise", b)) img.enable_draw_bg_noise = b;
+        if (GetBool(s, "enable_save_images", b)) img.enable_save_images = b;
+        if (GetString(s, "save_image_path", str)) img.save_image_path = str;
+    }
+    return have_fall;
+}
+
 int main(int argc, char** argv) {
     if (argc < 2) {
         std::cerr << "Usage: " << argv[0]
                   << " <path/to/evt_..._fN.raw> [--ini=parameter.ini] [--tolerance=15]\n"
                      "\n"
                      "Replays a SDK EventRecorder recording through a fresh SDK instance\n"
-                     "(same parameter.ini config, same bed region / background seeded from\n"
-                     "the recording) and checks whether the SDK still detects the event that\n"
-                     "was originally recorded. Use this to re-validate old event recordings\n"
-                     "against a new SDK build (e.g. after a detection logic fix).\n";
+                     "using the detection config recorded in the .meta.json snapshot (the\n"
+                     "exact params in effect at event time), same bed region / background\n"
+                     "seeded from the recording, and checks whether the SDK still detects the\n"
+                     "event at the same window position. Use this to re-validate recordings\n"
+                     "against a new SDK build (e.g. after a detection logic fix).\n"
+                     "  --ini=FILE     fallback config source if the meta has no snapshot\n"
+                     "  --tolerance=N  frame tolerance for the anchor match (default 15)\n";
         return 1;
     }
 
@@ -332,83 +457,107 @@ int main(int argc, char** argv) {
     std::cout << "Anchor (original): file position " << anchor_pos << ", type=" << anchor_type
               << ", confidence=" << triggers.front().confidence << "\n";
 
-    // --- Build detection config exactly like examples/sdk_gray_test.cpp ---
-    SimpleConfig cfg;
-    if (cfg.load(ini_path)) {
-        std::cout << "Loaded " << ini_path << " for detection config.\n";
-    } else {
-        std::cerr << "Warning: cannot open " << ini_path << ", using SDK defaults "
-                     "(may not match the config that produced this recording).\n";
-    }
-
+    // --- Detection config ---
+    // Prefer the meta.json "config" snapshot: the EXACT params SetConfig() had
+    // in effect when this event fired (recorded by src/event_recorder.cpp), so
+    // the replay reproduces the original run faithfully. Fall back to
+    // parameter.ini only for old recordings made before the snapshot existed.
     VisionSDK::MotionEstimation_v1 motionCfg;
     motionCfg.header.type = VisionSDK::ConfigType::MotionEstimation_v1;
     motionCfg.header.version = 1;
-    motionCfg.grid_cols = cfg.getInt("Motion.Grid_Cols", 12);
-    motionCfg.grid_rows = cfg.getInt("Motion.Grid_Rows", 16);
-    motionCfg.block_size = 16;
-    motionCfg.search_range = 24;
-    motionCfg.history_size = cfg.getInt("Motion.Diff_Check_Range", 5);
-    motionCfg.block_change_threshold = cfg.getFloat("Motion.Block_Difference_Ratio_Threshold", 0.03f);
-    motionCfg.search_mode = cfg.getInt("Motion.Search_Mode", 1);
-    motionCfg.enable_block_decay = (cfg.getInt("Motion.Enable_Block_Decay", 1) != 0);
-    motionCfg.block_decay_frames = cfg.getInt("Motion.Block_Decay_Frames", 3);
-    motionCfg.enable_block_dilation = (cfg.getInt("Motion.Enable_Block_Dilation", 1) != 0);
-    motionCfg.block_dilation_threshold = cfg.getInt("Motion.Block_Dilation_Threshold", 2);
-
     VisionSDK::ObjectExtraction_v1 objCfg;
     objCfg.header.type = VisionSDK::ConfigType::ObjectExtraction_v1;
-    objCfg.header.version = 1;
-    objCfg.object_merge_radius = cfg.getInt("Object.Block_Merge_Range", 3);
-    objCfg.foreground_merge_radius = cfg.getInt("Object.Foreground_Merge_Range", 1);
-    objCfg.object_extraction_threshold = 2.0f;
-    objCfg.tracking_overlap_threshold = cfg.getFloat("Tracking.Tracking_Overlap_Threshold", 0.5f);
-    objCfg.tracking_mode = cfg.getInt("Tracking.Tracking_Mode", 1);
-    objCfg.tracking_ttl = cfg.getInt("Tracking.Tracking_TTL", 60);
-
+    objCfg.header.version = 2;   // v2: this tool carries the appended fields (merge_*, use_fg_area,
+                                 // enable_kalman_predict, ...) from the meta snapshot; SetConfig only
+                                 // honors them for version>=2, so a v1 header would silently drop them.
     VisionSDK::FallDetection_v3 fallCfg;
     fallCfg.header.type = VisionSDK::ConfigType::FallDetection_v3;
-    fallCfg.header.version = 1;
-    fallCfg.fall_movement_threshold = cfg.getFloat("FallDetect.Fall_Detect_Minimum_Strength", 3.0f);
-    fallCfg.fall_strong_threshold = cfg.getFloat("FallDetect.Fall_Detect_Strong_Strength", 8.0f);
-    fallCfg.fall_acceleration_threshold = cfg.getFloat("FallDetect.Fall_Detect_Acceleration_Threshold", 5.0f);
-    fallCfg.fall_acceleration_upper_threshold = cfg.getFloat("FallDetect.Fall_Detect_Accel_Upper_Threshold", 6.0f);
-    fallCfg.fall_acceleration_lower_threshold = cfg.getFloat("FallDetect.Fall_Detect_Accel_Lower_Threshold", -4.0f);
-    fallCfg.bed_pixel_ratio_threshold = cfg.getFloat("FallDetect.Fall_Detect_Bed_Pixel_Ratio_Threshold", 0.15f);
-    fallCfg.safe_area_ratio_threshold = cfg.getFloat("FallDetect.Safe_Area_Ratio_Threshold", 0.5f);
-    fallCfg.fall_window_size = cfg.getInt("FallDetect.Fall_Detect_Frame_History_Length", 30);
-    fallCfg.fall_duration = cfg.getInt("FallDetect.Fall_Detect_Frame_History_Threshold", 5);
-    fallCfg.post_fall_distance_threshold = cfg.getFloat("FallDetect.Fall_Detect_Post_Fall_Distance_Threshold", 4.0f);
-    fallCfg.post_fall_check_frames = cfg.getInt("FallDetect.Fall_Detect_Post_Fall_Check_Frames", 5);
-    fallCfg.momentum_calc_type = cfg.getInt("FallDetect.Fall_Detect_Momentum_Calc_Type", 1);
-    fallCfg.enable_face_detection = false; // Disable to avoid NPU crash or other issues
-    fallCfg.face_detect_interval_frames = cfg.getInt("FallDetect.Face_Detect_Interval_Frames", 8);
-    fallCfg.enable_edge_drop_filter = (cfg.getInt("FallDetect.Enable_Edge_Drop_Filter", 1) != 0);
-    fallCfg.enable_bed_exit_verification = true;
-    fallCfg.enable_block_shrink_verification = true;
-    fallCfg.enable_save_bg_mask = (cfg.getInt("FallDetect.Enable_Save_BG_Mask", 1) != 0);
-    fallCfg.bg_init_start_frame = cfg.getInt("FallDetect.BG_Init_Start_Frame", 2);
-    fallCfg.bg_init_end_frame = cfg.getInt("FallDetect.BG_Init_End_Frame", 5);
-    fallCfg.bg_diff_threshold = cfg.getInt("FallDetect.BG_Diff_Threshold", 18);
-    fallCfg.bg_update_interval_frames = cfg.getInt("FallDetect.BG_Update_Interval", 12);
-    fallCfg.bg_update_alpha = cfg.getFloat("FallDetect.BG_Update_Alpha", 0.08f);
-    fallCfg.bed_update_alpha_multiplier = cfg.getFloat("FallDetect.Bed_Update_Alpha_Multiplier", 8.0f);
-    fallCfg.enable_post_bed_exit_threshold = (cfg.getInt("FallDetect.Enable_Post_BedExit_Threshold", 1) != 0);
-    fallCfg.post_bed_exit_threshold_multiplier = cfg.getFloat("FallDetect.Post_BedExit_Threshold_Multiplier", 0.7f);
-    fallCfg.projection_use_foreground = (cfg.getInt("FallDetect.Projection_Use_Foreground", 0) != 0);
-    fallCfg.opt_flow_frame_distance = cfg.getInt("OpticalFlow.CompareFrameDistance", 2);
-    fallCfg.perspective_point_x = cfg.getInt("OpticalFlow.PerspectivePointX", 416);
-    fallCfg.perspective_point_y = cfg.getInt("OpticalFlow.PerspectivePointY", 474);
-    fallCfg.min_trigger_area = cfg.getInt("OpticalFlow.MinTriggerArea", 2000);
-    fallCfg.enable_fall_and_bed_exit = true;
-
+    fallCfg.header.version = 2;  // v2: carries bg_protect_* from the meta snapshot (see above).
     VisionSDK::ImageRelated_v1 imgCfg;
     imgCfg.header.type = VisionSDK::ConfigType::ImageRelated_v1;
     imgCfg.header.version = 1;
+
+    bool cfg_from_meta = LoadConfigsFromMeta(meta_json, motionCfg, objCfg, fallCfg, imgCfg);
+    if (cfg_from_meta) {
+        std::cout << "Detection config : loaded from meta.json config snapshot "
+                     "(faithful replay of the params in effect at event time).\n";
+    } else {
+        // No snapshot in this meta -> rebuild the config from parameter.ini,
+        // exactly like examples/sdk_gray_test.cpp does.
+        SimpleConfig cfg;
+        if (cfg.load(ini_path)) {
+            std::cout << "Detection config : meta has no config snapshot; loaded "
+                      << ini_path << " instead.\n";
+        } else {
+            std::cerr << "Warning: meta has no config snapshot AND cannot open " << ini_path
+                      << "; using SDK defaults (will likely not match the original run).\n";
+        }
+        motionCfg.grid_cols = cfg.getInt("Motion.Grid_Cols", 12);
+        motionCfg.grid_rows = cfg.getInt("Motion.Grid_Rows", 16);
+        motionCfg.block_size = 16;
+        motionCfg.search_range = 24;
+        motionCfg.history_size = cfg.getInt("Motion.Diff_Check_Range", 5);
+        motionCfg.block_change_threshold = cfg.getFloat("Motion.Block_Difference_Ratio_Threshold", 0.03f);
+        motionCfg.search_mode = cfg.getInt("Motion.Search_Mode", 1);
+        motionCfg.enable_block_decay = (cfg.getInt("Motion.Enable_Block_Decay", 1) != 0);
+        motionCfg.block_decay_frames = cfg.getInt("Motion.Block_Decay_Frames", 3);
+        motionCfg.enable_block_dilation = (cfg.getInt("Motion.Enable_Block_Dilation", 1) != 0);
+        motionCfg.block_dilation_threshold = cfg.getInt("Motion.Block_Dilation_Threshold", 2);
+
+        objCfg.object_merge_radius = cfg.getInt("Object.Block_Merge_Range", 3);
+        objCfg.foreground_merge_radius = cfg.getInt("Object.Foreground_Merge_Range", 1);
+        objCfg.object_extraction_threshold = 2.0f;
+        objCfg.tracking_overlap_threshold = cfg.getFloat("Tracking.Tracking_Overlap_Threshold", 0.5f);
+        objCfg.tracking_mode = cfg.getInt("Tracking.Tracking_Mode", 1);
+        objCfg.tracking_ttl = cfg.getInt("Tracking.Tracking_TTL", 60);
+
+        fallCfg.fall_movement_threshold = cfg.getFloat("FallDetect.Fall_Detect_Minimum_Strength", 3.0f);
+        fallCfg.fall_strong_threshold = cfg.getFloat("FallDetect.Fall_Detect_Strong_Strength", 8.0f);
+        fallCfg.fall_acceleration_threshold = cfg.getFloat("FallDetect.Fall_Detect_Acceleration_Threshold", 5.0f);
+        fallCfg.fall_acceleration_upper_threshold = cfg.getFloat("FallDetect.Fall_Detect_Accel_Upper_Threshold", 6.0f);
+        fallCfg.fall_acceleration_lower_threshold = cfg.getFloat("FallDetect.Fall_Detect_Accel_Lower_Threshold", -4.0f);
+        fallCfg.bed_pixel_ratio_threshold = cfg.getFloat("FallDetect.Fall_Detect_Bed_Pixel_Ratio_Threshold", 0.15f);
+        fallCfg.safe_area_ratio_threshold = cfg.getFloat("FallDetect.Safe_Area_Ratio_Threshold", 0.5f);
+        fallCfg.fall_window_size = cfg.getInt("FallDetect.Fall_Detect_Frame_History_Length", 30);
+        fallCfg.fall_duration = cfg.getInt("FallDetect.Fall_Detect_Frame_History_Threshold", 5);
+        fallCfg.post_fall_distance_threshold = cfg.getFloat("FallDetect.Fall_Detect_Post_Fall_Distance_Threshold", 4.0f);
+        fallCfg.post_fall_check_frames = cfg.getInt("FallDetect.Fall_Detect_Post_Fall_Check_Frames", 5);
+        fallCfg.momentum_calc_type = cfg.getInt("FallDetect.Fall_Detect_Momentum_Calc_Type", 1);
+        fallCfg.face_detect_interval_frames = cfg.getInt("FallDetect.Face_Detect_Interval_Frames", 8);
+        fallCfg.enable_edge_drop_filter = (cfg.getInt("FallDetect.Enable_Edge_Drop_Filter", 1) != 0);
+        fallCfg.enable_bed_exit_verification = true;
+        fallCfg.enable_block_shrink_verification = true;
+        fallCfg.enable_save_bg_mask = (cfg.getInt("FallDetect.Enable_Save_BG_Mask", 1) != 0);
+        fallCfg.bg_init_start_frame = cfg.getInt("FallDetect.BG_Init_Start_Frame", 2);
+        fallCfg.bg_init_end_frame = cfg.getInt("FallDetect.BG_Init_End_Frame", 5);
+        fallCfg.bg_diff_threshold = cfg.getInt("FallDetect.BG_Diff_Threshold", 18);
+        fallCfg.bg_update_interval_frames = cfg.getInt("FallDetect.BG_Update_Interval", 12);
+        fallCfg.bg_update_alpha = cfg.getFloat("FallDetect.BG_Update_Alpha", 0.08f);
+        fallCfg.bed_update_alpha_multiplier = cfg.getFloat("FallDetect.Bed_Update_Alpha_Multiplier", 8.0f);
+        fallCfg.enable_post_bed_exit_threshold = (cfg.getInt("FallDetect.Enable_Post_BedExit_Threshold", 1) != 0);
+        fallCfg.post_bed_exit_threshold_multiplier = cfg.getFloat("FallDetect.Post_BedExit_Threshold_Multiplier", 0.7f);
+        fallCfg.projection_use_foreground = (cfg.getInt("FallDetect.Projection_Use_Foreground", 0) != 0);
+        fallCfg.opt_flow_frame_distance = cfg.getInt("OpticalFlow.CompareFrameDistance", 2);
+        fallCfg.perspective_point_x = cfg.getInt("OpticalFlow.PerspectivePointX", 416);
+        fallCfg.perspective_point_y = cfg.getInt("OpticalFlow.PerspectivePointY", 474);
+        fallCfg.min_trigger_area = cfg.getInt("OpticalFlow.MinTriggerArea", 2000);
+        fallCfg.enable_fall_and_bed_exit = true;
+
+        imgCfg.enable_draw_bg_noise = false;
+        imgCfg.expected_frame_interval_ms = cfg.getInt("Validation.Expected_Frame_Interval", 33);
+        imgCfg.frame_interval_tolerance_ms = cfg.getInt("Validation.Frame_Interval_Tolerance", 10);
+    }
+
+    // Replay-safety overrides, regardless of where the config came from: never
+    // run face detection during replay (NPU segfaults on the board; no model on
+    // a plain PC) and never save images. Note it if the original run had face on.
+    if (fallCfg.enable_face_detection) {
+        std::cout << "Note: original run had face detection ON; forcing it OFF for replay "
+                     "stability (NPU). Fall timing is momentum-driven so the anchor rarely "
+                     "changes; edit this tool if you specifically need face-gated behavior.\n";
+        fallCfg.enable_face_detection = false;
+    }
     imgCfg.enable_save_images = false;
-    imgCfg.enable_draw_bg_noise = false;
-    imgCfg.expected_frame_interval_ms = cfg.getInt("Validation.Expected_Frame_Interval", 33);
-    imgCfg.frame_interval_tolerance_ms = cfg.getInt("Validation.Frame_Interval_Tolerance", 10);
 
     VisionSDK::VisionSDK sdk;
     if (sdk.Init("models/blaze_face_detect_nnp310_128x128.ty", 4) != VisionSDK::StatusCode::OK) {

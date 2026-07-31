@@ -75,19 +75,20 @@ struct ObjectExtraction_v1 {
     // pixel_count for the Case5 trigger-area gate and the still-lying persistence
     // gate. fg_area is much larger (whole blob vs moving blocks), so its own
     // thresholds are needed -- tune these. Default OFF = keep block-local behavior.
-    bool use_fg_area = false;          // fg_area for the STILL-LYING persistence gate
+    bool use_fg_area = true;           // fg_area for the STILL-LYING persistence gate (default ON)
     int min_trigger_fg_area = 12000;   // trigger-gate threshold when use_fg_area_trigger
-    int still_lying_fg_area = 3000;    // replaces the 1000 block-local still-lying gate
+    int still_lying_fg_area = 2000;    // replaces the 1000 block-local still-lying gate
     // The TRIGGER gate ("is the moving region big enough") is separate: it defaults to
     // block-local pixel_count so a tiny 2-block remnant whose fg_area got inflated by a
     // nearby blob can't open an observation. Turn this on to use fg_area there too.
     bool use_fg_area_trigger = false;
-    // NEW: restore the Kalman Predict() step that a refactor dropped from mode-3/4
-    // tracking. Without it the filter's covariance collapses, its gain -> 0, and the
-    // "predicted" track position freezes/lags behind a moving object -> association
-    // fails and a continuing object spawns a new ID (see data14 id-split). Default
-    // OFF = current (buggy) behavior; the tuned baseline was set with it off.
-    bool enable_kalman_predict = false;
+    // Restore the Kalman Predict() step that a refactor dropped from mode-3/4 tracking
+    // (+ anchor the coasting centroid to its blocks). Without it the filter's covariance
+    // collapses, its gain -> 0, and the "predicted" track position freezes/lags behind a
+    // moving object -> association fails and a continuing object spawns a new ID (data14
+    // id-split). Default ON: validated on data4~17 (95.8%/FP1 vs old 91.7%/FP2). Set
+    // false to revert to the old (pre-fix) tracking.
+    bool enable_kalman_predict = true;
 };
 
 struct FallDetection_v1 {
@@ -131,14 +132,6 @@ struct FallDetection_v3 {
     // Background Update Params
     int bg_update_interval_frames = 0;
     float bg_update_alpha = 0.0f;
-    // NEW: anti-ghost background protection. A grid block covered by foreground is
-    // protected from BG absorption for up to bg_protect_max_frames CONSECUTIVE
-    // frames (so a person who pauses is not baked into the background and does not
-    // leave a ghost when they move on); after that it is allowed to absorb (so a
-    // genuinely static object still becomes background). 0 = disabled (old
-    // behavior: only shrinking motion blocks are protected).
-    int bg_protect_max_frames = 0;
-    int bg_protect_min_fg = 20;   // min foreground pixels in a block to count as covered
     float fall_acceleration_upper_threshold = 2.0f;
     float fall_acceleration_lower_threshold = -2.0f;
     float post_fall_distance_threshold = 10.0f;
@@ -170,6 +163,13 @@ struct FallDetection_v3 {
     
     // NEW: Control fall & bed exit detection logic
     bool enable_fall_and_bed_exit = true;
+    // NEW: anti-ghost BG protection. APPENDED at the struct end (not inserted mid-
+    // struct) so existing field offsets stay ABI-compatible with older callers. A
+    // grid block covered by foreground is protected from BG absorption for up to
+    // bg_protect_max_frames consecutive frames; 0 = disabled. Only read from
+    // header.version >= 2 callers (see SetConfig).
+    int bg_protect_max_frames = 0;
+    int bg_protect_min_fg = 20;
 };
 
 struct BedExitDetection_v1 {
@@ -261,6 +261,7 @@ struct ObjectFeatures {
     float cx, cy;      // 重心
     float angle;       // 角度
     float major, minor;// 長短軸
+    int min_x = 0, min_y = 0, max_x = 0, max_y = 0;  // NEW: pixel bbox (precomputed at blob detection)
     std::vector<int> pixels; // 像素索引
     
     // NEW for Optical Flow

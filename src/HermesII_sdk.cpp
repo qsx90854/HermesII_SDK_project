@@ -10,6 +10,7 @@
 #include <chrono>
 #include <thread>
 #include <cstring>
+#include <cstddef>  // offsetof — for ABI-safe partial config copy (see SetConfig)
 
 // Note: Do not wrap entire file in namespace VisionSDK
 // to avoid "VisionSDK::VisionSDK::" confusion if using prefix.
@@ -80,7 +81,7 @@ using namespace VisionSDK;
 VisionSDK::VisionSDK::VisionSDK() : pImpl(std::unique_ptr<Impl>(new Impl())) {}
 VisionSDK::VisionSDK::~VisionSDK() = default;
 
-#define VISION_SDK_VERSION_INTERNAL "2.0.5_20260725"
+#define VISION_SDK_VERSION_INTERNAL "2.0.5_20260728"
 
 const char* VisionSDK::VisionSDK::GetVersion() {
     return VISION_SDK_VERSION_INTERNAL;
@@ -169,7 +170,10 @@ StatusCode VisionSDK::VisionSDK::SetConfig(const void* config) {
     // Use ConfigHeader to identify type and version
     const ConfigHeader* header = static_cast<const ConfigHeader*>(config);
     
-    if (header->version != 1) {
+    // v1 = original caller (e.g. old mediad); v2 = caller that also carries the
+    // appended new fields. Both are accepted; per-case reads gate the new fields
+    // on version >= 2 so a v1 caller never reads past its (shorter) struct.
+    if (header->version != 1 && header->version != 2) {
         std::cerr << "Error: Unsupported config version: " << header->version << std::endl;
         return StatusCode::ERROR_INVALID_INPUT;
     }
@@ -200,17 +204,35 @@ StatusCode VisionSDK::VisionSDK::SetConfig(const void* config) {
             pImpl->config.tracking_mode = c->tracking_mode;
             pImpl->config.tracking_ttl = c->tracking_ttl; // NEW
             if (pImpl->config.tracking_ttl <= 0) pImpl->config.tracking_ttl = 1000; // Force default if user passed 0
-            pImpl->config.merge_overlapping_enable = c->merge_overlapping_enable; // NEW
-            pImpl->config.merge_overlapping_iou = c->merge_overlapping_iou;       // NEW
-            pImpl->config.merge_tracked_enable = c->merge_tracked_enable;         // NEW 方案4
-            pImpl->config.merge_tracked_overlap = c->merge_tracked_overlap;       // NEW 方案4
-            pImpl->config.merge_tracked_max_dist = c->merge_tracked_max_dist;     // NEW 方案4 距離保護
-            pImpl->config.use_fg_area = c->use_fg_area;                           // NEW fg_area
-            pImpl->config.min_trigger_fg_area = c->min_trigger_fg_area;           // NEW fg_area
-            pImpl->config.still_lying_fg_area = c->still_lying_fg_area;           // NEW fg_area
-            pImpl->config.use_fg_area_trigger = c->use_fg_area_trigger;           // NEW fg_area trigger split
-            pImpl->config.enable_kalman_predict = c->enable_kalman_predict;       // NEW kalman predict fix
-            pImpl->event_recorder.SetObjectConfig(*c);
+            // Fields below were APPENDED to ObjectExtraction_v1. An older caller (compiled
+            // against the pre-append struct, header.version < 2) does not carry them, so
+            // reading c->... would read past its struct (garbage). Only read them from
+            // version>=2 callers; older callers keep the InternalConfig defaults.
+            if (c->header.version >= 2) {
+                pImpl->config.merge_overlapping_enable = c->merge_overlapping_enable;
+                pImpl->config.merge_overlapping_iou = c->merge_overlapping_iou;
+                pImpl->config.merge_tracked_enable = c->merge_tracked_enable;
+                pImpl->config.merge_tracked_overlap = c->merge_tracked_overlap;
+                pImpl->config.merge_tracked_max_dist = c->merge_tracked_max_dist;
+                pImpl->config.use_fg_area = c->use_fg_area;
+                pImpl->config.min_trigger_fg_area = c->min_trigger_fg_area;
+                pImpl->config.still_lying_fg_area = c->still_lying_fg_area;
+                pImpl->config.use_fg_area_trigger = c->use_fg_area_trigger;
+                pImpl->config.enable_kalman_predict = c->enable_kalman_predict;
+            }
+            // Hand the recorder something it can copy in full without over-reading.
+            // SetObjectConfig does `cfg_object_ = c`, a whole-struct copy; for a v1
+            // caller c ends before the appended fields, so copying *c would read past
+            // it. Build a full-size local, memcpy only the pre-append prefix (exactly
+            // the fields SetConfig already reads unconditionally above) from c, leave
+            // the appended tail at defaults, and pass that.
+            if (c->header.version >= 2) {
+                pImpl->event_recorder.SetObjectConfig(*c);
+            } else {
+                ObjectExtraction_v1 safe{};
+                std::memcpy(&safe, c, offsetof(ObjectExtraction_v1, merge_overlapping_enable));
+                pImpl->event_recorder.SetObjectConfig(safe);
+            }
             break;
         }
         case ConfigType::FallDetection_v1: {
@@ -256,8 +278,10 @@ StatusCode VisionSDK::VisionSDK::SetConfig(const void* config) {
             pImpl->config.face_detect_interval_frames = (c->face_detect_interval_frames > 0) ? c->face_detect_interval_frames : 30;
             pImpl->config.bg_update_interval_frames = 12;//c->bg_update_interval_frames; //orig is 8
             pImpl->config.bg_update_alpha = 0.08;//c->bg_update_alpha; // orig is 0.1
-            pImpl->config.bg_protect_max_frames = c->bg_protect_max_frames; // NEW anti-ghost (honored from ini)
-            pImpl->config.bg_protect_min_fg = c->bg_protect_min_fg;         // NEW
+            if (c->header.version >= 2) {   // appended fields: only read from new callers
+                pImpl->config.bg_protect_max_frames = c->bg_protect_max_frames;
+                pImpl->config.bg_protect_min_fg = c->bg_protect_min_fg;
+            }
             pImpl->config.enable_save_bg_mask = c->enable_save_bg_mask;
             pImpl->config.bg_init_start_frame = c->bg_init_start_frame;
             pImpl->config.bg_init_end_frame = c->bg_init_end_frame;
@@ -280,7 +304,15 @@ StatusCode VisionSDK::VisionSDK::SetConfig(const void* config) {
             pImpl->config.projection_use_foreground = c->projection_use_foreground;
             pImpl->config.enable_edge_drop_filter = c->enable_edge_drop_filter; // NEW
             pImpl->config.enable_fall_and_bed_exit = c->enable_fall_and_bed_exit; // NEW
-            pImpl->event_recorder.SetFallConfig(*c);
+            // Same ABI-safe copy as ObjectExtraction: bg_protect_* are appended, so a v1
+            // caller's struct ends at bg_protect_max_frames. Copy only the prefix.
+            if (c->header.version >= 2) {
+                pImpl->event_recorder.SetFallConfig(*c);
+            } else {
+                FallDetection_v3 safe{};
+                std::memcpy(&safe, c, offsetof(FallDetection_v3, bg_protect_max_frames));
+                pImpl->event_recorder.SetFallConfig(safe);
+            }
             break;
         }
         case ConfigType::BedExitDetection_v1: {
@@ -302,7 +334,8 @@ StatusCode VisionSDK::VisionSDK::SetConfig(const void* config) {
         }
         case ConfigType::EventRecording_v1: {
             const auto* c = static_cast<const EventRecording_v1*>(config);
-            pImpl->event_recorder.SetPcOutputBase(c->pc_output_base);
+            if (c->header.version >= 2)   // pc_output_base is appended; only read from new callers
+                pImpl->event_recorder.SetPcOutputBase(c->pc_output_base);
             pImpl->event_recorder.Configure(c->enable, c->pre_frames, c->post_frames);
             if (c->enable) Impl::EnsureInternalCallback(pImpl.get());
             // Recorder is independent of InternalConfig; nothing to merge.

@@ -340,7 +340,7 @@ int main(int argc, char** argv) {
 
     VisionSDK::ObjectExtraction_v1 objCfg;
     objCfg.header.type = VisionSDK::ConfigType::ObjectExtraction_v1;
-    objCfg.header.version = 1;
+    objCfg.header.version = 2;   // v2: carries appended Object.* new fields
     objCfg.object_merge_radius = cfg.getInt("Object.Block_Merge_Range", 3);
     objCfg.foreground_merge_radius = cfg.getInt("Object.Foreground_Merge_Range", 1);
     objCfg.object_extraction_threshold = 2.0f;
@@ -360,7 +360,7 @@ int main(int argc, char** argv) {
 
     VisionSDK::FallDetection_v3 fallCfg;
     fallCfg.header.type = VisionSDK::ConfigType::FallDetection_v3;
-    fallCfg.header.version = 1;
+    fallCfg.header.version = 2;  // v2: carries appended BG_Protect_* fields
     fallCfg.fall_movement_threshold = cfg.getFloat("FallDetect.Fall_Detect_Minimum_Strength", 3.0f);
     fallCfg.fall_strong_threshold = cfg.getFloat("FallDetect.Fall_Detect_Strong_Strength", 8.0f);
     fallCfg.fall_acceleration_threshold = cfg.getFloat("FallDetect.Fall_Detect_Acceleration_Threshold", 5.0f);
@@ -417,7 +417,7 @@ int main(int argc, char** argv) {
     // (+ .meta.json) is written next to the input .gray for reviewing detection.
     VisionSDK::EventRecording_v1 recCfg;
     recCfg.header.type = VisionSDK::ConfigType::EventRecording_v1;
-    recCfg.header.version = 1;
+    recCfg.header.version = 2;   // v2: carries appended pc_output_base
     recCfg.enable = false;
 #if EVENT_RECORDER_PC_ANALYSIS
     // Sidecar base = input .gray path with the .gray suffix stripped (same stem

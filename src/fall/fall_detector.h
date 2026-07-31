@@ -57,11 +57,11 @@ struct InternalConfig {
     bool merge_tracked_enable = false;     // NEW (方案4): fuse overlapping TRACKED objects
     float merge_tracked_overlap = 0.3f;    // NEW: min shared-block ratio to fuse
     float merge_tracked_max_dist = 0.0f;   // NEW: max centroid dist for same-FG merge (0=no limit)
-    bool use_fg_area = false;              // NEW: fg_area for the STILL-LYING gate
+    bool use_fg_area = true;               // NEW: fg_area for the STILL-LYING gate (default ON)
     int min_trigger_fg_area = 12000;       // NEW: trigger gate threshold when use_fg_area_trigger
-    int still_lying_fg_area = 3000;        // NEW: still-lying gate when use_fg_area
+    int still_lying_fg_area = 2000;        // NEW: still-lying gate when use_fg_area
     bool use_fg_area_trigger = false;      // NEW: fg_area for the TRIGGER gate (default block-local)
-    bool enable_kalman_predict = false;    // NEW: restore Kalman Predict() (dropped in refactor)
+    bool enable_kalman_predict = true;     // NEW: restore Kalman Predict() + coasting-block centroid (default ON)
     float tracking_overlap_threshold = 0.5f;
     int tracking_mode = 1; 
     int tracking_ttl = 1000; // NEW: Object persistence time in frames

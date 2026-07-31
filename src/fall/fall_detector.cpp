@@ -561,6 +561,8 @@ std::vector<::VisionSDK::ObjectFeatures> find_objects_optimized(const uint8_t* m
             obj.area = blob.count;
             obj.cx = (float)blob.sum_x / blob.count;
             obj.cy = (float)blob.sum_y / blob.count;
+            obj.min_x = blob.min_x; obj.min_y = blob.min_y;   // NEW: precomputed bbox
+            obj.max_x = blob.max_x; obj.max_y = blob.max_y;
             obj.major = 0.0f;
             obj.minor = 0.0f;
             obj.angle = 0.0f;
@@ -5706,16 +5708,12 @@ StatusCode FallDetector::Detect(const Image& frame, bool& is_fall)
             const int gcm = pImpl->config.grid_cols;
             const float pxw = (float)W / gcm, pxh = (float)H / pImpl->config.grid_rows;
 
-            std::vector<std::array<int,4>> fgb;   // FG pixel bboxes for criterion (b)
-            fgb.reserve(pImpl->full_frame_objects.size());
-            for (const auto& f : pImpl->full_frame_objects) {
-                int x0,y0,x1,y1; getObjectFeatureBoundingBox(f, W, H, x0, y0, x1, y1);
-                fgb.push_back({x0,y0,x1,y1});
-            }
             auto fg_index = [&](float cx_g, float cy_g) -> int {
                 int px = (int)(cx_g * pxw), py = (int)(cy_g * pxh);
-                for (size_t k = 0; k < fgb.size(); ++k)
-                    if (px>=fgb[k][0] && px<=fgb[k][2] && py>=fgb[k][1] && py<=fgb[k][3]) return (int)k;
+                for (size_t k = 0; k < pImpl->full_frame_objects.size(); ++k) {
+                    const auto& f = pImpl->full_frame_objects[k];   // bbox precomputed at blob detection
+                    if (px >= f.min_x && px <= f.max_x && py >= f.min_y && py <= f.max_y) return (int)k;
+                }
                 return -1;
             };
 
@@ -5777,25 +5775,25 @@ StatusCode FallDetector::Detect(const Image& frame, bool& is_fall)
                 }
             }
         }
-        // === Populate fg_area: the actual pixel count of the foreground blob each
-        // object belongs to (whole-object FG), vs pixel_count = block-local FG only.
-        // An object is assigned to the full_frame_object whose pixel bbox contains
-        // its centroid; falls back to block-local pixel_count when none matches.
-        {
+        // === Populate fg_area: the pixel count of the foreground blob each object
+        // belongs to (whole-object FG), vs pixel_count = block-local FG only. Assigns
+        // the full_frame_object whose (precomputed) pixel bbox contains the centroid.
+        // Only run when something actually consumes fg_area -- the detection gates
+        // (use_fg_area / _trigger) or the same-FG merge -- so it costs nothing on the
+        // board when those are off. (fg_area is then 0 in the analysis JSON, which is
+        // just a debug/visualization field.)
+        if (pImpl->config.use_fg_area || pImpl->config.use_fg_area_trigger ||
+            pImpl->config.merge_tracked_enable) {
             const int fgc = pImpl->config.grid_cols;
             const float fpxw = (float)W / fgc, fpxh = (float)H / pImpl->config.grid_rows;
-            std::vector<std::array<int,4>> fbx; fbx.reserve(pImpl->full_frame_objects.size());
-            std::vector<int> farea; farea.reserve(pImpl->full_frame_objects.size());
-            for (const auto& f : pImpl->full_frame_objects) {
-                int x0,y0,x1,y1; getObjectFeatureBoundingBox(f, W, H, x0, y0, x1, y1);
-                fbx.push_back({x0,y0,x1,y1}); farea.push_back(f.area);
-            }
             for (auto& o : pImpl->current_objects) {
                 int px = (int)(o.centerX * fpxw), py = (int)(o.centerY * fpxh);
                 int best = -1;
-                for (size_t k = 0; k < fbx.size(); ++k)
-                    if (px>=fbx[k][0] && px<=fbx[k][2] && py>=fbx[k][1] && py<=fbx[k][3]) { best=(int)k; break; }
-                o.fg_area = (best >= 0) ? farea[best] : o.pixel_count;
+                for (size_t k = 0; k < pImpl->full_frame_objects.size(); ++k) {
+                    const auto& f = pImpl->full_frame_objects[k];   // bbox precomputed at blob detection
+                    if (px >= f.min_x && px <= f.max_x && py >= f.min_y && py <= f.max_y) { best = (int)k; break; }
+                }
+                o.fg_area = (best >= 0) ? pImpl->full_frame_objects[best].area : o.pixel_count;
             }
         }
     }//if bgdata

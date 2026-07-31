@@ -1129,15 +1129,34 @@ void EventRecorder::RunFinalize(const FinalizeJob& job) {
             js += "    \"motion_estimation_v1\": null,\n";
         }
         if (job.has_object_cfg) {
+            // Split across several AppendF calls (same reason as fall_detection_v3
+            // below): AppendF's buffer is 512 bytes and this struct now also carries
+            // the in-frame / post-tracking merge + fg-area + kalman params, so one
+            // call would truncate mid-string and corrupt the JSON after it.
             const ObjectExtraction_v1& c = job.cfg_object;
             AppendF(js,
                 "    \"object_extraction_v1\": {\"object_extraction_threshold\": %.4f, "
                 "\"object_merge_radius\": %d, \"foreground_merge_radius\": %d, "
                 "\"tracking_overlap_threshold\": %.4f, \"tracking_mode\": %d, "
-                "\"tracking_ttl\": %d},\n",
+                "\"tracking_ttl\": %d, ",
                 (double)c.object_extraction_threshold, c.object_merge_radius,
                 c.foreground_merge_radius, (double)c.tracking_overlap_threshold,
                 c.tracking_mode, c.tracking_ttl);
+            AppendF(js,
+                "\"merge_overlapping_enable\": %s, \"merge_overlapping_iou\": %.4f, "
+                "\"merge_tracked_enable\": %s, \"merge_tracked_overlap\": %.4f, "
+                "\"merge_tracked_max_dist\": %.4f, ",
+                c.merge_overlapping_enable ? "true" : "false",
+                (double)c.merge_overlapping_iou,
+                c.merge_tracked_enable ? "true" : "false",
+                (double)c.merge_tracked_overlap, (double)c.merge_tracked_max_dist);
+            AppendF(js,
+                "\"use_fg_area\": %s, \"min_trigger_fg_area\": %d, "
+                "\"still_lying_fg_area\": %d, \"use_fg_area_trigger\": %s, "
+                "\"enable_kalman_predict\": %s},\n",
+                c.use_fg_area ? "true" : "false", c.min_trigger_fg_area,
+                c.still_lying_fg_area, c.use_fg_area_trigger ? "true" : "false",
+                c.enable_kalman_predict ? "true" : "false");
         } else {
             js += "    \"object_extraction_v1\": null,\n";
         }
@@ -1164,6 +1183,9 @@ void EventRecorder::RunFinalize(const FinalizeJob& job) {
                 c.face_detect_interval_frames, c.enable_save_bg_mask ? "true" : "false",
                 c.bg_init_start_frame, c.bg_init_end_frame, c.bg_diff_threshold,
                 c.bg_update_interval_frames, (double)c.bg_update_alpha);
+            AppendF(js,
+                "\"bg_protect_max_frames\": %d, \"bg_protect_min_fg\": %d, ",
+                c.bg_protect_max_frames, c.bg_protect_min_fg);
             AppendF(js,
                 "\"fall_acceleration_upper_threshold\": %.4f, "
                 "\"fall_acceleration_lower_threshold\": %.4f, "
