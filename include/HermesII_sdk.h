@@ -195,9 +195,13 @@ struct ImageRelated_v1 {
 // background snapshot, a .meta.json and an append-only event_record.jsonl log.
 struct EventRecording_v1 {
     ConfigHeader header;
-    bool enable = false;
+    bool enable = true;
     int pre_frames = 300;    // frames kept before the event
-    int post_frames = 300;   // frames recorded after the event
+    int post_frames = 150;   // frames recorded after the event
+    // false = json-only: on an event the SDK writes .meta.json / .analysis.jsonl
+    // (and the global .jsonl log) but NOT the raw frame clip (.raw) or the
+    // background snapshot (_bg.raw). Saves the large SD write burst per event.
+    bool store_raw = true;
     // PC analysis-sidecar mode (only honored by builds compiled with
     // -DEVENT_RECORDER_PC_ANALYSIS=1, i.e. makefile2 / the PC .so). When set,
     // the whole-session per-frame analysis is written to

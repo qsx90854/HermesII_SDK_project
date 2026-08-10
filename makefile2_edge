@@ -55,6 +55,16 @@ SDK_OBJS = $(SDK_SRCS:.cpp=.o)
 # 互相覆蓋。
 SDK_OBJS_NORECORD = $(filter-out src/event_recorder.o,$(SDK_OBJS)) src/event_recorder.norecord.o
 
+# chunk 儲存後端變體(2026-07-31,見「事件錄影_chunk儲存架構設計.md」):把事件
+# 錄影從 mmap ring + finalize 讀回重寫,換成「每幀 append 進 chunk 檔、事件只記
+# 範圍、GC 限速刪滾動緩衝」,消掉 finalize 的讀回+重寫 I/O 尖峰。HermesII_sdk 用
+# -DEVENT_RECORDER_CHUNK_BACKEND=1 編出的 .chunk.o(把 recorder 型別換成
+# EventRecorderChunk),再加 event_recorder_chunk.o。其餘物件檔共用;event_recorder.o
+# 仍在鏈結名單裡但不被使用(無害)。opt-in,不在預設 all。
+SDK_OBJS_CHUNK = $(filter-out src/HermesII_sdk.o,$(SDK_OBJS)) src/HermesII_sdk.chunk.o src/event_recorder_chunk.o
+LIB_NAME_CHUNK = libHermesII_sdk_chunk.so
+LIB_TARGET_CHUNK = $(BUILD_DIR)/$(LIB_NAME_CHUNK)
+
 # 註:async spooler(把每幀 memcpy 進 mmap ring 搬到背景執行緒)自 2026-07-26
 # 起已是 src/event_recorder.cpp 的「預設編譯行為」(見該檔開頭的可調參數註解),
 # 所以正常編出的 libHermesII_sdk.so 就是 async 生產版,不再需要獨立的
@@ -70,6 +80,7 @@ LIB_TARGET = $(BUILD_DIR)/$(LIB_NAME)
 # 已含 async 生產行為 = 修好事件錄影 timestamp 長間隔 / finalize 掉幀,見
 # 「事件錄影_timestamp與掉幀修復說明.md」)。
 PACKAGE_DIR = $(BUILD_DIR)/package
+PACKAGE_CHUNK_DIR = $(BUILD_DIR)/package_chunk
 SDK_HEADER = include/HermesII_sdk.h
 STATIC_LIB_NAME = libHermesII_sdk.a
 STATIC_LIB_TARGET = $(BUILD_DIR)/$(STATIC_LIB_NAME)
@@ -108,7 +119,7 @@ INI_READ_TEST_EDGE_TARGET = ini_read_test_edge
 # 快速測試用。故意不放進 all,不需要時直接不編即可。
 SDK_GRAY_TEST_EDGE_NORECORD_TARGET = sdk_gray_test_edge_norecord
 
-.PHONY: all clean package
+.PHONY: all clean package package-chunk
 
 # 預設規則
 all: $(LIB_TARGET) $(STATIC_LIB_TARGET) $(FALL_DEMO_TARGET) $(FALL_CALLBACK_TARGET) $(SDK_DEMO_CODE_V1_TARGET) $(SDK_DEMO_CODE_V2_TARGET) $(SDK_DEMO_CODE_V2_SAVE_FALL_RESULT_TARGET) $(SDK_DEMO_TEST_ACCURACY_TARGET) $(STREAMING_DEMO_TARGET) $(FALL_ACCURACY_TEST_TARGET) $(SDK_DEMO_BG_TEST_TARGET) $(SDK_DEMO_LOOP_TEST_TARGET) $(SDK_ERRORLOG_VERIFIER_TARGET) $(SDK_GRAY_TEST_EDGE_TARGET) $(EVENT_REPLAY_VERIFY_EDGE_TARGET) $(SDK_GRAY_COUNT_FALLS_EDGE_TARGET) $(INI_READ_TEST_EDGE_TARGET) package
@@ -134,6 +145,15 @@ $(LIB_TARGET_NORECORD): $(SDK_OBJS_NORECORD) | $(BUILD_DIR)
 $(STATIC_LIB_TARGET_NORECORD): $(SDK_OBJS_NORECORD) | $(BUILD_DIR)
 	$(AR) rcs $@ $(SDK_OBJS_NORECORD)
 
+# chunk 儲存後端 .so(opt-in)。用法:make -f makefile2_edge $(LIB_TARGET_CHUNK)
+# HermesII_sdk 帶 -DEVENT_RECORDER_CHUNK_BACKEND=1 編成獨立的 .chunk.o,避免蓋掉
+# 正常的 HermesII_sdk.o。
+src/HermesII_sdk.chunk.o: src/HermesII_sdk.cpp
+	$(CXX) $(CXXFLAGS) -DEVENT_RECORDER_CHUNK_BACKEND=1 -c $< -o $@
+
+$(LIB_TARGET_CHUNK): $(SDK_OBJS_CHUNK) | $(BUILD_DIR)
+	$(CXX) -shared -o $@ $(SDK_OBJS_CHUNK) $(LDFLAGS_NPU) -lpthread
+
 # 對外交付打包: 把標頭檔與生產版 .so 複製到 build/package/。$(LIB_TARGET) 就是
 # 正常編出的 libHermesII_sdk.so,已含 async 生產行為(見 src/event_recorder.cpp
 # 開頭可調參數註解)。build/package 在 BUILD_DIR 底下,make clean 會一併清除。
@@ -141,7 +161,16 @@ package: $(LIB_TARGET) $(SDK_HEADER)
 	mkdir -p $(PACKAGE_DIR)
 	cp $(SDK_HEADER) $(PACKAGE_DIR)/
 	cp $(LIB_TARGET) $(PACKAGE_DIR)/$(LIB_NAME)
-	@echo "[package] $(PACKAGE_DIR)/: $(LIB_NAME)(生產版) + $(notdir $(SDK_HEADER))"
+	@echo "[package] $(PACKAGE_DIR)/: $(LIB_NAME)(生產版=ring 後端) + $(notdir $(SDK_HEADER))"
+
+# chunk 後端打包:把 chunk 版 .so 改名為正式名 libHermesII_sdk.so 放進獨立目錄
+# build/package_chunk/,方便上板直接換檔做 A/B。不會蓋掉 ring 版的 build/package/。
+# 用法:make -f makefile2_edge package-chunk
+package-chunk: $(LIB_TARGET_CHUNK) $(SDK_HEADER)
+	mkdir -p $(PACKAGE_CHUNK_DIR)
+	cp $(SDK_HEADER) $(PACKAGE_CHUNK_DIR)/
+	cp $(LIB_TARGET_CHUNK) $(PACKAGE_CHUNK_DIR)/$(LIB_NAME)
+	@echo "[package-chunk] $(PACKAGE_CHUNK_DIR)/: $(LIB_NAME)(chunk 後端, 已改名為正式名) + $(notdir $(SDK_HEADER))"
 
 # 編譯 Fall Demo
 $(FALL_DEMO_TARGET): examples/fall_demo.cpp $(STATIC_LIB_TARGET)
@@ -218,4 +247,5 @@ $(INI_READ_TEST_EDGE_TARGET): examples/ini_read_test.cpp
 clean:
 	rm -f $(SDK_OBJS) $(FALL_DEMO_TARGET) $(FALL_CALLBACK_TARGET) $(SDK_DEMO_CODE_V1_TARGET) $(SDK_DEMO_CODE_V2_TARGET) $(SDK_DEMO_TEST_ACCURACY_TARGET) $(STREAMING_DEMO_TARGET) $(FALL_ACCURACY_TEST_TARGET) $(SDK_DEMO_BG_TEST_TARGET) $(SDK_DEMO_CODE_V2_SAVE_FALL_RESULT_TARGET) $(SDK_DEMO_LOOP_TEST_TARGET) $(SDK_ERRORLOG_VERIFIER_TARGET) $(SDK_GRAY_TEST_EDGE_TARGET) $(EVENT_REPLAY_VERIFY_EDGE_TARGET) $(SDK_GRAY_COUNT_FALLS_EDGE_TARGET) $(INI_READ_TEST_EDGE_TARGET)
 	rm -f src/event_recorder.norecord.o $(SDK_GRAY_TEST_EDGE_NORECORD_TARGET)
+	rm -f src/HermesII_sdk.chunk.o src/event_recorder_chunk.o
 	rm -rf $(BUILD_DIR)

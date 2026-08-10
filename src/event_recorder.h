@@ -43,6 +43,7 @@ public:
         float direction_variance = 0;
         bool in_observation = false;       // Case5 observation phase
         bool is_fall = false;              // this object is reported as a fall this frame
+        bool is_bed_exit = false;          // this object is flagged bed-exit this frame
         int fg_area = 0;                   // whole-blob foreground pixel count (vs block-local pixel_count)
         bool is_coasting = false;          // coasting/predicted remnant (kept alive, not fresh)
         std::vector<uint16_t> blocks;      // grid block indices of this object
@@ -60,7 +61,9 @@ public:
     ~EventRecorder();
 
     // Called from SetConfig(EventRecording_v1). Safe to call multiple times.
-    void Configure(bool enable, int pre_frames, int post_frames);
+    // store_raw=false => json-only: finalize writes .meta.json/.analysis but no
+    // .raw/.bg (saves the big SD write burst; the ring still spools).
+    void Configure(bool enable, int pre_frames, int post_frames, bool store_raw = true);
 
     // Called once per ProcessNextFrame(), before Detect(). Copies the frame
     // into the ring file. Never throws; on storage failure disables itself.
@@ -143,6 +146,13 @@ private:
         bool has_motion_cfg, has_object_cfg, has_fall_cfg, has_image_cfg;
         bool event_recording_enabled;
         int event_recording_pre_frames, event_recording_post_frames;
+        // meta_only: this event was NOT recorded to .raw -- either the finalize
+        // queue was full (skipped, see max_pending_) or store_raw was off. The
+        // writer then writes only a .meta.json (no ring read, no .raw/.bg), and
+        // this job does NOT count against pending_raw_jobs_.
+        bool meta_only = false;
+        bool skipped_queue_full = false;   // meta_only reason was "queue full"
+        int pending_at_skip = 0;           // pending_raw_jobs_ when skipped
     };
 
     bool InitRing(int width, int height, int channels);
@@ -172,6 +182,20 @@ private:
     bool enabled_ = true;
     int pre_frames_ = 300;
     int post_frames_ = 300;
+    bool store_raw_ = true;          // false = json-only (no .raw/.bg at finalize)
+
+    // Max event recordings that may be queued/in-flight (holding ring frames)
+    // before the oldest queued window risks being overwritten. Computed at
+    // InitRing as kMarginSlots / post_frames_. A new event beyond this is saved
+    // meta-only (skipped). pending_raw_jobs_ counts jobs that read the ring;
+    // it is bumped in QueueFinalize and dropped in WriterLoop (writer thread),
+    // hence atomic.
+    int max_pending_ = 1;
+    std::atomic<int> pending_raw_jobs_{0};
+    // True while the current capture is a "skip" (queue was full at its start):
+    // it merges re-triggers like a normal capture but finalizes meta-only.
+    bool skip_capture_ = false;
+    int skip_pending_snapshot_ = 0;  // pending_raw_jobs_ at the moment we skipped
 
     // --- ring file (SDK thread writes, writer thread reads) ---
     int fd_ = -1;

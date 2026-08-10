@@ -257,6 +257,18 @@ std::string DirOf(const std::string& path) {
     return (p == std::string::npos) ? std::string(".") : path.substr(0, p);
 }
 
+// Chunk backend: a frame at global seq lives in
+//   <frames_abs>/<chunk_id/1000>/chunk_<chunk_id (8-digit)>.raw
+// at byte offset (seq % chunk_frames) * frame_size. Must match the writer's
+// naming in src/event_recorder_chunk.cpp (ChunkPath).
+std::string ChunkFramePath(const std::string& frames_abs, long long chunk_frames, long long seq) {
+    long long cid = seq / chunk_frames;
+    char sub[32], name[64];
+    snprintf(sub, sizeof(sub), "%lld", cid / 1000);
+    snprintf(name, sizeof(name), "chunk_%08lld.raw", cid);
+    return frames_abs + "/" + sub + "/" + name;
+}
+
 // event_type "fall+bed_exit" -> the set of required detected sub-types
 std::vector<std::string> SplitEventType(const std::string& type) {
     std::vector<std::string> parts;
@@ -374,8 +386,10 @@ bool LoadConfigsFromMeta(const std::string& meta,
 int main(int argc, char** argv) {
     if (argc < 2) {
         std::cerr << "Usage: " << argv[0]
-                  << " <path/to/evt_..._fN.raw> [--ini=parameter.ini] [--tolerance=15]\n"
+                  << " <path/to/evt_..._fN.raw | evt_..._fN.meta.json> [--ini=parameter.ini] [--tolerance=15]\n"
                      "\n"
+                     "Accepts either an old single-file recording (evt_*.raw) or a chunk-backend\n"
+                     "recording (pass its evt_*.meta.json; frames are read from the chunk files).\n"
                      "Replays a SDK EventRecorder recording through a fresh SDK instance\n"
                      "using the detection config recorded in the .meta.json snapshot (the\n"
                      "exact params in effect at event time), same bed region / background\n"
@@ -396,9 +410,16 @@ int main(int argc, char** argv) {
         else if (a.rfind("--tolerance=", 0) == 0) tolerance = std::atoi(a.c_str() + 12);
     }
 
-    std::string meta_path = raw_path;
-    if (EndsWith(meta_path, ".raw")) meta_path = meta_path.substr(0, meta_path.size() - 4);
-    meta_path += ".meta.json";
+    // Accept either an evt_*.raw path (old single-file recording) or an
+    // evt_*.meta.json path directly (chunk recordings have no single .raw).
+    std::string meta_path;
+    if (EndsWith(raw_path, ".meta.json")) {
+        meta_path = raw_path;
+    } else {
+        meta_path = raw_path;
+        if (EndsWith(meta_path, ".raw")) meta_path = meta_path.substr(0, meta_path.size() - 4);
+        meta_path += ".meta.json";
+    }
 
     std::string meta_json;
     if (!metajson::ReadWholeFile(meta_path, meta_json)) {
@@ -419,8 +440,38 @@ int main(int argc, char** argv) {
     std::vector<std::pair<int, int>> bed_region = metajson::GetBedRegion(meta_json);
     std::vector<metajson::Trigger> triggers = metajson::GetTriggers(meta_json);
 
-    if (width <= 0 || height <= 0 || channels <= 0 || total_frames <= 0) {
-        std::cerr << "Error: meta file missing/invalid width/height/channels/total_frames: "
+    // Storage backend: "chunked" (frames live in chunk files, replayed by seq)
+    // vs the old single evt_*.raw. Determines how frames are read below.
+    std::string storage;
+    metajson::GetString(meta_json, "storage", storage);
+    bool is_chunked = (storage == "chunked");
+    long long chunk_frames = 0, first_seq = 0, last_seq = 0;
+    std::string frames_dir_name = "frames";
+    if (is_chunked) {
+        metajson::GetLongLong(meta_json, "chunk_frames", chunk_frames);
+        metajson::GetLongLong(meta_json, "first_seq", first_seq);
+        metajson::GetLongLong(meta_json, "last_seq", last_seq);
+        metajson::GetString(meta_json, "frames_dir", frames_dir_name);
+        bool stored = false;
+        metajson::GetBool(meta_json, "stored", stored);
+        if (!stored) {
+            std::string reason;
+            metajson::GetString(meta_json, "not_stored_reason", reason);
+            std::cout << "This chunk recording was NOT stored (meta-only, reason=\""
+                      << reason << "\") -- no frames to replay. Exiting.\n";
+            return 0;
+        }
+        if (chunk_frames <= 0 || last_seq < first_seq) {
+            std::cerr << "Error: chunk meta missing chunk_frames/first_seq/last_seq.\n";
+            return 1;
+        }
+    }
+    // Frames to feed: the full window. For chunk that is last_seq-first_seq+1;
+    // for the old .raw it is the frame count written to the file.
+    long long feed_count = is_chunked ? (last_seq - first_seq + 1) : total_frames;
+
+    if (width <= 0 || height <= 0 || channels <= 0 || feed_count <= 0) {
+        std::cerr << "Error: meta file missing/invalid width/height/channels/frame-count: "
                   << meta_path << std::endl;
         return 1;
     }
@@ -429,10 +480,10 @@ int main(int argc, char** argv) {
     std::cout << "SDK Event Replay Verification\n";
     std::cout << "SDK Version: " << VisionSDK::VisionSDK::GetVersion() << "\n";
     std::cout << "=========================================\n";
-    std::cout << "Recording        : " << raw_path << "\n";
     std::cout << "Meta             : " << meta_path << "\n";
+    std::cout << "Storage          : " << (is_chunked ? "chunked" : "single .raw") << "\n";
     std::cout << "Geometry         : " << width << "x" << height << " x" << channels << "ch\n";
-    std::cout << "Frames in file   : " << total_frames << " (pre=" << pre_frames
+    std::cout << "Window frames    : " << feed_count << " (pre=" << pre_frames
               << " post=" << post_frames << ")\n";
     std::cout << "Original event   : " << event_type << " (" << triggers.size() << " trigger(s) recorded)\n";
     std::cout << "Bed region       : " << (bed_region.empty() ? "(none recorded)" :
@@ -588,7 +639,7 @@ int main(int argc, char** argv) {
     // the fresh SDK "learn" a background from the first few frames of this
     // 601-frame window (which show the room mid-event, not an empty room).
     if (has_bg) {
-        std::string bg_path = DirOf(raw_path) + "/" + bg_file;
+        std::string bg_path = DirOf(meta_path) + "/" + bg_file;
         FILE* bf = fopen(bg_path.c_str(), "rb");
         if (bf) {
             std::vector<uint8_t> bg_data((size_t)(width * height)); // recorder always saves bg as 1-channel
@@ -624,30 +675,60 @@ int main(int argc, char** argv) {
         }
     });
 
-    FILE* rf = fopen(raw_path.c_str(), "rb");
-    if (!rf) {
-        std::cerr << "Error: cannot open " << raw_path << std::endl;
-        return 1;
-    }
     size_t frame_size = (size_t)(width * height * channels);
     std::vector<uint8_t> buf(frame_size);
-    long long fed = 0;
-    std::cout << "\nFeeding " << total_frames << " frames...\n";
-    for (long long i = 0; i < total_frames; ++i) {
-        size_t got = fread(buf.data(), 1, frame_size, rf);
-        if (got != frame_size) {
-            std::cerr << "Warning: short read at frame " << i << " (" << got << "/" << frame_size
-                      << " bytes); stopping early.\n";
-            break;
+    long long fed = 0, missing = 0;
+    std::cout << "\nFeeding " << feed_count << " frames ("
+              << (is_chunked ? "from chunk files" : "from .raw") << ")...\n";
+
+    if (is_chunked) {
+        // Read each window frame from its chunk file by seq. Keep the current
+        // chunk file open, reopening only at chunk boundaries.
+        std::string frames_abs = DirOf(meta_path) + "/" + frames_dir_name;
+        long long cur_cid = -1;
+        FILE* cf = nullptr;
+        for (long long i = 0; i < feed_count; ++i) {
+            long long seq = first_seq + i;
+            long long cid = seq / chunk_frames;
+            if (cid != cur_cid) {
+                if (cf) fclose(cf);
+                std::string cp = ChunkFramePath(frames_abs, chunk_frames, seq);
+                cf = fopen(cp.c_str(), "rb");
+                cur_cid = cid;
+                if (!cf) std::cerr << "Warning: cannot open chunk " << cp
+                                   << " (frames in it will be treated as missing)\n";
+            }
+            if (!cf) { missing++; continue; }
+            long long off = (seq % chunk_frames) * (long long)frame_size;
+            if (fseeko(cf, (off_t)off, SEEK_SET) != 0) { missing++; continue; }
+            size_t got = fread(buf.data(), 1, frame_size, cf);
+            if (got != frame_size) { missing++; continue; }   // dropped/partial frame -> skip
+            uint64_t ts = (uint64_t)(i * 33);
+            sdk.SetInputMemory(buf.data(), (int)width, (int)height, (int)channels, ts);
+            sdk.ProcessNextFrame();
+            fed++;
+            if (fed % 100 == 0) std::cout << "  fed " << fed << "/" << feed_count << "\n";
         }
-        uint64_t ts = (uint64_t)(i * 33); // replay pacing metadata only; detection doesn't depend on it
-        sdk.SetInputMemory(buf.data(), (int)width, (int)height, (int)channels, ts);
-        sdk.ProcessNextFrame();
-        fed++;
-        if (fed % 100 == 0) std::cout << "  fed " << fed << "/" << total_frames << "\n";
+        if (cf) fclose(cf);
+    } else {
+        FILE* rf = fopen(raw_path.c_str(), "rb");
+        if (!rf) { std::cerr << "Error: cannot open " << raw_path << std::endl; return 1; }
+        for (long long i = 0; i < feed_count; ++i) {
+            size_t got = fread(buf.data(), 1, frame_size, rf);
+            if (got != frame_size) {
+                std::cerr << "Warning: short read at frame " << i << " (" << got << "/" << frame_size
+                          << " bytes); stopping early.\n";
+                break;
+            }
+            uint64_t ts = (uint64_t)(i * 33); // replay pacing metadata only; detection doesn't depend on it
+            sdk.SetInputMemory(buf.data(), (int)width, (int)height, (int)channels, ts);
+            sdk.ProcessNextFrame();
+            fed++;
+            if (fed % 100 == 0) std::cout << "  fed " << fed << "/" << feed_count << "\n";
+        }
+        fclose(rf);
     }
-    fclose(rf);
-    std::cout << "Fed " << fed << " frames total.\n";
+    std::cout << "Fed " << fed << " frames total" << (missing ? (" (" + std::to_string(missing) + " missing/skipped)") : "") << ".\n";
     sdk.Release();
 
     // --- Anchor check: this is the pass/fail criterion ---

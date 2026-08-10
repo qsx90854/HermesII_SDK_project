@@ -3,6 +3,9 @@
 #include "fusion/image_fusion.h"
 #include "fall/fall_detector.h"
 #include "event_recorder.h"
+#if EVENT_RECORDER_CHUNK_BACKEND
+#include "event_recorder_chunk.h"   // chunk-storage backend (opt-in, see typedef below)
+#endif
 #include "Image.h"
 #include <iostream>
 #include <fstream>
@@ -11,11 +14,22 @@
 #include <thread>
 #include <cstring>
 #include <cstddef>  // offsetof — for ABI-safe partial config copy (see SetConfig)
+#include <cstdlib>  // getenv/atoi (stress mode)
 
 // Note: Do not wrap entire file in namespace VisionSDK
 // to avoid "VisionSDK::VisionSDK::" confusion if using prefix.
 
 namespace VisionSDK {
+    // Event-recorder backend selection. Default: the mmap-ring EventRecorder.
+    // Build with -DEVENT_RECORDER_CHUNK_BACKEND=1 to swap in the chunk-storage
+    // backend (event_recorder_chunk.*) instead -- same public interface, and both
+    // share EventRecorder::FrameAnalysis so the analysis glue below is unchanged.
+#if EVENT_RECORDER_CHUNK_BACKEND
+    using ActiveEventRecorder = EventRecorderChunk;
+#else
+    using ActiveEventRecorder = EventRecorder;
+#endif
+
     // Define Impl inside namespace
     class VisionSDK::Impl {
     public:
@@ -39,8 +53,8 @@ namespace VisionSDK {
         FusionParams stored_fusion_params;
         bool has_stored_fusion_params = false;
 
-        // Event-triggered raw frame recording (mmap ring on SD card)
-        EventRecorder event_recorder;
+        // Event-triggered raw frame recording (mmap ring, or chunk backend)
+        ActiveEventRecorder event_recorder;
         VisionSDKCallback user_callback;
         bool internal_callback_registered = false;
 
@@ -52,6 +66,16 @@ namespace VisionSDK {
         bool event_record_self_test = true;
         bool self_test_triggered = false;
         uint64_t recorder_frame_count = 0;
+
+        // Stress mode: fire a synthetic (self-test) event every N frames so the
+        // recorder can be load-tested WITHOUT physically triggering real falls.
+        // Driven by the env var HERMES_STRESS_INTERVAL (frames between triggers;
+        // unset/0 = off), read once on the first ProcessNextFrame. Board usage:
+        //   HERMES_STRESS_INTERVAL=200 ./mediad
+        // (env var, not a config field, so mediad needs no change and there is
+        // no EventRecording_v1 ABI change.)
+        int stress_interval_ = 0;
+        bool stress_read_ = false;
 
         // FallDetector fires events synchronously inside Detect(). This wrapper
         // feeds fall / bed-exit events into the recorder before forwarding them
@@ -81,7 +105,7 @@ using namespace VisionSDK;
 VisionSDK::VisionSDK::VisionSDK() : pImpl(std::unique_ptr<Impl>(new Impl())) {}
 VisionSDK::VisionSDK::~VisionSDK() = default;
 
-#define VISION_SDK_VERSION_INTERNAL "2.0.5_20260728"
+#define VISION_SDK_VERSION_INTERNAL "2.0.6_20260731"
 
 const char* VisionSDK::VisionSDK::GetVersion() {
     return VISION_SDK_VERSION_INTERNAL;
@@ -336,7 +360,7 @@ StatusCode VisionSDK::VisionSDK::SetConfig(const void* config) {
             const auto* c = static_cast<const EventRecording_v1*>(config);
             if (c->header.version >= 2)   // pc_output_base is appended; only read from new callers
                 pImpl->event_recorder.SetPcOutputBase(c->pc_output_base);
-            pImpl->event_recorder.Configure(c->enable, c->pre_frames, c->post_frames);
+            pImpl->event_recorder.Configure(c->enable, c->pre_frames, c->post_frames, c->store_raw);
             if (c->enable) Impl::EnsureInternalCallback(pImpl.get());
             // Recorder is independent of InternalConfig; nothing to merge.
             return StatusCode::OK;
@@ -528,6 +552,26 @@ StatusCode VisionSDK::VisionSDK::ProcessNextFrame() {
         pImpl->event_recorder.TriggerSelfTest(std::move(bg));
     }
 
+    // Stress mode (env var HERMES_STRESS_INTERVAL): inject a synthetic event
+    // every N frames so the recorder can be load-tested without real falls.
+    // TriggerSelfTest is a no-op while a capture is in progress, so with N >=
+    // post_frames each interval that lands while idle starts a fresh recording.
+    if (!pImpl->stress_read_) {
+        pImpl->stress_read_ = true;
+        const char* s = getenv("HERMES_STRESS_INTERVAL");
+        pImpl->stress_interval_ = (s && *s) ? atoi(s) : 0;
+        if (pImpl->stress_interval_ > 0)
+            std::cout << "[EventRecorder] STRESS MODE: injecting a synthetic event every "
+                      << pImpl->stress_interval_ << " frames (HERMES_STRESS_INTERVAL).\n";
+    }
+    if (pImpl->stress_interval_ > 0 &&
+        pImpl->recorder_frame_count % (uint64_t)pImpl->stress_interval_ == 0 &&
+        !pImpl->event_recorder.IsCapturing()) {
+        std::vector<uint8_t> bg;
+        pImpl->fall_detector.GetBackgroundImage(bg);
+        pImpl->event_recorder.TriggerSelfTest(std::move(bg));
+    }
+
     bool is_fall = false;
     
     // Performance Profiling
@@ -567,6 +611,7 @@ StatusCode VisionSDK::VisionSDK::ProcessNextFrame() {
             ao.direction_variance = o.direction_variance;
             ao.in_observation = o.is_in_observation_mode;
             ao.is_fall = o.is_fall_this_frame;
+            ao.is_bed_exit = pImpl->fall_detector.IsObjectBedExit(o.id);
             ao.fg_area = o.fg_area;
             ao.is_coasting = o.is_coasting;
             ao.blocks.reserve(o.blocks.size());

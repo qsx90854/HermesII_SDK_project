@@ -568,10 +568,12 @@ std::vector<::VisionSDK::ObjectFeatures> find_objects_optimized(const uint8_t* m
             obj.angle = 0.0f;
             
             // 預先分配足夠的記憶體給像素，避免 vector 在 push_back 時不斷 reallocate
-            obj.pixels.reserve(blob.count); 
-            obj.pixel_dx.resize(blob.count, 0.0f);
-            obj.pixel_dy.resize(blob.count, 0.0f);
-            obj.pixel_dir.resize(blob.count, 0.0f);
+            obj.pixels.reserve(blob.count);
+            // NOTE(perf/A1): pixel_dx/dy/dir intentionally NOT sized here. They are never
+            // read anywhere in the SDK (.so) -- only the external demo examples touch them,
+            // and only ever saw the all-zero fill this used to write. Leaving them empty
+            // avoids 3 alloc+memset of blob.count floats per object per frame; detection
+            // output is byte-identical.
             
             // 建立查表，讓收集像素時可以 $O(1)$ 找到該塞進哪個 result
             for (int r : blob.root_labels) {
@@ -2634,6 +2636,11 @@ namespace LK_Utils {
 class FallDetector::Impl {
 public:
     std::unique_ptr<OptimizedBlockMotionEstimator> estimator;
+    // perf(B): per-frame scratch buffers hoisted to members to avoid re-allocating
+    // ~W*H every frame. Both are fully overwritten before being read each frame, so
+    // reusing them across frames is byte-identical to the old per-frame locals.
+    ::Image wrapper_buf;                   // B2: grayscale working image
+    std::vector<unsigned char> mask_buf;   // B1: BG-diff foreground mask
     std::vector<MotionObject> current_objects;
     std::vector<std::vector<MotionObject>> object_history;
     InternalConfig config; // Use unified Config
@@ -4164,6 +4171,7 @@ void detectFallMomentumTrend(
 
 StatusCode FallDetector::Detect(const Image& frame, bool& is_fall) 
 {
+    
     int edge_threshold = 40;
     is_fall = false;
     pImpl->absolute_frame_count++; // Increment frame counter
@@ -4517,8 +4525,14 @@ StatusCode FallDetector::Detect(const Image& frame, bool& is_fall)
     long long t0 = pImpl->get_now_us();
     #endif
 
-    // Needs Gray Image (1 channel) for correct stride/SAD in OptimizedBlockMotionEstimator
-    ::Image wrapper(W, H, 1);
+    // Needs Gray Image (1 channel) for correct stride/SAD in OptimizedBlockMotionEstimator.
+    // perf(B2): reuse a member buffer instead of allocating a fresh W*H image each frame.
+    // Re-created only if the frame geometry changes; filled completely below, so identical.
+    if (pImpl->wrapper_buf.width() != W || pImpl->wrapper_buf.height() != H ||
+        pImpl->wrapper_buf.getChannels() != 1) {
+        pImpl->wrapper_buf = ::Image(W, H, 1);
+    }
+    ::Image& wrapper = pImpl->wrapper_buf;
     
     {
     TimerGuard t_img(g_perf_timer, "0_ImageConv");
@@ -4565,7 +4579,10 @@ StatusCode FallDetector::Detect(const Image& frame, bool& is_fall)
         int w = wrapper.width();
         int h = wrapper.height();
         
-        std::vector<unsigned char> maskData(w * h);
+        // perf(B1): reuse a member buffer instead of allocating w*h bytes each frame.
+        // Every pixel is written by the BG-diff pass below, so no need to zero on reuse.
+        std::vector<unsigned char>& maskData = pImpl->mask_buf;
+        if (maskData.size() != (size_t)(w * h)) maskData.resize(w * h);
         const uint8_t* curr = wrapper.getData();
         const uint8_t* bg = pImpl->backgroundFrame.getData();
         int diff_thr = pImpl->config.bg_diff_threshold;
@@ -5248,6 +5265,19 @@ StatusCode FallDetector::Detect(const Image& frame, bool& is_fall)
             }
         }
 
+        // perf(P1): the per-block FG count below is |curr-bg| > bg_thresh per pixel --
+        // which is EXACTLY the mask the BG-diff pass already produced this frame into
+        // pImpl->mask_buf (same threshold, same '> ', and for a 1-channel background the
+        // grayscale/luma diff matches: 1ch frame -> wrapper==frame.data; 3ch frame ->
+        // wrapper is the same (r*77+g*150+b*29)>>8 luma used in the else-branch here).
+        // So when the background is 1-channel (always, per SetBackground) we just count
+        // mask bytes instead of re-reading curr+bg and recomputing abs-diff. If the
+        // background is ever multi-channel we fall back to the exact original scan, so
+        // the result is byte-identical either way.
+        const bool use_mask_fast = (pImpl->backgroundFrame.getChannels() == 1) &&
+                                   (pImpl->mask_buf.size() == (size_t)(W * H));
+        const unsigned char* maskp = use_mask_fast ? pImpl->mask_buf.data() : nullptr;
+
         // C. Perform Pixel Scanning
         for (int i = 0; i < grid_rows * grid_cols; ++i) {
             if (!blocks_to_scan[i]) continue;
@@ -5258,11 +5288,20 @@ StatusCode FallDetector::Detect(const Image& frame, bool& is_fall)
             int startY = r * bh;
             int endX = std::min(W, startX + bw);
             int endY = std::min(H, startY + bh);
-            
+
             int count = 0;
-            for (int y = startY; y < endY; ++y) {
+            if (use_mask_fast) {
+                // Fast path: count foreground bytes already computed in mask_buf.
+                for (int y = startY; y < endY; ++y) {
+                    const unsigned char* mrow = maskp + y * W;
+                    for (int x = startX; x < endX; ++x) {
+                        if (mrow[x]) count++;
+                    }
+                }
+            } else {
+              for (int y = startY; y < endY; ++y) {
                 for (int x = startX; x < endX; ++x) {
-                    
+
                     int diff = 0;
                     if (pImpl->backgroundFrame.getChannels() == 1 && frame.channels == 1) {
                         int idx = (y * W + x);
@@ -5294,6 +5333,7 @@ StatusCode FallDetector::Detect(const Image& frame, bool& is_fall)
                         count++;
                     }
                 }
+              }
             }
             block_fg_scores[i] = count;
             
@@ -6656,15 +6696,10 @@ StatusCode FallDetector::Detect(const Image& frame, bool& is_fall)
                                 float p_area = 0.0f;
                                 
                                 // We use the max/min x/y of the raw pixel object
-                                int fmin_x = 99999, fmax_x = -1, fmin_y = 99999, fmax_y = -1;
-                                for(int p_idx : fg_obj.pixels) {
-                                    int px = p_idx % frame.width;
-                                    int py = p_idx / frame.width;
-                                    if (px < fmin_x) fmin_x = px;
-                                    if (px > fmax_x) fmax_x = px;
-                                    if (py < fmin_y) fmin_y = py;
-                                    if (py > fmax_y) fmax_y = py;
-                                }
+                                // perf(C1): bbox already computed at blob detection; the old
+                                // per-pixel scan produced exactly these min/max values.
+                                int fmin_x = fg_obj.min_x, fmax_x = fg_obj.max_x;
+                                int fmin_y = fg_obj.min_y, fmax_y = fg_obj.max_y;
 #if ENABLE_DEBUG_FRAME_SAVE
                                 if (!pImpl->lastMaskData.empty()) 
                                 {
@@ -7019,20 +7054,14 @@ StatusCode FallDetector::Detect(const Image& frame, bool& is_fall)
                                         {
                                             mx = f_obj.cx; mxx = f_obj.cx; // Initial values
                                             my = f_obj.cy; mxy = f_obj.cy;
-                                            int f_mx = 99999, f_mxx = -1, f_my = 99999, f_mxy = -1;
-                                            for (int p_idx : f_obj.pixels) 
+                                            // perf(C1): use the bbox precomputed at blob
+                                            // detection (identical to the old per-pixel scan).
+                                            // Guard on emptiness to preserve the old f_mxx!=-1
+                                            // "had at least one pixel" condition.
+                                            if (!f_obj.pixels.empty())
                                             {
-                                                int px = p_idx % W;
-                                                int py = p_idx / W;
-                                                if (px < f_mx) f_mx = px;
-                                                if (px > f_mxx) f_mxx = px;
-                                                if (py < f_my) f_my = py;
-                                                if (py > f_mxy) f_mxy = py;
-                                            }
-                                            if (f_mxx != -1) 
-                                            {
-                                                mx = f_mx; mxx = f_mxx;
-                                                my = f_my; mxy = f_mxy;
+                                                mx = f_obj.min_x; mxx = f_obj.max_x;
+                                                my = f_obj.min_y; mxy = f_obj.max_y;
                                             }
                                             break;
                                         }
@@ -7769,6 +7798,11 @@ StatusCode FallDetector::Detect(const Image& frame, bool& is_fall)
 const std::vector<MotionObject>& FallDetector::GetMotionObjects() const {
 
     return pImpl->current_objects;
+}
+
+bool FallDetector::IsObjectBedExit(int id) const {
+    auto it = pImpl->object_bed_exit_status.find(id);
+    return (it != pImpl->object_bed_exit_status.end()) && it->second;
 }
 
 std::vector<::VisionSDK::ObjectFeatures> FallDetector::GetFullFrameObjects() const {

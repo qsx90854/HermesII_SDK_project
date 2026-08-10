@@ -115,13 +115,17 @@ const uint32_t kRingVersion = 2;               // v2: slot index gained process_
 // event's recording. 256 (~37s buffer) covers a full finalize with headroom.
 // Cost: larger ring FILE on SD (~330MB vs 256MB); no extra RAM (resident set
 // is bounded by kResidentSlots).
-// 2026-07-26: 256 -> 384. With the finalize now rate-capped at 6MB/s
-// (kFinalizeBytesPerSec) a 216MB window takes ~36s, during which ~270 frames
-// arrive at 7.5fps. 256 was just under that, so the tail overflowed into the
-// copy window and got overwrite-dropped; 384 covers a ~50s finalize with
-// headroom so overwrite drops go to ~0, leaving only transient queue drops
-// (which kMaxSpoolFrames absorbs). Ring FILE ~378MB on SD; still no extra RAM.
-const uint32_t kMarginSlots = 384;             // extra slots protecting the copy window
+// 2026-07-31: 384 -> 2250. The margin now also sets how many event recordings
+// can be QUEUED (waiting to finalize) without the oldest queued window being
+// overwritten in the ring. With events spaced >= post_frames apart (state
+// machine minimum), each additional pending recording keeps ~post_frames of
+// extra oldest span alive, so the safe queue depth is:
+//     max_pending_ = kMarginSlots / post_frames   (computed at InitRing)
+// 2250 / 150 = 15 recordings can queue with pre300/post150. Beyond that a new
+// event is saved meta-only (skipped, see OnEvent/max_pending_). Ring FILE on
+// SD ~= (pre+1+post+2250) * slot_size; at 385KB/slot & pre300/post150 ~= 1.04GB
+// (SD has 58GB). No extra RAM (resident set bounded by kResidentSlots).
+const uint32_t kMarginSlots = 2250;            // extra slots: overwrite margin + queue depth
 const size_t kPageSize = 4096;
 const uint64_t kInvalidSeq = UINT64_MAX;
 // madvise(DONTNEED) slots older than this.
@@ -162,13 +166,22 @@ const size_t kFinalizeYieldWatermark = 8;      // out of kMaxSpoolFrames (36)
 // msync/memcpy. The spooler falls behind, the spool queue fills, frames drop,
 // and each dropped frame shows up as a ~2x frame-arrival interval (the
 // "occasional long gap during a real recording" symptom). Capping finalize
-// below the SD's sustained writeback (async board measures ~12MB/s) keeps the
-// dirty pool drained so neither thread is throttled. 6MB/s leaves ~6MB/s for
-// the 2.5MB/s spooler; a 216MB window then finalizes in ~36s (vs ~19s) -- the
-// recording data is already safe in the ring, only the .raw completes later.
+// below the SD's sustained writeback keeps the dirty pool drained so neither
+// thread is throttled.
+// 2026-07-31: 6MB/s -> 2MB/s. On-board measurement showed the real numbers are
+// much tighter than first assumed: sustained sequential write is only ~7MB/s
+// (not 12), and DURING a finalize the concurrent "read the window back from the
+// ring" pulls the write ceiling down to ~5MB/s. The spooler needs ~3MB/s, so
+// the finalize write may use at most ~2MB/s or it starves the spooler and the
+// next event's pre-window frames get dropped before they reach the ring (the
+// pre-300 missing symptom). 6MB/s was ABOVE that budget => effectively no
+// throttle => drops. 2MB/s leaves the spooler its 3. Cost: a 173MB (pre300/
+// post150) window finalizes in ~86s; the data is already safe in the ring, only
+// the .raw completes later. (To shorten this, the post window can later be
+// written straight to the .raw as it arrives, skipping the ring re-read.)
 // Overridable at build time (makefile can sweep values) and 0 = no throttle.
 #ifndef EVENT_RECORDER_FINALIZE_BYTES_PER_SEC
-#define EVENT_RECORDER_FINALIZE_BYTES_PER_SEC (6u * 1024 * 1024)
+#define EVENT_RECORDER_FINALIZE_BYTES_PER_SEC (2u * 1024 * 1024)
 #endif
 const uint64_t kFinalizeBytesPerSec = EVENT_RECORDER_FINALIZE_BYTES_PER_SEC;
 
@@ -273,14 +286,15 @@ EventRecorder::~EventRecorder() {
     Shutdown();
 }
 
-void EventRecorder::Configure(bool enable, int pre_frames, int post_frames) {
+void EventRecorder::Configure(bool enable, int pre_frames, int post_frames, bool store_raw) {
     std::lock_guard<std::mutex> api_lk(api_mtx_);
     if (enable) shutdown_ = false;   // allow re-enable after a Shutdown
     enabled_ = enable;
     if (pre_frames >= 0) pre_frames_ = pre_frames;
     if (post_frames >= 0) post_frames_ = post_frames;
-    LogF("[EventRecorder] Configure: enable=%d pre_frames=%d post_frames=%d",
-         (int)enable, pre_frames_, post_frames_);
+    store_raw_ = store_raw;
+    LogF("[EventRecorder] Configure: enable=%d pre_frames=%d post_frames=%d store_raw=%d",
+         (int)enable, pre_frames_, post_frames_, (int)store_raw_);
 
 #if EVENT_RECORDER_PC_ANALYSIS
     // PC analysis-sidecar mode: pure in-RAM whole-session collector. No ring
@@ -345,6 +359,15 @@ bool EventRecorder::InitRing(int width, int height, int channels) {
     frame_size_ = (uint32_t)(width * height * channels);
     slot_size_ = (uint32_t)PageAlign(frame_size_);
     capacity_ = (uint32_t)(pre_frames_ + 1 + post_frames_ + kMarginSlots);
+    // Safe finalize-queue depth: each pending recording beyond the active one
+    // keeps ~post_frames of extra oldest span alive (events are >= post_frames
+    // apart), so kMarginSlots / post_frames windows fit before the oldest is
+    // overwritten. Events beyond this are saved meta-only (see OnEvent).
+    max_pending_ = (post_frames_ > 0) ? (int)(kMarginSlots / (uint32_t)post_frames_)
+                                      : (int)(kMarginSlots / (uint32_t)(pre_frames_ > 0 ? pre_frames_ : 1));
+    if (max_pending_ < 1) max_pending_ = 1;
+    LogF("[EventRecorder] ring capacity=%u slots, max queued recordings=%d "
+         "(margin=%u / post=%d)", capacity_, max_pending_, (unsigned)kMarginSlots, post_frames_);
 
 #if EVENT_RECORDER_SKIP_RAW_STORAGE
     // Perf-isolation test mode: no ring file, no mmap, no per-frame SD I/O at
@@ -597,9 +620,19 @@ void EventRecorder::OnEvent(const VisionSDKEvent& event, std::vector<uint8_t>&& 
     triggers_.clear();
     triggers_.push_back(t);
     event_bg_ = std::move(bg_image);
-    LogF("[EventRecorder] Event start: type=%s frame_index=%d seq=%llu",
+    // If the finalize queue is already at capacity, this recording can't be
+    // saved as raw without risking overwrite of an older queued window. Mark it
+    // a "skip capture": it still merges re-triggers over its window, but
+    // finalizes meta-only (event logged, no .raw). Protects the in-flight ones.
+    int pend = pending_raw_jobs_.load(std::memory_order_relaxed);
+    skip_capture_ = (pend >= max_pending_);
+    skip_pending_snapshot_ = pend;
+    LogF("[EventRecorder] Event start: type=%s frame_index=%d seq=%llu%s "
+         "(pending=%d/%d)",
          t.is_fall ? (t.is_bed_exit ? "fall+bed_exit" : "fall") : "bed_exit",
-         t.frame_index, (unsigned long long)t.seq);
+         t.frame_index, (unsigned long long)t.seq,
+         skip_capture_ ? " [QUEUE FULL -> meta-only skip]" : "",
+         pend, max_pending_);
 
     if (post_frames_ == 0) {
         QueueFinalize(true);
@@ -626,6 +659,7 @@ void EventRecorder::TriggerSelfTest(std::vector<uint8_t>&& bg_image) {
     triggers_.clear();
     triggers_.push_back(t);
     event_bg_ = std::move(bg_image);
+    skip_capture_ = false;   // self-test always records in full (fires once at startup)
     LogF("[EventRecorder][SELF-TEST] TEST recording started (NOT a real event) at seq=%llu"
          " (pre=%d post=%d); will save after %d more frames.",
          (unsigned long long)t.seq, pre_frames_, post_frames_, post_frames_);
@@ -721,10 +755,16 @@ void EventRecorder::QueueFinalize(bool complete) {
     job.event_recording_enabled = enabled_;
     job.event_recording_pre_frames = pre_frames_;
     job.event_recording_post_frames = post_frames_;
+    // meta_only when the queue was full at this capture's start (skip) -- the
+    // writer then reads no ring window and writes only a .meta.json.
+    job.meta_only = skip_capture_;
+    job.skipped_queue_full = skip_capture_;
+    job.pending_at_skip = skip_pending_snapshot_;
 
     // Copy the window's analysis snapshots now (caller holds api_mtx_): the
     // RAM ring keeps mutating after we return, the writer must not touch it.
-    if (!analysis_ring_.empty()) {
+    // Skip for meta_only jobs (no window is saved, keeps them cheap).
+    if (!job.meta_only && !analysis_ring_.empty()) {
         job.analysis.reserve((size_t)(job.last_seq - job.first_seq + 1));
         for (uint64_t seq = job.first_seq; seq <= job.last_seq; ++seq) {
             const FrameAnalysis& fa = analysis_ring_[(uint32_t)(seq % capacity_)];
@@ -733,8 +773,13 @@ void EventRecorder::QueueFinalize(bool complete) {
     }
 
     capturing_ = false;
+    skip_capture_ = false;
     triggers_.clear();
     event_bg_.clear();
+
+    // Only real (ring-reading) jobs count toward the queue-depth limit; a
+    // meta-only skip holds no ring frames.
+    if (!job.meta_only) pending_raw_jobs_.fetch_add(1, std::memory_order_relaxed);
 
     {
         std::lock_guard<std::mutex> lk(mtx_);
@@ -755,19 +800,23 @@ void EventRecorder::WriterLoop() {
             }
             job = std::move(jobs_.front());
             jobs_.pop_front();
-            copy_cursor_ = job.first_seq;   // protect window from overwrite
-            copy_last_ = job.last_seq;
+            // A meta-only job reads no ring window, so it neither protects a
+            // copy range nor waits for the spooler.
+            if (!job.meta_only) {
+                copy_cursor_ = job.first_seq;   // protect window from overwrite
+                copy_last_ = job.last_seq;
 #if EVENT_RECORDER_ASYNC_SPOOL
-            // Wait until the spooler has written every frame of this window
-            // into the ring before we read it. The spooler advances
-            // spooled_seq_ for each dequeued frame (even ones it drops for
-            // overwrite protection), and the last_seq frame was enqueued
-            // before this job, so spooled_seq_ is guaranteed to reach
-            // last_seq+1 -- this cannot hang. Intentionally NOT gated on stop_:
-            // on shutdown the spooler drains fully before it exits, so waiting
-            // purely on spooled_seq_ still reads a complete window.
-            cv_.wait(lk, [this, &job] { return spooled_seq_ > job.last_seq; });
+                // Wait until the spooler has written every frame of this window
+                // into the ring before we read it. The spooler advances
+                // spooled_seq_ for each dequeued frame (even ones it drops for
+                // overwrite protection), and the last_seq frame was enqueued
+                // before this job, so spooled_seq_ is guaranteed to reach
+                // last_seq+1 -- this cannot hang. Intentionally NOT gated on
+                // stop_: on shutdown the spooler drains fully before it exits,
+                // so waiting purely on spooled_seq_ still reads a complete window.
+                cv_.wait(lk, [this, &job] { return spooled_seq_ > job.last_seq; });
 #endif
+            }
         }
 
         RunFinalize(job);
@@ -776,6 +825,9 @@ void EventRecorder::WriterLoop() {
             std::lock_guard<std::mutex> lk(mtx_);
             copy_cursor_ = kInvalidSeq;
         }
+        // A real recording is done reading the ring: free its queue slot so the
+        // next event can be recorded (rather than skipped) again.
+        if (!job.meta_only) pending_raw_jobs_.fetch_sub(1, std::memory_order_relaxed);
     }
 }
 
@@ -865,12 +917,18 @@ void EventRecorder::RunFinalize(const FinalizeJob& job) {
     std::vector<uint32_t> frame_proc_us;
     bool raw_saved = false;
     bool bg_saved = false;
+    // json-only (store_raw=false) or a queue-full skip (job.meta_only): do NOT
+    // read the ring window or write .raw/.bg. Only .meta.json / .analysis.jsonl /
+    // the global log follow. write_raw guards the whole raw+bg block below.
+    bool write_raw = store_raw_ && !job.meta_only;
 
 #if EVENT_RECORDER_SKIP_RAW_STORAGE
+    (void)write_raw;
     LogF("[EventRecorder] PERF-TEST MODE: skipping raw/bg file write for %s "
          "(EVENT_RECORDER_SKIP_RAW_STORAGE=1) -- meta/analysis/log JSON still written.",
          base_name);
 #else
+  if (write_raw) {
     // --- 1. Frame window: ring -> .raw (write to .tmp, fsync, rename) ---
     int out = open(raw_tmp.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
     if (out < 0) {
@@ -961,6 +1019,10 @@ void EventRecorder::RunFinalize(const FinalizeJob& job) {
             if (!bg_saved) unlink(bg_tmp.c_str());
         }
     }
+  } else {
+    LogF("[EventRecorder] %s: json-only (store_raw=%d meta_only=%d) -- no .raw/.bg written",
+         base_name, (int)store_raw_, (int)job.meta_only);
+  }
 #endif // EVENT_RECORDER_SKIP_RAW_STORAGE
 
     // Raw storage skipped (or otherwise yielded nothing): fall back to the
@@ -977,7 +1039,14 @@ void EventRecorder::RunFinalize(const FinalizeJob& job) {
         }
         first_ts = frame_ts.front();
         last_ts = frame_ts.back();
+        // No .raw was written (json-only), so written/missing weren't computed by
+        // the ring loop; derive them from the analysis coverage of the window.
+        written = frame_ts.size();
+        uint64_t win = (job.last_seq >= job.first_seq) ? (job.last_seq - job.first_seq + 1) : 0;
+        missing = (win >= written) ? (win - written) : 0;
     }
+    // A queue-full skip saved no window at all.
+    if (job.meta_only) { written = 0; missing = 0; }
 
     // --- 2.5 Per-frame analysis snapshots -> <base>.analysis.jsonl ---
     // Line 1 is a header (grid geometry + window info); every following line
@@ -1016,12 +1085,12 @@ void EventRecorder::RunFinalize(const FinalizeJob& job) {
                     AppendF(buf, "%s{\"id\":%d,\"cx\":%.2f,\"cy\":%.2f,"
                                  "\"dx\":%.2f,\"dy\":%.2f,\"strength\":%.2f,"
                                  "\"accel\":%.2f,\"pixels\":%d,\"safe_ratio\":%.3f,"
-                                 "\"dir_var\":%.3f,\"obs\":%d,\"is_fall\":%d,\"fg_area\":%d,\"coasting\":%d,\"blocks\":[",
+                                 "\"dir_var\":%.3f,\"obs\":%d,\"is_fall\":%d,\"is_bed_exit\":%d,\"fg_area\":%d,\"coasting\":%d,\"blocks\":[",
                             o ? "," : "", ob.id, (double)ob.cx, (double)ob.cy,
                             (double)ob.dx, (double)ob.dy, (double)ob.strength,
                             (double)ob.acceleration, ob.pixel_count,
                             (double)ob.safe_area_ratio, (double)ob.direction_variance,
-                            ob.in_observation ? 1 : 0, ob.is_fall ? 1 : 0, ob.fg_area, ob.is_coasting ? 1 : 0);
+                            ob.in_observation ? 1 : 0, ob.is_fall ? 1 : 0, ob.is_bed_exit ? 1 : 0, ob.fg_area, ob.is_coasting ? 1 : 0);
                     for (size_t b = 0; b < ob.blocks.size(); ++b) {
                         AppendF(buf, b ? ",%u" : "%u", (unsigned)ob.blocks[b]);
                     }
@@ -1096,6 +1165,13 @@ void EventRecorder::RunFinalize(const FinalizeJob& job) {
         AppendF(js, "  \"total_frames\": %llu,\n  \"missing_frames\": %llu,\n",
                 (unsigned long long)written, (unsigned long long)missing);
         AppendF(js, "  \"complete\": %s,\n", job.complete ? "true" : "false");
+        AppendF(js, "  \"store_raw\": %s,\n", store_raw_ ? "true" : "false");
+        AppendF(js, "  \"skipped\": %s,\n", job.meta_only ? "true" : "false");
+        if (job.meta_only) {
+            AppendF(js, "  \"skipped_reason\": \"%s\",\n",
+                    job.skipped_queue_full ? "queue_full" : "store_raw_off");
+            AppendF(js, "  \"pending_jobs_at_skip\": %d,\n", job.pending_at_skip);
+        }
         AppendF(js, "  \"ring_dropped_frames\": %llu,\n", (unsigned long long)dropped);
         AppendF(js, "  \"first_timestamp_ms\": %llu,\n  \"last_timestamp_ms\": %llu,\n",
                 (unsigned long long)first_ts, (unsigned long long)last_ts);
@@ -1308,6 +1384,7 @@ void EventRecorder::RunFinalize(const FinalizeJob& job) {
                       "\"event_timestamp_ms\":%llu,\"trigger_count\":%llu,"
                       "\"max_confidence\":%.4f,\"total_frames\":%llu,"
                       "\"process_time_us_avg\":%llu,\"process_time_us_max\":%u,"
+                      "\"skipped\":%s,\"skipped_reason\":\"%s\","
                       "\"complete\":%s}\n",
                 event_type, event_frame_index,
                 (unsigned long long)(job.triggers.empty() ? 0 : job.triggers.front().timestamp_ms),
@@ -1315,6 +1392,8 @@ void EventRecorder::RunFinalize(const FinalizeJob& job) {
                 (double)max_conf, (unsigned long long)written,
                 (unsigned long long)(frame_proc_us.empty() ? 0 : proc_sum / frame_proc_us.size()),
                 proc_max,
+                job.meta_only ? "true" : "false",
+                job.meta_only ? (job.skipped_queue_full ? "queue_full" : "store_raw_off") : "",
                 job.complete ? "true" : "false");
 
         std::string log_path = event_dir_ + "/" + kLogFileName;
@@ -1455,12 +1534,12 @@ void EventRecorder::WritePcAnalysis() {
             const FrameAnalysisObject& ob = fa.objects[o];
             AppendF(a, "%s{\"id\":%d,\"cx\":%.2f,\"cy\":%.2f,\"dx\":%.2f,\"dy\":%.2f,"
                        "\"strength\":%.2f,\"accel\":%.2f,\"pixels\":%d,\"safe_ratio\":%.3f,"
-                       "\"dir_var\":%.3f,\"obs\":%d,\"is_fall\":%d,\"fg_area\":%d,\"coasting\":%d,\"blocks\":[",
+                       "\"dir_var\":%.3f,\"obs\":%d,\"is_fall\":%d,\"is_bed_exit\":%d,\"fg_area\":%d,\"coasting\":%d,\"blocks\":[",
                     o ? "," : "", ob.id, (double)ob.cx, (double)ob.cy,
                     (double)ob.dx, (double)ob.dy, (double)ob.strength,
                     (double)ob.acceleration, ob.pixel_count,
                     (double)ob.safe_area_ratio, (double)ob.direction_variance,
-                    ob.in_observation ? 1 : 0, ob.is_fall ? 1 : 0, ob.fg_area, ob.is_coasting ? 1 : 0);
+                    ob.in_observation ? 1 : 0, ob.is_fall ? 1 : 0, ob.is_bed_exit ? 1 : 0, ob.fg_area, ob.is_coasting ? 1 : 0);
             for (size_t b = 0; b < ob.blocks.size(); ++b) {
                 AppendF(a, b ? ",%u" : "%u", (unsigned)ob.blocks[b]);
             }

@@ -163,6 +163,11 @@ public:
     // Get current motion objects
     // Get current motion objects
     const std::vector<MotionObject>& GetMotionObjects() const;
+
+    // True if object `id` is flagged as bed-exit this frame (from the per-object
+    // bed-exit tracking). Read-only; used by the event recorder to record WHICH
+    // object triggered a bed-exit into the analysis snapshot.
+    bool IsObjectBedExit(int id) const;
     
     // Get full-frame foreground objects
     std::vector<ObjectFeatures> GetFullFrameObjects() const;
