@@ -43,6 +43,28 @@ int ggap = 1;
 
 using namespace std;
 
+// MotionObject::trajectory 上限 (2026-08-28)。
+// 這條軌跡每幀 push 一點,而且在 tracking 關聯時會整條複製給下一幀
+// (current[i].trajectory = previous[j].trajectory)。原本沒有任何上限,所以一個
+// 長時間存在的 track(例如躺在床上不動的人)會讓它線性成長:記憶體是 O(n),
+// 每幀的複製成本也是 O(n) => 整體 O(n^2)。板子上 7fps 連續跑數小時就會累積到
+// 數百 MB 並拖慢每一幀;PC 上用幾分鐘的 .gray 回放做演算法驗證則完全看不到。
+//
+// 目前全專案沒有任何程式碼「讀取」trajectory 的內容(只有 push_back、整體複製,
+// 以及 mode 1 用 .empty() 判斷是不是全新物件),所以限制長度不會改變任何偵測
+// 結果 —— 上限 > 0 就能保證 .empty() 的語意不變。
+static const size_t kMaxTrajectoryPoints = 120;
+
+// push 一個軌跡點並維持長度上限。超出時丟掉最舊的點(保留最近的軌跡)。
+static inline void PushTrajectoryPoint(VisionSDK::MotionObject& obj, int x, int y) {
+    obj.trajectory.push_back({x, y});
+    if (obj.trajectory.size() > kMaxTrajectoryPoints) {
+        obj.trajectory.erase(obj.trajectory.begin(),
+                             obj.trajectory.begin() +
+                                 (obj.trajectory.size() - kMaxTrajectoryPoints));
+    }
+}
+
 #if defined(__ARM_NEON) || defined(__ARM_NEON__)
 #include <arm_neon.h>
 #endif
@@ -3438,7 +3460,7 @@ void TrackObjects(std::vector<MotionObject>& current, const std::vector<MotionOb
         for (auto& obj : current) {
              bool was_new = (obj.id < 1000);
              if (was_new) obj.id = global_id_counter++; // New ID
-             obj.trajectory.push_back({(int)obj.centerX, (int)obj.centerY});
+             PushTrajectoryPoint(obj, (int)obj.centerX, (int)obj.centerY);
              
              // Track entry filter info for new objects
              if (was_new) {
@@ -3500,7 +3522,7 @@ void TrackObjects(std::vector<MotionObject>& current, const std::vector<MotionOb
                 for (int objIdx : currIndices) {
                     current[objIdx].id = pObj.id;
                     current[objIdx].trajectory = pObj.trajectory;
-                    current[objIdx].trajectory.push_back({(int)avgX, (int)avgY});
+                    PushTrajectoryPoint(current[objIdx], (int)avgX, (int)avgY);
                     
                     // Fallback Strength Calculation (Centroid Speed)
                     float cx = current[objIdx].centerX;
@@ -3553,7 +3575,7 @@ void TrackObjects(std::vector<MotionObject>& current, const std::vector<MotionOb
                  float dist = 0.0f; // Hard to define dist for merge. Use ME strength.
                  
                  current[currIdx].acceleration = current[currIdx].strength - avgPrevStrength;
-                 current[currIdx].trajectory.push_back({(int)current[currIdx].centerX, (int)current[currIdx].centerY});
+                 PushTrajectoryPoint(current[currIdx], (int)current[currIdx].centerX, (int)current[currIdx].centerY);
              } 
              else if (prevIndices.size() == 1) {
                  int pIdx = prevIndices[0];
@@ -3577,7 +3599,7 @@ void TrackObjects(std::vector<MotionObject>& current, const std::vector<MotionOb
                          DEBUG_PRINT("[TrackFallback] ID %d Used Centroid Speed (Blocks: %.3f -> Pixels: %.1f)\n", current[currIdx].id, dist_blocks, pixel_dist);
                      }
 
-                     current[currIdx].trajectory.push_back({(int)cx, (int)cy});
+                     PushTrajectoryPoint(current[currIdx], (int)cx, (int)cy);
                      current[currIdx].acceleration = current[currIdx].strength - previous[pIdx].strength;
                  }
              }
@@ -3834,7 +3856,7 @@ void TrackObjects(std::vector<MotionObject>& current, const std::vector<MotionOb
                 // New Object
                 bool was_new = (current[j].id < 1000);
                 if (was_new) current[j].id = global_id_counter++;
-                 current[j].trajectory.push_back({(int)current[j].centerX, (int)current[j].centerY});
+                 PushTrajectoryPoint(current[j], (int)current[j].centerX, (int)current[j].centerY);
                  
                  // Track entry filter info for new objects
                  if (was_new) {
@@ -3870,7 +3892,7 @@ void TrackObjects(std::vector<MotionObject>& current, const std::vector<MotionOb
             if (obj.trajectory.empty()) {
                 bool was_new = (obj.id < 1000);
                 if (was_new) obj.id = global_id_counter++;
-                obj.trajectory.push_back({(int)obj.centerX, (int)obj.centerY});
+                PushTrajectoryPoint(obj, (int)obj.centerX, (int)obj.centerY);
                 if (was_new) {
                     detectEdgeEntry(obj, obj.id);
                 }

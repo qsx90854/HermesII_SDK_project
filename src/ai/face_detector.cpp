@@ -26,6 +26,13 @@ namespace VisionSDK {
 
 bool g_npu_sys_initialized = false;
 
+// Single switch for the face-detector input orientation.
+// true  : Resize() feeds a vertically flipped 128x128 image to the NPU, and
+//         Detect() maps the detected Y coords back to the original top-down space.
+// false : no flip anywhere, detected Y coords are used as-is.
+// Resize() and Detect() both read this, so the two always stay in sync.
+static constexpr bool kFaceVFlip = true;
+
 // =========================================================
 // Debug Helper: Save Gray BMP
 // =========================================================
@@ -492,21 +499,22 @@ public:
         if (num_dets == 0) return 0;
 
         // 5. Post-process (Union)
-        // Note: The input image was vertically flipped (vflip=true in Resize).
-        // So the detected coordinates are relative to the flipped image (0,0 is bottom-left of original).
-        // We need to revert the Y-coordinates to match the original top-down orientation.
-        // Coordinate Space: 0..128. 
-        // y_orig = 128 - y_flipped (roughly, assuming standard pixel coords).
-        // Check blaze_face_parse output: x1, y1 are pixels.
-        
-        auto fix_y = [](float y) { return 128.0f - y; };
+        // Map the parser output (128x128 crop space) back to the original top-down
+        // orientation. When the input was flipped, y_orig = 128 - y_flipped, and the
+        // top/bottom edges swap roles, so y1/y2 are exchanged as well.
+        auto map_y = [](float in_y1, float in_y2, float& out_y1, float& out_y2) {
+            if (kFaceVFlip) {
+                out_y1 = 128.0f - in_y2;
+                out_y2 = 128.0f - in_y1;
+            } else {
+                out_y1 = in_y1;
+                out_y2 = in_y2;
+            }
+        };
 
-        // We need to be careful with y1 vs y2. If y1 < y2 in flipped, then 128-y1 > 128-y2.
-        // So flipped y1 becomes new y2, flipped y2 becomes new y1.
-        
         if (num_dets == 1) {
-            float y1 = fix_y(results[0].y2); // Swap 1 and 2
-            float y2 = fix_y(results[0].y1);
+            float y1, y2;
+            map_y(results[0].y1, results[0].y2, y1, y2);
             faces.push_back({results[0].x1, y1, results[0].x2, y2, results[0].score});
         } else {
              float ux1 = results[0].x1;
@@ -523,9 +531,8 @@ public:
                  if (results[i].score > max_score) max_score = results[i].score;
              }
              
-             // Fix Union Box
-             float fixed_y1 = fix_y(uy2);
-             float fixed_y2 = fix_y(uy1);
+             float fixed_y1, fixed_y2;
+             map_y(uy1, uy2, fixed_y1, fixed_y2);
              faces.push_back({ux1, fixed_y1, ux2, fixed_y2, max_score});
         }
         return 0;
@@ -543,9 +550,9 @@ public:
         
         // Delegate to ImageProcess
         // We know we want 128x128 output
-        // Also enable V-Flip because reference demo does it (input data is likely flipped)
+        // V-Flip is driven by kFaceVFlip so Detect()'s Y mapping always matches.
         // printf("before call ImageProcess Resize\n");
-        return imageProcess.Resize(src, dst, 128, 128, true, crop_x, crop_y, crop_w, crop_h);
+        return imageProcess.Resize(src, dst, 128, 128, kFaceVFlip, crop_x, crop_y, crop_w, crop_h);
     }
 #else
     // MOCK IMPLEMENTATION

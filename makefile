@@ -25,6 +25,12 @@ PC_FLAGS = -D__PC_BUILD__ -DDISABLE_NPU
 # Combine for default CXX (ARM)
 CXXFLAGS = $(COMMON_FLAGS) $(ARM_FLAGS)
 
+# Header 相依自動追蹤 (2026-09-14,與 makefile2_edge 同步)
+# 原本編譯規則沒有任何 header 相依:改了 .h 而沒改對應的 .cpp,make 不會重編。
+# 這個專案裡特別危險 —— Impl 是 by value 持有 ActiveEventRecorder,event_recorder*.h
+# 一改 sizeof 就變了,用到舊 .o 不會有編譯錯誤,而是在執行期踩壞記憶體。
+DEPFLAGS = -MMD -MP
+
 # NPU Libraries
 LDFLAGS_NPU += -Wl,--start-group
 LDFLAGS_NPU += $(wildcard $(SDK_LIBRARY)/npu/*.a)
@@ -108,19 +114,19 @@ $(LIB_TARGET): $(SDK_OBJS) | $(BUILD_DIR)
 SDK_PC_OBJS = $(addprefix $(BUILD_DIR)/pc_, $(notdir $(SDK_OBJS)))
 
 $(BUILD_DIR)/pc_%.o: src/%.cpp | $(BUILD_DIR)
-	g++ $(COMMON_FLAGS) $(PC_FLAGS) -c $< -o $@
+	g++ $(COMMON_FLAGS) $(PC_FLAGS) $(DEPFLAGS) -c $< -o $@
 
 $(BUILD_DIR)/pc_%.o: src/ai/%.cpp | $(BUILD_DIR)
-	g++ $(COMMON_FLAGS) $(PC_FLAGS) -c $< -o $@
+	g++ $(COMMON_FLAGS) $(PC_FLAGS) $(DEPFLAGS) -c $< -o $@
 
 $(BUILD_DIR)/pc_%.o: src/fusion/%.cpp | $(BUILD_DIR)
-	g++ $(COMMON_FLAGS) $(PC_FLAGS) -c $< -o $@
+	g++ $(COMMON_FLAGS) $(PC_FLAGS) $(DEPFLAGS) -c $< -o $@
 
 $(BUILD_DIR)/pc_%.o: src/fall/%.cpp | $(BUILD_DIR)
-	g++ $(COMMON_FLAGS) $(PC_FLAGS) -c $< -o $@
+	g++ $(COMMON_FLAGS) $(PC_FLAGS) $(DEPFLAGS) -c $< -o $@
 
 $(BUILD_DIR)/pc_%.o: src/image_process/%.cpp | $(BUILD_DIR)
-	g++ $(COMMON_FLAGS) $(PC_FLAGS) -c $< -o $@
+	g++ $(COMMON_FLAGS) $(PC_FLAGS) $(DEPFLAGS) -c $< -o $@
 
 $(LIB_PC_TARGET): $(SDK_PC_OBJS) | $(BUILD_DIR)
 	g++ -shared -o $@ $(SDK_PC_OBJS) -lpthread
@@ -214,9 +220,15 @@ $(INI_READ_TEST_PC_TARGET): examples/ini_read_test.cpp
 
 # 編譯 .o 檔
 %.o: %.cpp
-	$(CXX) $(CXXFLAGS) -c $< -o $@
+	$(CXX) $(CXXFLAGS) $(DEPFLAGS) -c $< -o $@
+
+# 把 -MMD 產生的 header 相依檔收回來(見上面 DEPFLAGS 說明)。用 wildcard 撈,
+# 全新編譯時不存在也不會出錯。PC 物件檔的 .d 在 $(BUILD_DIR) 底下。
+DEPFILES = $(wildcard src/*.d src/*/*.d $(BUILD_DIR)/*.d)
+-include $(DEPFILES)
 
 # 清除規則
 clean:
 	rm -f $(SDK_OBJS) $(FALL_DEMO_TARGET) $(FALL_CALLBACK_TARGET) $(SDK_DEMO_CODE_V1_TARGET) $(SDK_DEMO_CODE_V2_TARGET) $(SDK_DEMO_TEST_ACCURACY_TARGET) $(STREAMING_DEMO_TARGET) $(RTSP_DEMO_TARGET) $(FALL_ACCURACY_TEST_TARGET) $(SDK_DEMO_BG_TEST_TARGET) $(SDK_ERRORLOG_VERIFIER_TARGET) $(SDK_GRAY_TEST_PC_TARGET) $(SDK_GRAY_TEST_EDGE_TARGET) $(EVENT_REPLAY_VERIFY_PC_TARGET) $(EVENT_REPLAY_VERIFY_EDGE_TARGET) $(SDK_GRAY_COUNT_FALLS_PC_TARGET) $(SDK_GRAY_COUNT_FALLS_EDGE_TARGET) $(INI_READ_TEST_PC_TARGET) $(INI_READ_TEST_EDGE_TARGET)
+	rm -f src/*.d src/*/*.d
 	rm -rf $(BUILD_DIR)

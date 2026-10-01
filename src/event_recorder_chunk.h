@@ -103,6 +103,17 @@ private:
         std::string meta_name;
     };
 
+    // 節流過的錯誤 log 狀態。SD 壞掉時 I/O 錯誤是「每一幀」都會發生的,不節流
+    // 的話 30fps 就是 30 行/秒且沒有上限;stdout 若又被導向 SD 上的檔案,這些
+    // log 本身會繼續吃空間,並在 SD 阻塞時把 spooler thread 卡在 write() 上。
+    // 每個實例只屬於單一 thread(見成員宣告的註解),所以不需要鎖。
+    struct ErrThrottle {
+        uint64_t last_ms = 0;
+        uint64_t hidden = 0;
+        // 回傳 true 表示這次該印,並把期間被壓掉的次數填進 suppressed。
+        bool Allow(uint64_t& suppressed);
+    };
+
     bool InitStorage(int width, int height, int channels);   // caller holds api_mtx_
     void StartThreadsLocked();
     void SpoolerLoop();      // appends frames into chunk files
@@ -110,7 +121,8 @@ private:
     void QueueMeta(bool complete);   // caller holds api_mtx_
     void WriteMeta(const MetaJob& job);
     void RunGc();            // deletes rolling-buffer chunks not retained (throttled)
-    bool SpaceForOneEvent() const;   // statvfs: room to retain another window?
+    // nullptr => 可以保留這個事件的 chunk;否則回傳不保留的原因字串(靜態字面量)。
+    const char* RetainBlockedReason() const;
     void Fail(const std::string& why);
 
     std::string ChunkPath(uint64_t chunk_id) const;
@@ -128,7 +140,8 @@ private:
     int width_ = 0, height_ = 0, channels_ = 0;
     uint32_t frame_size_ = 0;
     bool ready_ = false;
-    bool failed_ = false;
+    // spooler thread 也會在執行中的 I/O 錯誤時呼叫 Fail(),所以必須是 atomic。
+    std::atomic<bool> failed_{false};
 
     std::string base_dir_;
     std::string event_dir_;          // <base>/event_record (parent of session folders)
@@ -172,17 +185,27 @@ private:
     bool spooler_running_ = false;
     std::deque<SpoolFrame> spool_q_;
     uint64_t spooled_seq_ = 0;
-    uint64_t dropped_frames_ = 0;
+    // SDK thread 寫、writer thread 讀(WriteMeta),所以是 atomic 而非受 mtx_ 保護。
+    std::atomic<uint64_t> dropped_frames_{0};
     int cur_chunk_fd_ = -1;          // spooler thread only
     uint64_t cur_chunk_id_ = UINT64_MAX;  // spooler thread only
+    int spool_err_streak_ = 0;       // spooler thread only: 連續 I/O 失敗次數
+    ErrThrottle spool_err_log_;      // spooler thread only
 
     // writer + GC
     std::thread writer_;
     bool writer_running_ = false;
     std::deque<MetaJob> jobs_;
+    // writer 卡在 hang 住的 fsync 時被丟棄的 meta job 數(見 QueueMeta 的上限)。
+    std::atomic<uint64_t> dropped_jobs_{0};
+    ErrThrottle job_drop_log_;       // SDK thread only (QueueMeta)
+    ErrThrottle retain_block_log_;   // SDK thread only (RetainBlockedReason)
 
     // retention / existing chunks (mtx_)
     std::deque<Retained> retained_;
+    // retained_.size() 的無鎖鏡像:RetainBlockedReason() 在 SDK thread 上被呼叫
+    // (持有 api_mtx_),不必為了讀一個數字去搶 writer thread 的 mtx_。
+    std::atomic<size_t> retained_count_{0};
     std::set<uint64_t> existing_chunks_;   // chunk_ids currently on disk
     uint64_t gc_last_seq_seen_ = 0;        // latest write_seq_ observed by GC's floor calc
 };

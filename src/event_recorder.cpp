@@ -87,6 +87,8 @@
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <sys/statvfs.h>
+#include <cstdint>
 
 #include <cerrno>
 #include <cstdarg>
@@ -184,6 +186,43 @@ const size_t kFinalizeYieldWatermark = 8;      // out of kMaxSpoolFrames (36)
 #define EVENT_RECORDER_FINALIZE_BYTES_PER_SEC (2u * 1024 * 1024)
 #endif
 const uint64_t kFinalizeBytesPerSec = EVENT_RECORDER_FINALIZE_BYTES_PER_SEC;
+
+// ===========================================================================
+// 儲存位置安全性 (2026-08-28) — 與 event_recorder_chunk.cpp 的修正同一件事。
+// ===========================================================================
+// 原本只用 access(kBasePath, W_OK) 判斷。SD 沒掛載時 /mnt/mmcblk1p1 仍然是
+// rootfs 上一個普通的空目錄,只要 rootfs 可寫,access() 就會通過 -> 這顆 ~1GB 的
+// ring 檔就被 ftruncate/mmap 在 rootfs 上。ftruncate 出來的是稀疏檔,所以一開始
+// 不會失敗,而是隨著每幀寫入慢慢長大 -> RAM/flash 被吃光 -> 板子 OOM 死掉、必須
+// 重新上電。「過一段時間才死」的時間特徵就是這樣來的。
+// 舊的 fallback(寫進 cwd 的 ./event_record)本來只是給 PC 測試用的便利路徑,
+// 卻同時成了板子上的災難路徑。
+//
+// 新規則(失敗一律是「停用錄影」,絕不「換個地方寫」):
+//   * kBasePath 不存在        -> PC 開發環境,沿用 ./event_record fallback
+//   * kBasePath 存在但沒掛載  -> Fail
+//   * kBasePath 掛載但不可寫  -> Fail
+//   * 剩餘空間放不下 ring 檔  -> Fail
+const uint64_t kMinFreeBytesToStart = 64ull * 1024 * 1024;   // ring 檔以外的額外餘裕
+
+// path 是否為真正的掛載點(與其父目錄不同 st_dev)。
+bool IsMountPoint(const std::string& path) {
+    struct stat me, par;
+    if (stat(path.c_str(), &me) != 0) return false;
+    std::string p = path;
+    while (p.size() > 1 && p[p.size() - 1] == '/') p.erase(p.size() - 1);
+    size_t slash = p.find_last_of('/');
+    std::string parent = (slash == std::string::npos) ? std::string(".")
+                       : (slash == 0 ? std::string("/") : p.substr(0, slash));
+    if (stat(parent.c_str(), &par) != 0) return false;
+    return me.st_dev != par.st_dev;
+}
+
+uint64_t FreeBytes(const std::string& dir) {
+    struct statvfs vfs;
+    if (statvfs(dir.c_str(), &vfs) != 0) return 0;
+    return (uint64_t)vfs.f_bavail * (uint64_t)vfs.f_frsize;
+}
 
 size_t PageAlign(size_t n) { return (n + kPageSize - 1) & ~(kPageSize - 1); }
 
@@ -334,18 +373,42 @@ void EventRecorder::Fail(const std::string& why) {
 }
 
 bool EventRecorder::InitRing(int width, int height, int channels) {
-    // Pick storage location: SD card, else local fallback for PC testing.
-    if (access(kBasePath, W_OK) == 0) {
-        base_dir_ = kBasePath;
-        event_dir_ = std::string(kBasePath) + "/event_record";
-    } else {
-        LogF("[EventRecorder] Warning: %s not writable, falling back to %s",
-             kBasePath, kFallbackDir);
-        base_dir_ = kFallbackDir;
-        event_dir_ = kFallbackDir;
-        if (mkdir(base_dir_.c_str(), 0755) != 0 && errno != EEXIST) {
-            Fail("mkdir fallback dir failed");
+    // Pick storage location. 見上方 kMinFreeBytesToStart 附近的說明:
+    // 這裡絕不能在 SD 不可用時「退而求其次」寫到 rootfs 或 cwd。
+    {
+        struct stat st;
+        if (stat(kBasePath, &st) != 0) {
+            // 掛載點目錄本身不存在。PC 上正常;板子上代表開機腳本沒建出掛載點,
+            // 此時退回 CWD 很危險:CWD 可能落在 tmpfs/rootfs 上,statvfs 量到的
+            // 是 tmpfs 上限,空間門檻會通過,然後 ring 檔就直接吃光 RAM -> OOM。
+            // fallback 只在 PC build 開啟。
+#if defined(__PC_BUILD__) || defined(HERMES_ALLOW_CWD_FALLBACK)
+            LogF("[EventRecorder] %s not present, using dev fallback %s",
+                 kBasePath, kFallbackDir);
+            base_dir_ = kFallbackDir;
+            event_dir_ = kFallbackDir;
+            if (mkdir(base_dir_.c_str(), 0755) != 0 && errno != EEXIST) {
+                Fail("mkdir fallback dir failed");
+                return false;
+            }
+#else
+            Fail(std::string(kBasePath) + " does not exist (SD mount point missing) -- "
+                 "refusing to fall back to the working directory");
             return false;
+#endif
+        } else if (!S_ISDIR(st.st_mode)) {
+            Fail(std::string(kBasePath) + " exists but is not a directory");
+            return false;
+        } else if (!IsMountPoint(kBasePath)) {
+            Fail(std::string(kBasePath) + " is not a mount point (SD not mounted?) -- "
+                 "refusing to create the ring file on the rootfs");
+            return false;
+        } else if (access(kBasePath, W_OK) != 0) {
+            Fail(std::string(kBasePath) + " is mounted but not writable (remounted read-only?)");
+            return false;
+        } else {
+            base_dir_ = kBasePath;
+            event_dir_ = std::string(kBasePath) + "/event_record";
         }
     }
     if (mkdir(event_dir_.c_str(), 0755) != 0 && errno != EEXIST) {
@@ -386,7 +449,40 @@ bool EventRecorder::InitRing(int width, int height, int channels) {
 #else
     size_t index_bytes = PageAlign((size_t)capacity_ * sizeof(RingSlotIndex));
     size_t data_off = kPageSize + index_bytes;
-    map_size_ = data_off + (size_t)capacity_ * slot_size_;
+
+    // ring 檔大小先用 64-bit 算,再確認塞得進 size_t。target 是 32-bit ARM
+    // (sizeof(size_t) == 4),原本直接寫 (size_t)capacity_ * slot_size_ 是 32-bit
+    // 乘法:一旦影格夠大(例如 3 channel 或更高解析度)乘積就會超過 4GB 而靜默
+    // 回繞,得到一個很小的 map_size_ -> mmap 成功但 PushFrame 仍依 slot_size_ 算
+    // offset 往外寫 -> 寫到映射範圍外。這裡直接擋掉。
+    uint64_t want_size = (uint64_t)data_off + (uint64_t)capacity_ * (uint64_t)slot_size_;
+    if (want_size > (uint64_t)SIZE_MAX) {
+        char why[160];
+        snprintf(why, sizeof(why),
+                 "ring size %llu MB exceeds the address space (capacity=%u slot=%u)",
+                 (unsigned long long)(want_size / (1024 * 1024)), capacity_, slot_size_);
+        Fail(why);
+        return false;
+    }
+    map_size_ = (size_t)want_size;
+
+    // 空間門檻:寧可不錄,也不要把儲存裝置寫爆。ftruncate 出來的是稀疏檔,
+    // 不先檢查的話它會「先成功、之後才慢慢把裝置塞滿」。
+    {
+        uint64_t freeb = FreeBytes(base_dir_);
+        uint64_t need = want_size + kMinFreeBytesToStart;
+        if (freeb < need) {
+            char why[192];
+            snprintf(why, sizeof(why),
+                     "insufficient free space at %s: %llu MB free, ring needs %llu MB + %llu MB floor",
+                     base_dir_.c_str(),
+                     (unsigned long long)(freeb / (1024 * 1024)),
+                     (unsigned long long)(want_size / (1024 * 1024)),
+                     (unsigned long long)(kMinFreeBytesToStart / (1024 * 1024)));
+            Fail(why);
+            return false;
+        }
+    }
 
     std::string ring_path = base_dir_ + "/" + kRingFileName;
     fd_ = open(ring_path.c_str(), O_RDWR | O_CREAT, 0644);

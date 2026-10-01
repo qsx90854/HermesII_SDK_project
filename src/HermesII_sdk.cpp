@@ -58,12 +58,17 @@ namespace VisionSDK {
         VisionSDKCallback user_callback;
         bool internal_callback_registered = false;
 
-        // Recorder self-test: FORCED ON for bring-up testing (no sdk.ini
-        // needed). Once more than kSelfTestTriggerFrame frames have been
-        // processed, fire one synthetic event to verify the whole
-        // trigger/save pipeline; afterwards normal event logic applies.
+        // Recorder self-test: 處理超過 kSelfTestTriggerFrame 幀之後,發出一次
+        // 合成事件來驗證整條 trigger/save 管線;之後恢復正常事件邏輯。
+        //
+        // 2026-08-28: 預設由「強制開啟」改為關閉,改用 sdk.ini 的
+        // event_record_self_test=1 開啟(回到原本設計的意圖)。原因:chunk 後端
+        // 的事件是靠 retention 永久釘住 chunk 檔的,所以「每次開機都自動錄一次」
+        // 等於每重開一次機就永久佔用一段 pre+post 的空間,而 RunGc() 只回收
+        // 當前 session、跨 session 沒人清 => 板子當掉->重上電的循環會單調累積。
+        // 這是 bring-up 期間的除錯開關,不該是生產預設值。
         static const uint64_t kSelfTestTriggerFrame = 300;
-        bool event_record_self_test = true;
+        bool event_record_self_test = false;
         bool self_test_triggered = false;
         uint64_t recorder_frame_count = 0;
 
@@ -105,7 +110,7 @@ using namespace VisionSDK;
 VisionSDK::VisionSDK::VisionSDK() : pImpl(std::unique_ptr<Impl>(new Impl())) {}
 VisionSDK::VisionSDK::~VisionSDK() = default;
 
-#define VISION_SDK_VERSION_INTERNAL "2.0.6_20260731"
+#define VISION_SDK_VERSION_INTERNAL "2.0.7_20260908"
 
 const char* VisionSDK::VisionSDK::GetVersion() {
     return VISION_SDK_VERSION_INTERNAL;
@@ -135,11 +140,15 @@ StatusCode VisionSDK::VisionSDK::Init(const std::string& model_path, int num_thr
                     if (key == "only_save_raw" && val == "1") {
                         pImpl->config.only_save_raw = true;
                     }
+                    if (key == "event_record_self_test" && val == "1") {
+                        pImpl->event_record_self_test = true;
+                    }
                 }
             }
             ini_file.close();
             std::cout << "[SDK] sdk.ini loaded. save_txt=" << (int)save_txt 
-                      << " only_save_raw=" << (int)pImpl->config.only_save_raw << std::endl;
+                      << " only_save_raw=" << (int)pImpl->config.only_save_raw
+                      << " event_record_self_test=" << (int)pImpl->event_record_self_test << std::endl;
         } else {
             std::cout << "[SDK] sdk.ini not found, debug logging disabled." << std::endl;
         }
@@ -170,7 +179,7 @@ StatusCode VisionSDK::VisionSDK::Init(const std::string& model_path, int num_thr
     Impl::EnsureInternalCallback(pImpl.get());
 
     if (pImpl->event_record_self_test) {
-        std::cout << "[SDK][SELF-TEST] Event recording self-test is FORCED ON: "
+        std::cout << "[SDK][SELF-TEST] Event recording self-test ENABLED via sdk.ini: "
                   << "one TEST recording will start automatically after "
                   << Impl::kSelfTestTriggerFrame << " frames. "
                   << "Test files are named evt_selftest_* / event_type=self_test. "
@@ -360,8 +369,8 @@ StatusCode VisionSDK::VisionSDK::SetConfig(const void* config) {
             const auto* c = static_cast<const EventRecording_v1*>(config);
             if (c->header.version >= 2)   // pc_output_base is appended; only read from new callers
                 pImpl->event_recorder.SetPcOutputBase(c->pc_output_base);
-            pImpl->event_recorder.Configure(c->enable, c->pre_frames, c->post_frames, c->store_raw);
-            if (c->enable) Impl::EnsureInternalCallback(pImpl.get());
+            pImpl->event_recorder.Configure(false, c->pre_frames, c->post_frames, c->store_raw);
+            if (c->enable) Impl::EnsureInternalCallback(pImpl.get()); //20260915 => c->enable改成false
             // Recorder is independent of InternalConfig; nothing to merge.
             return StatusCode::OK;
         }

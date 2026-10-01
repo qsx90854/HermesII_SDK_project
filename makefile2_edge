@@ -26,6 +26,16 @@ CXXFLAGS = $(COMMON_FLAGS) $(ARM_FLAGS)
 # DEBUG: 除錯符號，供 core dump 配合 cross-gdb 使用（不影響執行效能，只增加檔案大小）
 CXXFLAGS += -g
 
+# Header 相依自動追蹤 (2026-09-14)
+# ---------------------------------------------------------------------------
+# 原本所有編譯規則都只寫 %.o: %.cpp,完全沒有 header 相依。改了 .h 而沒改
+# 對應的 .cpp 時,make 會認為 .o 是最新的而不重編 —— 這在這個專案特別危險:
+# Impl 是「by value」持有 ActiveEventRecorder(src/HermesII_sdk.cpp),所以
+# event_recorder*.h 一改,sizeof 就變了。用到舊 .o 不會有任何編譯錯誤,而是
+# 直接在執行期踩壞記憶體。-MMD -MP 讓編譯器順手產生 .d 相依檔,下面再 include
+# 回來,header 改動就會正確觸發重編。
+DEPFLAGS = -MMD -MP
+
 # DEBUG: AddressSanitizer（找出是誰踩壞 main 的堆疊；除錯完移除）
 # 板子 RAM 小，執行時務必帶 ASAN_OPTIONS 降低記憶體用量，見下：
 #   ASAN_OPTIONS=quarantine_size_mb=4:malloc_context_size=2:redzone=16:detect_leaks=0 ./SDK_DemoCode_v2_save_fall_result_edge app_config_data2.ini
@@ -149,7 +159,7 @@ $(STATIC_LIB_TARGET_NORECORD): $(SDK_OBJS_NORECORD) | $(BUILD_DIR)
 # HermesII_sdk 帶 -DEVENT_RECORDER_CHUNK_BACKEND=1 編成獨立的 .chunk.o,避免蓋掉
 # 正常的 HermesII_sdk.o。
 src/HermesII_sdk.chunk.o: src/HermesII_sdk.cpp
-	$(CXX) $(CXXFLAGS) -DEVENT_RECORDER_CHUNK_BACKEND=1 -c $< -o $@
+	$(CXX) $(CXXFLAGS) $(DEPFLAGS) -DEVENT_RECORDER_CHUNK_BACKEND=1 -c $< -o $@
 
 $(LIB_TARGET_CHUNK): $(SDK_OBJS_CHUNK) | $(BUILD_DIR)
 	$(CXX) -shared -o $@ $(SDK_OBJS_CHUNK) $(LDFLAGS_NPU) -lpthread
@@ -219,7 +229,7 @@ $(SDK_GRAY_TEST_EDGE_TARGET): examples/sdk_gray_test.cpp $(STATIC_LIB_TARGET)
 
 # 效能診斷專用: event_recorder 帶 -DEVENT_RECORDER_SKIP_RAW_STORAGE=1 編譯的物件檔
 src/event_recorder.norecord.o: src/event_recorder.cpp
-	$(CXX) $(CXXFLAGS) -DEVENT_RECORDER_SKIP_RAW_STORAGE=1 -c $< -o $@
+	$(CXX) $(CXXFLAGS) $(DEPFLAGS) -DEVENT_RECORDER_SKIP_RAW_STORAGE=1 -c $< -o $@
 
 # 效能診斷專用: sdk_gray_test_edge 的變體, 事件錄影只寫 json, 不寫 SD 卡
 # raw frame (見上面 SDK_GRAY_TEST_EDGE_NORECORD_TARGET 註解)。直接連結物件
@@ -241,11 +251,17 @@ $(INI_READ_TEST_EDGE_TARGET): examples/ini_read_test.cpp
 
 # 編譯 .o 檔
 %.o: %.cpp
-	$(CXX) $(CXXFLAGS) -c $< -o $@
+	$(CXX) $(CXXFLAGS) $(DEPFLAGS) -c $< -o $@
+
+# 把 -MMD 產生的 header 相依檔收回來(見上面 DEPFLAGS 說明)。用 wildcard 撈,
+# 所以第一次全新編譯時不存在也不會出錯,之後每次 make 都會自動生效。
+DEPFILES = $(wildcard src/*.d src/*/*.d)
+-include $(DEPFILES)
 
 # 清除規則
 clean:
 	rm -f $(SDK_OBJS) $(FALL_DEMO_TARGET) $(FALL_CALLBACK_TARGET) $(SDK_DEMO_CODE_V1_TARGET) $(SDK_DEMO_CODE_V2_TARGET) $(SDK_DEMO_TEST_ACCURACY_TARGET) $(STREAMING_DEMO_TARGET) $(FALL_ACCURACY_TEST_TARGET) $(SDK_DEMO_BG_TEST_TARGET) $(SDK_DEMO_CODE_V2_SAVE_FALL_RESULT_TARGET) $(SDK_DEMO_LOOP_TEST_TARGET) $(SDK_ERRORLOG_VERIFIER_TARGET) $(SDK_GRAY_TEST_EDGE_TARGET) $(EVENT_REPLAY_VERIFY_EDGE_TARGET) $(SDK_GRAY_COUNT_FALLS_EDGE_TARGET) $(INI_READ_TEST_EDGE_TARGET)
 	rm -f src/event_recorder.norecord.o $(SDK_GRAY_TEST_EDGE_NORECORD_TARGET)
 	rm -f src/HermesII_sdk.chunk.o src/event_recorder_chunk.o
+	rm -f src/*.d src/*/*.d
 	rm -rf $(BUILD_DIR)
