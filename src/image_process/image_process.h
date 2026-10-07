@@ -2,9 +2,11 @@
 #define IMAGE_PROCESS_H
 
 #include "HermesII_sdk.h"
+#ifndef DISABLE_NPU
 #include "fhhcp/npu.h"
 #include "fhhcp/sys.h"
 #include "types/vmm_api.h"
+#endif
 #include <memory>
 
 namespace VisionSDK {
