@@ -7,7 +7,7 @@
 namespace hermes_person {
 // Platform-independent policy in intent: scheduling, delayed-result safeguards,
 // person protection, BG alpha updates and history for fall confirmation must survive
-// Linux migration. Current .cpp still constructs the Windows backend; see porting guide.
+// Linux migration. Backend selection is isolated in ai/person_backend.h.
 class PersonBgController {
 public:
  PersonBgController();~PersonBgController();

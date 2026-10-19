@@ -5,7 +5,7 @@ namespace hermes_person {
 // Windows backend only. Public headers intentionally contain no ONNX/Windows types.
 // Replace this implementation for Linux/NPU; retain the Detector data contract.
 // RunSync is an offline test extension, not part of Detector's asynchronous API.
-// The controller still names this concrete class; replacing the header alone is insufficient.
+// person_backend.h selects this backend and isolates the RunSync offline extension.
 class PersonDetectorOnnx final : public Detector {
 public:
  explicit PersonDetectorOnnx(const Config&);

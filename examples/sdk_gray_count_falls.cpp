@@ -32,6 +32,11 @@
 
 #include "HermesII_sdk.h"
 #include <algorithm>
+#include <chrono>
+#include <thread>
+#include <cmath>
+#include <csignal>
+#include <stdexcept>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -43,6 +48,8 @@
 #include <vector>
 
 using namespace VisionSDK;
+static volatile std::sig_atomic_t stop_requested=0;
+static void stop_counter(int){stop_requested=1;}
 
 // ==========================================================================
 // Minimal INI loader (duplicated from examples/sdk_gray_test.cpp so this
@@ -223,19 +230,25 @@ std::vector<std::pair<int, int>> ParseBedPoints(const std::string& s) {
     return pts;
 }
 
-int main(int argc, char** argv) {
+int run_counter(int argc, char** argv) {
     if (argc < 2) {
         std::cerr << "Usage: " << argv[0]
                   << " <path.gray> [--width=800] [--height=450] [--channels=1]\n"
                      "                    [--interval=1] [--ini=sdk_gray_count_falls.ini]\n"
-                     "                    [--bed=x1,y1,x2,y2,x3,y3,x4,y4]\n";
+                     "                    [--bed=x1,y1,x2,y2,x3,y3,x4,y4]\n"
+                     "                    [--frame-period-ms=133.3333333333333] [--realtime]\n"
+                     "                    [--max-frames=120] [--face=0|1] [--face-model=path]\n"
+                     "                    [--output-prefix=path]\n";
         return 1;
     }
 
     std::string gray_path = argv[1];
     int width = 800, height = 450, channels = 1, interval = 1;
     std::string ini_path = "sdk_gray_count_falls.ini";
-    std::string bed_arg;
+    std::string bed_arg,output_prefix,face_model="models/blaze_face_detect_nnp310_128x128.ty";
+    double frame_period_ms=33.0;bool explicit_period=false,realtime=false;
+    long max_frames=0;int face_override=-1;
+    std::signal(SIGINT,stop_counter);std::signal(SIGTERM,stop_counter);
     for (int i = 2; i < argc; ++i) {
         std::string a = argv[i];
         if (a.rfind("--width=", 0) == 0) width = std::atoi(a.c_str() + 8);
@@ -244,9 +257,17 @@ int main(int argc, char** argv) {
         else if (a.rfind("--interval=", 0) == 0) interval = std::max(1, std::atoi(a.c_str() + 11));
         else if (a.rfind("--ini=", 0) == 0) ini_path = a.substr(6);
         else if (a.rfind("--bed=", 0) == 0) bed_arg = a.substr(6);
+        else if(a.rfind("--frame-period-ms=",0)==0){frame_period_ms=std::stod(a.substr(18));explicit_period=true;}
+        else if(a.rfind("--max-frames=",0)==0)max_frames=std::stol(a.substr(13));
+        else if(a=="--realtime")realtime=true;
+        else if(a.rfind("--output-prefix=",0)==0)output_prefix=a.substr(16);
+        else if(a.rfind("--face=",0)==0)face_override=std::stoi(a.substr(7));
+        else if(a.rfind("--face-model=",0)==0)face_model=a.substr(13);
         else std::cerr << "Warning: unknown argument \"" << a << "\", ignored.\n";
     }
 
+    if(!std::isfinite(frame_period_ms)||frame_period_ms<=0||frame_period_ms>60000||max_frames<0||face_override < -1||face_override>1||width<=0||height<=0||channels!=1)
+        throw std::runtime_error("Invalid gray runner options (packed grayscale required)");
     // Earliest possible checkpoint: right after the argv-parsing loop, before
     // fopen/banner/cfg.load() run at all. If bed_arg is already garbage HERE,
     // the corruption happens during/immediately after argv parsing (or
@@ -404,8 +425,12 @@ int main(int argc, char** argv) {
     imgCfg.expected_frame_interval_ms = cfg.getInt("Validation.Expected_Frame_Interval", 33);
     imgCfg.frame_interval_tolerance_ms = cfg.getInt("Validation.Frame_Interval_Tolerance", 10);
 
+    if(explicit_period)imgCfg.expected_frame_interval_ms=int(std::lround(frame_period_ms*interval));
+    if(face_override>=0)fallCfg.enable_face_detection=face_override!=0;
     VisionSDK::VisionSDK sdk;
-    if (sdk.Init("models/blaze_face_detect_nnp310_128x128.ty", 4) != VisionSDK::StatusCode::OK) {
+    // Honor face-off before Init, which otherwise uses its default face-on config.
+    if(!fallCfg.enable_face_detection)sdk.SetConfig(&fallCfg);
+    if (sdk.Init(face_model, 4) != VisionSDK::StatusCode::OK) {
         std::cerr << "Error: SDK Init failed.\n";
         fclose(fp);
         return 1;
@@ -463,7 +488,7 @@ int main(int argc, char** argv) {
     // src/event_recorder.cpp's evt_*.meta.json). The whole file is rewritten
     // (tmp + rename) after every event, so it's always complete/valid on disk
     // as of the last successful write, even if the process later crashes. ---
-    std::string events_json_path = gray_path;
+    std::string events_json_path = output_prefix.empty()?gray_path:output_prefix;
     if (events_json_path.size() >= 5 && events_json_path.compare(events_json_path.size() - 5, 5, ".gray") == 0) {
         events_json_path.erase(events_json_path.size() - 5);
     }
@@ -472,7 +497,9 @@ int main(int argc, char** argv) {
     std::cout << "Events JSON: " << events_json_path << "\n";
 
     std::vector<DetectedEvent> events;
+    bool frame_fall=false;
     sdk.RegisterVisionSDKCallback([&](const VisionSDKEvent& e) {
+        frame_fall=e.is_fall_detected;
         if (!e.is_fall_detected && !e.is_bed_exit) return;
 
         // Snapshot the currently-tracked objects' regions right now, while
@@ -524,11 +551,24 @@ int main(int argc, char** argv) {
     std::vector<uint8_t> buf(frame_size);
     long total_read = 0, total_fed = 0;
     std::cout << "\nReading frames...\n";
-    while (fread(buf.data(), 1, frame_size, fp) == frame_size) {
+    std::ofstream frames;
+    if(!output_prefix.empty()){frames.open(output_prefix+".frames.csv");if(!frames)throw std::runtime_error("Cannot write frames CSV");frames<<"gray_index,timestamp_ms,process_ms,wall_lag_ms,is_fall\n";}
+    auto wall_start=std::chrono::steady_clock::now();
+    while (!stop_requested && (!max_frames || total_read<max_frames)) {
+        size_t count=fread(buf.data(),1,frame_size,fp);
+        if(!count){if(ferror(fp))throw std::runtime_error("Gray read failed");break;}
+        if(count!=frame_size)throw std::runtime_error("Partial gray frame");
         if (total_read % interval == 0) {
-            uint64_t ts = (uint64_t)(total_read * 33);
-            sdk.SetInputMemory(buf.data(), width, height, channels, ts);
-            sdk.ProcessNextFrame();
+            uint64_t ts=uint64_t(std::llround(total_read*frame_period_ms));
+            auto deadline=wall_start+std::chrono::microseconds(int64_t(std::llround(total_read*frame_period_ms*1000)));
+            if(realtime)std::this_thread::sleep_until(deadline);
+            frame_fall=false;
+            auto start=std::chrono::steady_clock::now();
+            if(sdk.SetInputMemory(buf.data(), width, height, channels, ts)!=VisionSDK::StatusCode::OK || sdk.ProcessNextFrame()!=VisionSDK::StatusCode::OK)
+                throw std::runtime_error("SDK rejected gray frame "+std::to_string(total_read));
+            double process_ms=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-start).count();
+            double lag=std::chrono::duration<double,std::milli>(start-deadline).count();
+            if(frames.is_open())frames<<total_read<<','<<ts<<','<<process_ms<<','<<lag<<','<<frame_fall<<'\n';
             total_fed++;
         }
         total_read++;
@@ -568,4 +608,8 @@ int main(int argc, char** argv) {
     std::cout << "FALL_COUNT=" << fall_count << " BEDEXIT_COUNT=" << bedexit_count << "\n";
 
     return 0;
+}
+
+int main(int argc,char** argv){
+    try{return run_counter(argc,argv);}catch(const std::exception& e){std::cerr<<"Gray runner failed: "<<e.what()<<std::endl;return 2;}
 }

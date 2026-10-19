@@ -1,4 +1,8 @@
 #include "face_detector.h"
+#ifdef HERMES_ENABLE_NPU_PERSON
+#include "npu_runtime.h"
+#include <stdexcept>
+#endif
 #include "blaze_face_detect_parser.h"
 
 #include <stdio.h>
@@ -278,8 +282,21 @@ public:
     T_TY_MemSegmentInfo task_mem;
     T_TY_TaskInput *task_inputs = NULL;
     T_TY_TaskOutput *task_outputs = NULL;
-    T_TY_ModelDesc model_desc;
+    T_TY_ModelDesc model_desc{};
     bool initialized = false;
+#ifdef HERMES_ENABLE_NPU_PERSON
+    bool runtime_owned=false, pending=false;
+    TY_NPU_NN_HANDLE nn{};
+    uint64_t source_stamp=0;
+    bool drain() {
+        hermes_npu::admission().cancel(this);
+        if(!pending)return true;
+        E_TY_Bool done=E_TY_FALSE;
+        int rc=TY_NPU_Query(E_TY_NPU_ID_0,nn,&done,1);
+        if(rc||done!=E_TY_TRUE){std::cerr<<"Face NPU drain failed; retaining live resources: "<<rc<<std::endl;return false;}
+        pending=false;hermes_npu::admission().complete(this);return true;
+    }
+#endif
     
     uint32_t call_count = 0;
     uint32_t success_count = 0;
@@ -299,6 +316,9 @@ public:
     }
 
     void cleanup() {
+#ifdef HERMES_ENABLE_NPU_PERSON
+        if(!drain())return;
+#endif
         // Idempotent: this runs once from FaceDetector::Release() and again
         // from ~Impl() when the object is destroyed. Every resource must be
         // nulled out after release, otherwise the second call double-frees
@@ -320,6 +340,11 @@ public:
         for (int i=0; i<model_mem.segNum; i++) free_mmz_memory(&model_mem.memInfo[i].mem);
         for (int i=0; i<task_mem.segNum; i++) free_mmz_memory(&task_mem.memInfo[i].mem);
 
+        memset(&model_mem,0,sizeof(model_mem));
+        memset(&task_mem,0,sizeof(task_mem));
+#ifdef HERMES_ENABLE_NPU_PERSON
+        if(runtime_owned){hermes_npu::release();runtime_owned=false;}
+#endif
         initialized = false;
     }
 
@@ -327,6 +352,8 @@ public:
         call_count = 0;
         success_count = 0;
         if (initialized) return StatusCode::OK;
+        cleanup(); // Release a partially initialized previous attempt before retry.
+
 
         // Ensure System Init is called (checking if already called? existing API doesn't seem to error if called twice, but best practice: call once)
         // Since we don't have a global singleton for SysInit yet, we will call it here.
@@ -340,6 +367,9 @@ public:
         int ret = 0;
         extern bool g_cv_sys_initialized;
         extern bool g_npu_sys_initialized;
+#ifdef HERMES_ENABLE_NPU_PERSON
+        if(!runtime_owned){try{hermes_npu::acquire();runtime_owned=true;}catch(const std::exception& e){std::cerr<<e.what()<<std::endl;return StatusCode::ERROR_INIT_FAILED;}}
+#else
         if (!g_npu_sys_initialized) {
             printf("[FaceDetector] Init: TY_NPU_SysInit\n");
             ret = TY_NPU_SysInit();
@@ -350,6 +380,8 @@ public:
             }
         }
         
+#endif
+
         if (!g_cv_sys_initialized) {
             printf("[FaceDetector] Init: TY_CV_SysInit\n");
             // CV Init
@@ -384,14 +416,14 @@ public:
         }
         flush_mmz_memory(&model_mem.memInfo[0].mem);
 
-        T_TY_ModelCfgParam model_cfg;
+        T_TY_ModelCfgParam model_cfg{};
         if (TY_NPU_CreateModelFromPhyMem(&model_mem, &model_cfg, NULL, &model_desc, &model_handle) != 0) {
             std::cout << "[FaceDetector] Init Error: TY_NPU_CreateModelFromPhyMem failed" << std::endl;
             return StatusCode::ERROR_INIT_FAILED;
         }
 
-        T_TY_TaskCfgParam task_cfg;
-        TY_NPU_GetTaskMemSize(model_handle, &task_cfg, &task_mem);
+        T_TY_TaskCfgParam task_cfg{};
+        if(TY_NPU_GetTaskMemSize(model_handle, &task_cfg, &task_mem)!=0)return StatusCode::ERROR_INIT_FAILED;
         
         // Allocate task memory
         for(int i=0; i<task_mem.segNum; i++) {
@@ -411,6 +443,7 @@ public:
         int output_num = model_desc.ioDesc.outputNum;
         task_inputs = (T_TY_TaskInput*)calloc(input_num, sizeof(T_TY_TaskInput));
         task_outputs = (T_TY_TaskOutput*)calloc(output_num, sizeof(T_TY_TaskOutput));
+        if(!task_inputs||!task_outputs||input_num!=1||output_num!=2)return StatusCode::ERROR_INIT_FAILED;
         
         for (int i=0; i<input_num; i++) {
              task_inputs[i].descIn.type = E_TY_BLOB_IMAGE;
@@ -445,6 +478,10 @@ public:
     }
 
     int Detect(const Image& img, std::vector<FaceROI>& faces) {
+#ifdef HERMES_ENABLE_NPU_PERSON
+        // The integrated SDK must use TrySubmit/TryGetResult exclusively.
+        (void)img;faces.clear();return -1;
+#else
         if (!initialized) {
             std::cout << "[FaceDetector] Init failed!" << std::endl;
             return -1;
@@ -480,9 +517,14 @@ public:
              return ret;
          }
 
+         return Parse(faces);
+#endif
+    }
+
+    int Parse(std::vector<FaceROI>& faces) {
          // 3. Flush output
-         for(int i=0; i<model_desc.ioDesc.outputNum; i++) 
-             flush_mmz_memory(&task_outputs[i].dataOut);
+         for(int i=0; i<model_desc.ioDesc.outputNum; i++)
+             if(flush_mmz_memory(&task_outputs[i].dataOut)!=0)return -1;
 
          // 4. Parse Results
          FaceDetection results[FACE_MAX_OBJS];
@@ -609,11 +651,38 @@ int FaceDetector::Detect(const Image& img, std::vector<FaceROI>& faces) {
     return ret;
 }
 
+#ifdef HERMES_ENABLE_NPU_PERSON
+void FaceDetector::Demand(uint64_t due){if(pImpl->initialized&&!pImpl->pending)hermes_npu::admission().demand(pImpl.get(),due);}
+void FaceDetector::CancelDemand(){hermes_npu::admission().cancel(pImpl.get());}
+bool FaceDetector::CanSubmit()const{return pImpl->initialized&&!pImpl->pending&&hermes_npu::admission().eligible(pImpl.get());}
+bool FaceDetector::TrySubmit(const Image& img,uint64_t timestamp){
+    if(!pImpl->initialized||pImpl->pending||!img.data||img.width!=128||img.height!=128)return false;
+    auto& gate=hermes_npu::admission();if(!gate.claim(pImpl.get()))return false;
+    YUV400_to_YUV420_NEON((uint8_t*)img.data,(uint8_t*)pImpl->task_inputs[0].dataIn.virAddr,128,128);
+    int rc=flush_mmz_memory(&pImpl->task_inputs[0].dataIn);
+    if(!rc)rc=TY_NPU_ForwardAsync(pImpl->task_handle,E_TY_NPU_ID_0,pImpl->model_desc.ioDesc.inputNum,pImpl->task_inputs,pImpl->model_desc.ioDesc.outputNum,pImpl->task_outputs,&pImpl->nn);
+    if(rc){gate.complete(pImpl.get());throw std::runtime_error("Face NPU submit failed: "+std::to_string(rc));}
+    pImpl->pending=true;pImpl->source_stamp=timestamp;return true;
+}
+bool FaceDetector::TryGetResult(Result& result){
+    if(!pImpl->pending)return false;
+    E_TY_Bool done=E_TY_FALSE;int rc=TY_NPU_Query(E_TY_NPU_ID_0,pImpl->nn,&done,0);
+    if(rc)throw std::runtime_error("Face NPU query failed; shutdown required: "+std::to_string(rc));
+    if(done!=E_TY_TRUE)return false;
+    pImpl->pending=false;hermes_npu::admission().complete(pImpl.get());
+    result={};result.timestamp=pImpl->source_stamp;result.success=pImpl->Parse(result.faces)==0;return true;
+}
+void FaceDetector::ResetAsync(){if(!pImpl->drain())throw std::runtime_error("Cannot drain face NPU");}
+#endif
+
 bool FaceDetector::Resize(const Image& src, Image& dst, int crop_x, int crop_y, int crop_w, int crop_h) {
     return pImpl->Resize(src, dst, crop_x, crop_y, crop_w, crop_h);
 }
 
 StatusCode FaceDetector::Release() {
+#ifdef HERMES_ENABLE_NPU_PERSON
+    ResetAsync();
+#endif
 #ifndef DISABLE_NPU
     pImpl->cleanup();
 #endif

@@ -1,0 +1,65 @@
+# 忽略所有檔案與資料夾
+/*
+
+# 排除 (Keep) 你想要的項目
+!/src/
+!/example
+!/include
+!/models
+!/examples
+!/.vscode
+!makefile
+!makefile2
+!makefile2_edge
+!app_config_data1.ini
+!app_config_data2.ini
+!app_config_data3.ini
+!app_config_data4.ini
+!app_config_data5.ini
+!app_config_data6.ini
+!app_config_data7.ini
+!app_config_data8.ini
+!app_config_data9.ini
+!app_config_data10.ini
+!app_config_data11.ini
+!app_config_data12.ini
+!app_config_data13.ini
+!app_config_data14.ini
+!app_config_data15.ini
+!app_config_data16.ini
+!app_config_data17.ini
+!app_config_data18.ini
+!batch_run.sh
+#!app_config.ini
+!parameter.ini
+
+
+# 忽略編譯後的暫存檔 (例如 Python 的 pycache 或 C++ 的 .o)
+**/__pycache__/
+*.log
+# C/C++ 編譯產物 (避免 PC/ARM 交叉編譯互相污染 git)
+*.o
+*.a
+*.so
+# -MMD 產生的 header 相依檔
+*.d
+
+# Keep the NPU integration build, short-run entry and host tests (not datasets/results).
+!/experiments/
+/experiments/*
+!/experiments/yolo_bg/
+/experiments/yolo_bg/*
+!/experiments/yolo_bg/Makefile.npu
+!/experiments/yolo_bg/npu_vendor.exports
+!/experiments/yolo_bg/run_npu_short.sh
+!/experiments/yolo_bg/run_npu_batch.sh
+!/experiments/yolo_bg/run_abi_diagnostic.sh
+!/experiments/yolo_bg/abi_diagnostic.cpp
+!/experiments/yolo_bg/NPU_INTEGRATION.md
+!/experiments/yolo_bg/tests/
+/experiments/yolo_bg/tests/*
+!/experiments/yolo_bg/tests/npu_policy_test.cpp
+!/experiments/yolo_bg/tests/npu_backend_test.cpp
+!/experiments/yolo_bg/tests/run_host_tests.sh
+
+!/.gitignore

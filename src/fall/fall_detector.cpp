@@ -1,7 +1,16 @@
+// Legacy ONNX builds keep their existing shared-feature behavior.
+#if defined(HERMES_ENABLE_ONNX_PERSON) || defined(HERMES_ENABLE_NPU_PERSON)
+#ifndef HERMES_ENABLE_PERSON
+#define HERMES_ENABLE_PERSON 1
+#endif
+#endif
+#ifdef HERMES_ENABLE_NPU_PERSON
+#include "../ai/npu_runtime.h"
+#endif
 #include "fall_detector.h"
 #include "fall_safety.h"
 #include "identity_a.h"
-#ifdef HERMES_ENABLE_ONNX_PERSON
+#ifdef HERMES_ENABLE_PERSON
 #include "person_bg_controller.h"
 
 #endif
@@ -29,13 +38,17 @@
 #include <sys/types.h>
 #include <cstring>
 #include <climits>
-#define ENABLE_PERF_PROFILING 1
 #define ENABLE_DEBUG_FRAME_SAVE 0 // Feature to save current frame as JPG every 3 frames
 
 int ggap = 1;
 // Define this to 1 to enable debug prints in this file, or 0 to suppress them
 #ifndef ENABLE_DEBUG_PRINT
 #define ENABLE_DEBUG_PRINT 0
+#endif
+
+// Profiling is opt-in when debug output is disabled. Both timer systems use it.
+#ifndef ENABLE_PERF_PROFILING
+#define ENABLE_PERF_PROFILING ENABLE_DEBUG_PRINT
 #endif
 
 #if ENABLE_DEBUG_PRINT
@@ -81,7 +94,7 @@ static inline void PushTrajectoryPoint(VisionSDK::MotionObject& obj, int x, int 
 #define STB_IMAGE_WRITE_STATIC
 #define STB_IMAGE_WRITE_IMPLEMENTATION
 #include "../../include/stb_image_write.h"
-#ifdef HERMES_ENABLE_ONNX_PERSON
+#ifdef HERMES_ENABLE_PERSON
 #include "fg_replay_writer.h"
 #endif
 
@@ -704,6 +717,7 @@ static void getObjectFeatureBoundingBox(const ::VisionSDK::ObjectFeatures& obj, 
     }
 }
 
+#if ENABLE_PERF_PROFILING
 struct FunctionTimer {
     std::map<std::string, double> total_ms;
     std::map<std::string, uint64_t> calls;
@@ -725,6 +739,13 @@ struct TimerGuard {
         prof->add(name, ms);
     }
 };
+
+#else
+struct FunctionTimer {};
+struct TimerGuard {
+    TimerGuard(FunctionTimer&, const char*) noexcept {}
+};
+#endif
 
 static FunctionTimer g_perf_timer;
 
@@ -853,11 +874,13 @@ public:
     FunctionTimer profiler;
 
     void PrintTimings() {
+#if ENABLE_PERF_PROFILING
          if (ENABLE_DEBUG_PRINT) std::cout << "\n=== AVG TIMINGS ===\n";
          for(auto& kv : profiler.total_ms) {
              uint64_t count = profiler.calls[kv.first];
              if (ENABLE_DEBUG_PRINT) std::cout << kv.first << ": " << kv.second << " ms (Calls: " << count << ")\n";
          }
+#endif
     }
 
 private:
@@ -870,7 +893,7 @@ private:
 
     std::deque<::Image> prev_frames;
     std::vector<BlockPosition> positions_cache;
-    std::vector<std::vector<MotionVector>> motion_history;
+    std::vector<MotionVector> previous_motion_vectors;
     
     // Block Decay Logic
     std::vector<int> block_active_counters;
@@ -1075,17 +1098,17 @@ private:
 
 
     void predictMotionVectorFast(int block_idx, int& pdx, int& pdy) {
-        if(!motion_history.empty() && block_idx < (int)motion_history.back().size()) {
-             pdx = motion_history.back()[block_idx].dx;
-             pdy = motion_history.back()[block_idx].dy;
+        if(block_idx >= 0 && block_idx < (int)previous_motion_vectors.size()) {
+             pdx = previous_motion_vectors[block_idx].dx;
+             pdy = previous_motion_vectors[block_idx].dy;
         } else {
              pdx = 0; pdy = 0;
         }
     }
 
     void updateMotionHistoryFast(const std::vector<MotionVector>& mvs) {
-        motion_history.push_back(mvs);
-        if(motion_history.size() > 5) motion_history.erase(motion_history.begin());
+        // Prediction consumes only the previous vectors; image history is unchanged.
+        previous_motion_vectors = mvs;
     }
 
     void optimizedMotionEstimation(const uint8_t* block_data, int block_stride, const ::Image& prev,
@@ -2682,7 +2705,7 @@ public:
     }();
     hermes_identity_a::Model<MotionObject, ::VisionSDK::ObjectFeatures> identity_a;
     std::vector<uint8_t> safety_input;
-#ifdef HERMES_ENABLE_ONNX_PERSON
+#ifdef HERMES_ENABLE_PERSON
     hermes_person::PersonBgController person_bg;
     hermes_person::FgReplayWriter fg_replay;
 #endif
@@ -2780,6 +2803,12 @@ public:
     bool face_model_inited = false;
     bool last_has_face = false;
     FaceROI last_face_roi = {0,0,0,0,0.0f};
+#ifdef HERMES_ENABLE_NPU_PERSON
+    uint64_t face_source_stamp=0,face_stream_stamp=0;
+    bool face_stream_started=false;
+    int face_stream_w=0,face_stream_h=0;
+    int face_crop_x=0,face_crop_y=0,face_crop_w=128,face_crop_h=128;
+#endif
     
     // Tracking
     std::map<int, KalmanFilter> kalmanFilters;
@@ -2818,11 +2847,6 @@ public:
     // Global FG history buffer (last 120 frames)
     std::deque<int> fg_count_history_buffer;
     
-    // Global Object Y-Pos history (last 120 frames per ID)
-    std::map<int, std::deque<float>> object_y_history_buffer;
-    
-    // V17.5: Safe Ratio History (last 120 frames)
-    std::map<int, std::deque<float>> object_safe_ratio_history_buffer;
     
     // NEW: Persistent Object Block Cache for Robust FG Tracking (Object-local stats)
     
@@ -3227,7 +3251,7 @@ public:
 
     void Release() {
         if(diagnostic_trace.is_open()){diagnostic_trace.flush();diagnostic_trace.close();}
-#ifdef HERMES_ENABLE_ONNX_PERSON
+#ifdef HERMES_ENABLE_PERSON
         fg_replay.Finish();
         person_bg.Finish();
         safety.finish();
@@ -3279,8 +3303,6 @@ public:
         pending_falls.shrink_to_fit();
         
         fg_count_history_buffer.clear();
-        object_y_history_buffer.clear();
-        object_safe_ratio_history_buffer.clear();
         persistent_object_blocks.clear();
         object_last_active_frame.clear();
         
@@ -3297,6 +3319,9 @@ public:
         frame_idx = 0;
         fall_consecutive_frames = 0;
         face_model_inited = false;
+#ifdef HERMES_ENABLE_NPU_PERSON
+        face_stream_started=false;
+#endif
         last_has_face = false;
         last_face_roi = {0,0,0,0,0.0f};
         hasBedMask = false;
@@ -3321,6 +3346,11 @@ void FallDetector::SetConfig(const InternalConfig& config) {
                         config.block_size != pImpl->config.block_size ||
                         config.search_range != pImpl->config.search_range);
     
+#ifdef HERMES_ENABLE_NPU_PERSON
+    if(!config.enable_face_detection || gridChanged){
+        pImpl->faceDetector.ResetAsync();pImpl->last_has_face=false;pImpl->last_face_roi={};
+    }
+#endif
     pImpl->config = config; // Update internal config
 
     if (gridChanged) {
@@ -3342,13 +3372,16 @@ void FallDetector::SetConfig(const InternalConfig& config) {
     // Initialize Face Detector
     // Update Verification Flags - Handled in HermesII_sdk.cpp via pImpl->config
 
-    if (!pImpl->face_model_inited) {
+    if (pImpl->config.enable_face_detection && !pImpl->face_model_inited) {
          if (ENABLE_DEBUG_PRINT) std::cout << "[FallDetector::SetConfig] Initializing FaceDetector..." << std::endl;
          std::string path = pImpl->config.model_path.empty() ? "res/blaze_face_detect_nnp310_128x128.ty" : pImpl->config.model_path;
          StatusCode ret = pImpl->faceDetector.Init(path);
          if (ret != StatusCode::OK) {
              //if (ENABLE_DEBUG_PRINT) 
              std::cout << "[FallDetector::SetConfig] FaceDetector Init Failed: " << (int)ret << std::endl;
+#ifdef HERMES_ENABLE_NPU_PERSON
+             throw std::runtime_error("Enabled face backend could not initialize");
+#endif
              // Do NOT set true, allows retry on next Config call or manually? 
              // Actually, Config is usually called once. If it fails, maybe we should try in Detect too?
              // But let's stick to Config first.
@@ -3361,6 +3394,9 @@ void FallDetector::SetConfig(const InternalConfig& config) {
 }
 
 void FallDetector::SetBedRegion(const std::vector<std::pair<int, int>>& points) {
+#ifdef HERMES_ENABLE_NPU_PERSON
+    pImpl->faceDetector.ResetAsync();pImpl->last_has_face=false;pImpl->last_face_roi={};
+#endif
     pImpl->bed_region = points;
     pImpl->hasBedMask = false; 
     if (!points.empty()) {
@@ -4315,6 +4351,30 @@ StatusCode FallDetector::Detect(const Image& input_frame, bool& is_fall)
     long long t_face_start = pImpl->get_now_us();
     #endif
 
+#ifdef HERMES_ENABLE_NPU_PERSON
+    // Source geometry/time discontinuities invalidate cached and in-flight faces.
+    if(pImpl->face_stream_started && (frame.timestamp<=pImpl->face_stream_stamp ||
+       frame.timestamp-pImpl->face_stream_stamp>1000 || frame.width!=pImpl->face_stream_w || frame.height!=pImpl->face_stream_h)) {
+        pImpl->faceDetector.ResetAsync();pImpl->last_has_face=false;pImpl->last_face_roi={};
+    }
+    pImpl->face_stream_started=true;pImpl->face_stream_stamp=frame.timestamp;
+    pImpl->face_stream_w=frame.width;pImpl->face_stream_h=frame.height;
+    FaceDetector::Result face_result;
+    if(pImpl->faceDetector.TryGetResult(face_result) && face_result.success) {
+        pImpl->last_has_face=!face_result.faces.empty();pImpl->face_source_stamp=face_result.timestamp;
+        pImpl->last_face_roi={};
+        if(pImpl->last_has_face){auto r=face_result.faces[0];
+            r.x1=pImpl->face_crop_x+r.x1*pImpl->face_crop_w/128.f;
+            r.x2=pImpl->face_crop_x+r.x2*pImpl->face_crop_w/128.f;
+            r.y1=pImpl->face_crop_y+r.y1*pImpl->face_crop_h/128.f;
+            r.y2=pImpl->face_crop_y+r.y2*pImpl->face_crop_h/128.f;
+            pImpl->last_face_roi=r;
+        }
+    }
+    const uint64_t face_max_age=2500;
+    if(!pImpl->config.enable_face_detection || frame.timestamp<pImpl->face_source_stamp || frame.timestamp-pImpl->face_source_stamp>face_max_age){pImpl->last_has_face=false;pImpl->last_face_roi={};}
+    bool face_prepared=false;int prepared_x=0,prepared_y=0,prepared_w=0,prepared_h=0;
+#endif
     bool has_face = pImpl->last_has_face;
     FaceROI face_roi = pImpl->last_face_roi;
 
@@ -4325,6 +4385,13 @@ StatusCode FallDetector::Detect(const Image& input_frame, bool& is_fall)
             should_run_face_detect = false;
         }
     }
+
+#ifdef HERMES_ENABLE_NPU_PERSON
+    if(!pImpl->config.enable_face_detection)pImpl->faceDetector.CancelDemand();
+    else if(should_run_face_detect)pImpl->faceDetector.Demand(frame.timestamp);
+    // A missed deadline remains eligible, but always uses the current frame.
+    should_run_face_detect=pImpl->config.enable_face_detection&&pImpl->faceDetector.CanSubmit();
+#endif
 
     // Retry Init if failed in Config
     if (should_run_face_detect && !pImpl->face_model_inited) {
@@ -4344,7 +4411,9 @@ StatusCode FallDetector::Detect(const Image& input_frame, bool& is_fall)
     {
     TimerGuard t_face(g_perf_timer, "1_2_FaceDetect");
     if (should_run_face_detect) {
-        has_face = false; // Reset before detection explicitly
+#ifndef HERMES_ENABLE_NPU_PERSON
+        has_face = false; // Synchronous build resets before detection.
+#endif
         
         // 1. Check input frame data pointer
         if (!frame.data) {
@@ -4494,6 +4563,9 @@ StatusCode FallDetector::Detect(const Image& input_frame, bool& is_fall)
         //std::cout<<"[FallDetector::Detect] FaceDetector::Resize GO"<<std::endl;
         if (pImpl->faceDetector.Resize(cropInput, faceInput, crop_x, crop_y, crop_w, crop_h)) 
         {
+#ifdef HERMES_ENABLE_NPU_PERSON
+             face_prepared=true;prepared_x=crop_x;prepared_y=crop_y;prepared_w=crop_w;prepared_h=crop_h;
+#else
              std::vector<FaceROI> faces;
              //std::cout<<"[FallDetector::Detect] FaceDetector::Detect GO"<<std::endl;
              int ret = pImpl->faceDetector.Detect(faceInput, faces);//disable for debug
@@ -4515,6 +4587,7 @@ StatusCode FallDetector::Detect(const Image& input_frame, bool& is_fall)
                  face_roi.score = roi_128.score;
                  //std::cout<<"[FallDetector::Detect] FaceDetector::Detect Get Face"<<face_roi.x1<<", "<<face_roi.y1<<", "<<face_roi.x2<<", "<<face_roi.y2<<", "<<face_roi.score<<std::endl;
              }
+#endif
             //std::cout<<" Resize success"<<std::endl;
         } 
         else 
@@ -4528,6 +4601,9 @@ StatusCode FallDetector::Detect(const Image& input_frame, bool& is_fall)
     }
     }
 
+#ifdef HERMES_ENABLE_NPU_PERSON
+    if(should_run_face_detect&&!face_prepared)pImpl->faceDetector.CancelDemand();
+#endif
     // End Face logic
     
     #if ENABLE_PERF_PROFILING
@@ -4649,7 +4725,7 @@ StatusCode FallDetector::Detect(const Image& input_frame, bool& is_fall)
     //    pImpl->raw_frame_history.pop_front();
     //}
     
-#ifdef HERMES_ENABLE_ONNX_PERSON
+#ifdef HERMES_ENABLE_PERSON
     if(pImpl->person_bg.enabled()) {
         if(pImpl->backgroundFrame.width()!=W || pImpl->backgroundFrame.height()!=H)
             pImpl->backgroundFrame=wrapper.clone();
@@ -4729,7 +4805,7 @@ StatusCode FallDetector::Detect(const Image& input_frame, bool& is_fall)
 
 
         if(pImpl->safety.exclude)std::fill_n(maskData.data(),size_t(w)*(h/pImpl->config.grid_rows),0);
-#ifdef HERMES_ENABLE_ONNX_PERSON
+#ifdef HERMES_ENABLE_PERSON
         pImpl->fg_replay.Write(pImpl->frame_idx,frame.timestamp,bg,maskData.data(),w,h);
 #endif
         {
@@ -4916,7 +4992,8 @@ StatusCode FallDetector::Detect(const Image& input_frame, bool& is_fall)
     #endif
 
     // 2. Extract Objects
-    pImpl->previous_objects = pImpl->current_objects;
+    // Only the legacy tracker reads this deep copy.
+    if (!pImpl->identity_a.enabled()) pImpl->previous_objects = pImpl->current_objects;
     
     {
         TimerGuard t_track(g_perf_timer, "3_TrackingAndExtraction");
@@ -4989,8 +5066,6 @@ StatusCode FallDetector::Detect(const Image& input_frame, bool& is_fall)
             pImpl->object_bed_stats_history.erase(id);
             pImpl->object_accumulated_descent.erase(id);
             pImpl->observation_states.erase(id);
-            pImpl->object_y_history_buffer.erase(id);
-            pImpl->object_safe_ratio_history_buffer.erase(id);
             pImpl->persistent_object_blocks.erase(id); // NEW: Complete cleanup
             
             // Clean up any pending falls associated with this dead object
@@ -5056,8 +5131,6 @@ StatusCode FallDetector::Detect(const Image& input_frame, bool& is_fall)
             pImpl->object_bed_stats_history.erase(id);
             pImpl->object_accumulated_descent.erase(id);
             pImpl->observation_states.erase(id);
-            pImpl->object_y_history_buffer.erase(id);
-            pImpl->object_safe_ratio_history_buffer.erase(id);
             
             // NEW: Clean up more state maps to prevent "ghost" IDs
             //if (pImpl->object_is_in_bed.count(id)) pImpl->object_is_in_bed.erase(id);
@@ -5448,16 +5521,20 @@ StatusCode FallDetector::Detect(const Image& input_frame, bool& is_fall)
         }
 
         // Mirror per-block FG scores for updateBackground's anti-ghost protection.
-        pImpl->block_fg_scores_ = block_fg_scores;
+#ifdef HERMES_ENABLE_PERSON
+        if (!pImpl->person_bg.enabled())
+#endif
+            pImpl->block_fg_scores_ = block_fg_scores;
 
         int diag_scanned = std::count(blocks_to_scan.begin(), blocks_to_scan.end(), true);
         // printf("[DIAG-PixelStats] blocks_to_scan=%d / %d\n", diag_scanned, grid_rows * grid_cols);
 
-        // D. Ghost Object Injection (Maintain stationary objects in current_objects)
+        // D. Ghost Object Injection (legacy tracking only).
+        if (!pImpl->identity_a.enabled()) {
         std::set<int> current_ids;
         for (const auto& obj : pImpl->current_objects) current_ids.insert(obj.id);
 
-        if (!pImpl->identity_a.enabled()) for (auto const& kv : pImpl->persistent_object_blocks) 
+        for (auto const& kv : pImpl->persistent_object_blocks)
         {
             int id = kv.first;
             if (current_ids.find(id) == current_ids.end()) {
@@ -5507,6 +5584,7 @@ StatusCode FallDetector::Detect(const Image& input_frame, bool& is_fall)
                 pImpl->LogTrace(id, pImpl->frame_idx, "GHOST_INJECT", ghost.strength, "No motion; forced zero momentum");
             }
         }
+        } // legacy ghost injection
 
         for (auto& obj : pImpl->current_objects) 
         {
@@ -5524,16 +5602,6 @@ StatusCode FallDetector::Detect(const Image& input_frame, bool& is_fall)
             // If pixel_count > 0, it means the object is still visible (stationary person), so we must NOT skip the scan.
             bool is_ghost = (obj.strength <= 0.0f && obj.pixel_count == 0);
             
-            // V17.1: Update Global Object trajectory history
-            auto& y_hist = pImpl->object_y_history_buffer[obj.id];
-            y_hist.push_back(obj.centerY);
-            if (y_hist.size() > 120) y_hist.pop_front();
-            
-            // V17.5: Update Global Safe Ratio history
-            auto& sr_hist = pImpl->object_safe_ratio_history_buffer[obj.id];
-            sr_hist.push_back(obj.safe_area_ratio);
-            if (sr_hist.size() > 120) sr_hist.pop_front();
-
             // PERFORMANCE OPTIMIZATION: Skip expensive scanning for ghost/stationary objects
             if (is_ghost) {
                 obj.avg_brightness = 0;
@@ -7775,7 +7843,7 @@ StatusCode FallDetector::Detect(const Image& input_frame, bool& is_fall)
     if(!bg_detection_allowed){is_fall=false;for(auto& obj:pImpl->current_objects)obj.is_fall_this_frame=false;}
     // 8. Background Update (Selective)
     // Runs here to use the latest pImpl->current_objects found in this frame
-#ifdef HERMES_ENABLE_ONNX_PERSON
+#ifdef HERMES_ENABLE_PERSON
     if(pImpl->person_bg.enabled()) {
         pImpl->person_bg.Step(frame.timestamp,wrapper.getData(),pImpl->backgroundFrame.getData(),W,H,
             pImpl->config.grid_cols,pImpl->config.grid_rows,pImpl->current_objects);
@@ -7809,7 +7877,7 @@ StatusCode FallDetector::Detect(const Image& input_frame, bool& is_fall)
     }
     }
 
-#ifdef HERMES_ENABLE_ONNX_PERSON
+#ifdef HERMES_ENABLE_PERSON
     if(pImpl->safety.confirm){
         if(!pImpl->person_bg.enabled())throw std::runtime_error("Person confirmation requires YOLO BG backend");
         pImpl->safety.filter(frame.timestamp,pImpl->current_objects,is_fall,pImpl->person_bg.History());
@@ -7818,6 +7886,14 @@ StatusCode FallDetector::Detect(const Image& input_frame, bool& is_fall)
 #endif
     pImpl->safety.write(pImpl->frame_idx,pImpl->current_objects,pImpl->full_frame_objects,pImpl->observation_states,pImpl->config.grid_cols,pImpl->config.grid_rows,pImpl->observation_frame_limit);
     if(pImpl->identity_a.enabled())pImpl->identity_a.write(pImpl->frame_idx);
+#ifdef HERMES_ENABLE_NPU_PERSON
+    // Person Step has now announced its deadline. Oldest due client wins;
+    // both submits occur after the CPU detection work, never wait for NPU here.
+    if(face_prepared && pImpl->faceDetector.TrySubmit(faceInput,frame.timestamp)) {
+        pImpl->face_crop_x=prepared_x;pImpl->face_crop_y=prepared_y;
+        pImpl->face_crop_w=prepared_w;pImpl->face_crop_h=prepared_h;
+    }
+#endif
     // 7. Invoke Callback
     if (pImpl->callback) 
     {
@@ -7885,6 +7961,7 @@ StatusCode FallDetector::Detect(const Image& input_frame, bool& is_fall)
     // End of Frame
     // DEBUG_PRINT("[Debug] FallDetector::Detect End Frame %d\n", pImpl->frame_idx);
     
+    #if ENABLE_PERF_PROFILING
     if (pImpl->absolute_frame_count % 100 == 0) {
         DEBUG_PRINT("\n=== PERFORMANCE PROFILE (Avg over last 100 frames) ===\n");
         for (auto const& kv : g_perf_timer.total_ms) {
@@ -7900,6 +7977,7 @@ StatusCode FallDetector::Detect(const Image& input_frame, bool& is_fall)
         g_perf_timer.total_ms.clear();
         g_perf_timer.calls.clear();
     }
+    #endif
 
 #if ENABLE_DEBUG_FRAME_SAVE
     // Selective saving: only if there is a detected object with area > 30

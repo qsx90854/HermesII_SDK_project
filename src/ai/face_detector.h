@@ -24,6 +24,17 @@ public:
     FaceDetector();
     ~FaceDetector();
 
+#ifdef HERMES_ENABLE_NPU_PERSON
+    struct Result { uint64_t timestamp=0; bool success=false; std::vector<FaceROI> faces; };
+    // All methods run on the same SDK thread as the person backend.
+    void Demand(uint64_t due);
+    void CancelDemand();
+    bool CanSubmit() const;
+    bool TrySubmit(const Image& prepared128, uint64_t timestamp);
+    bool TryGetResult(Result&);
+    void ResetAsync(); // Explicit boundary: drains before reusing buffers.
+#endif
+
     // Initialize the model
     StatusCode Init(const std::string& model_path);
 

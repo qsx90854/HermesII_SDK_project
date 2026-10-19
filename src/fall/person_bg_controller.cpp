@@ -1,9 +1,5 @@
 #include "person_bg_controller.h"
-// LINUX PORT: this include, concrete pointer and BOTH construction sites must be
-// replaced via a backend factory/injection. Keep the controller policy below.
-// HERMES_ENABLE_ONNX_PERSON also gates shared SDK integration; do not simply disable
-// that macro and assume person-assisted BG / fall confirmation remain enabled.
-#include "../ai/person_detector_onnx.h"
+#include "../ai/person_backend.h"
 #include <algorithm>
 #include <cmath>
 #include <cstdlib>
@@ -24,17 +20,20 @@ struct PersonBgController::Impl {
  bool on=env("HERMES_PERSON_BG")=="1",offline=env("HERMES_PERSON_MODE","async")=="offline",trace=env("HERMES_PERSON_TRACE")=="1";
  uint64_t interval=4000,delay=2000,hold=14000,last=0,next=0,serial=0,request_time=0;int w=0,h=0,cols=0,rows=0;
  float base=.08f,increment=.04f,maximum=.32f,margin=.10f;bool pending=false,started=false,finished=false;Result delayed;
- std::unique_ptr<PersonDetectorOnnx> detector;
+ std::unique_ptr<Detector> detector;
  std::vector<uint8_t> valid,source,moved;std::vector<unsigned> misses;std::vector<float> alpha;
  std::vector<Track> captured;std::map<int,Track> previous;
  struct Bridge{float dx=0,dy=0;bool continuous=true;};std::map<int,Bridge> bridges;
  struct Protection{int id=-1;Box box;uint64_t confirmed=0;std::vector<uint8_t> reference;uint64_t unsupported_since=0;const char* state="tracked";};std::vector<Protection> protections;
  std::ofstream events,blocks,boxes_log,protection_log;uint64_t submitted=0,success=0,failed=0,updates=0,stale=0;double infer_ms=0,control_ms=0;
  Impl(){if(!on)return;auto mode=env("HERMES_PERSON_MODE","async");if(mode!="async"&&mode!="offline")throw std::runtime_error("Invalid HERMES_PERSON_MODE");
+#ifdef HERMES_ENABLE_NPU_PERSON
+  if(offline)throw std::runtime_error("NPU backend requires async mode");
+#endif
   interval=uint64_t(number("HERMES_PERSON_INTERVAL_MS",4000,100,60000));delay=uint64_t(number("HERMES_PERSON_DELAY_MS",2000,0,60000));hold=uint64_t(number("HERMES_PERSON_HOLD_MS",14000,0,120000));
   base=float(number("HERMES_PERSON_BASE_ALPHA",.08,0,1));increment=float(number("HERMES_PERSON_ALPHA_STEP",.04,0,1));maximum=float(number("HERMES_PERSON_MAX_ALPHA",.32,base,1));margin=float(number("HERMES_PERSON_MARGIN",.10,0,1));
   Config c;c.model_path=env("HERMES_PERSON_MODEL");c.runtime_path=env("HERMES_PERSON_RUNTIME");c.confidence=float(number("HERMES_PERSON_CONF",.25,.001,1));c.nms_iou=float(number("HERMES_PERSON_NMS",.45,.001,1));
-  detector=std::make_unique<PersonDetectorOnnx>(c);
+  detector=createDetector(c);
   if(trace){protection_log.open("person_bg_protection.csv");protection_log<<"timestamp_ms,track_id,confirmed_ms,action,appearance_support,x1,y1,x2,y2\n";}
   events.open("person_bg_events.csv");if(!events)throw std::runtime_error("Cannot write person events");events<<"request_id,source_timestamp_ms,applied_timestamp_ms,success,persons,inference_ms,total_ms,valid_blocks,protected_blocks,status\n";
   if(trace){boxes_log.open("person_bg_boxes.csv");if(!boxes_log)throw std::runtime_error("Cannot write person boxes");boxes_log<<"request_id,source_timestamp_ms,applied_timestamp_ms,track_id,kind,x1,y1,x2,y2,confidence,class_id\n";blocks.open("person_bg_blocks.csv");if(!blocks)throw std::runtime_error("Cannot write person blocks");blocks<<"timestamp_ms,block,alpha,nonperson_count,valid,reason\n";}
@@ -51,7 +50,12 @@ struct PersonBgController::Impl {
   if(!on)return;auto begin=std::chrono::steady_clock::now();if(iw<=0||ih<=0||gc<=0||gr<=0||gc>iw||gr>ih)throw std::runtime_error("Invalid BG grid");
   if(!started||iw!=w||ih!=h||gc!=cols||gr!=rows||ts<=last||ts-last>1000){
    // Drain old asynchronous work before accepting a new stream/geometry.
-   if(pending&&!offline){detector->Shutdown();Result discard;detector->TryGetResult(discard);Config c;c.model_path=env("HERMES_PERSON_MODEL");c.runtime_path=env("HERMES_PERSON_RUNTIME");c.confidence=float(number("HERMES_PERSON_CONF",.25,.001,1));c.nms_iou=float(number("HERMES_PERSON_NMS",.45,.001,1));detector=std::make_unique<PersonDetectorOnnx>(c);}
+#ifdef HERMES_ENABLE_NPU_PERSON
+   // Cancel an unadmitted deadline too; old stream priority must not survive reset.
+   if(started){detector->Shutdown();Config c;c.model_path=env("HERMES_PERSON_MODEL");c.confidence=float(number("HERMES_PERSON_CONF",.25,.001,1));c.nms_iou=float(number("HERMES_PERSON_NMS",.45,.001,1));detector=createDetector(c);}
+#else
+   if(pending&&!offline){detector->Shutdown();Result discard;detector->TryGetResult(discard);Config c;c.model_path=env("HERMES_PERSON_MODEL");c.runtime_path=env("HERMES_PERSON_RUNTIME");c.confidence=float(number("HERMES_PERSON_CONF",.25,.001,1));c.nms_iou=float(number("HERMES_PERSON_NMS",.45,.001,1));detector=createDetector(c);}
+#endif
    started=true;w=iw;h=ih;cols=gc;rows=gr;valid.assign(gc*gr,0);misses.assign(gc*gr,0);alpha.assign(gc*gr,0);protections.clear();previous.clear();pending=false;next=ts;history.clear();crop_top=exclude?h/rows:0;
   }
   auto current=tracks(objects);std::map<int,Track> curr;for(auto t:current)curr[t.id]=t;
@@ -93,10 +97,15 @@ struct PersonBgController::Impl {
    if(!result.success){std::ofstream errors("person_bg_errors.log",std::ios::app);errors<<result.error<<'\n';}
   }
 // Submission cadence uses source time, not completion time + interval. Busy slots
-// are skipped (no queue); next advances even when submission cannot happen.
+// are skipped for an outstanding request. NPU admission contention retries on the
+// next fresh frame, retaining only a deadline (never an old image queue).
 // Only the top grid row is cropped, preserving packed pitch=w. Backend must not add
 // this crop offset. The source copy supports changes detected while inference is pending.
-  if(ts>=next){next=ts+interval;if(!pending){++serial;bool accepted=true;if(offline)delayed=detector->RunSync(now+crop_top*w,w,h-crop_top,ts,serial);else accepted=detector->TrySubmit(now+crop_top*w,w,h-crop_top,ts,serial);if(accepted){pending=true;request_time=ts;++submitted;source.assign(now,now+size_t(w)*h);moved.assign(cols*rows,0);captured=current;bridges.clear();for(auto&t:current)bridges[t.id]={};}}}
+  if(ts>=next){next=ts+interval;if(!pending){++serial;bool accepted=true;if(offline)delayed=runOffline(*detector,now+crop_top*w,w,h-crop_top,ts,serial);else accepted=detector->TrySubmit(now+crop_top*w,w,h-crop_top,ts,serial);if(!accepted){
+#ifdef HERMES_ENABLE_NPU_PERSON
+ next=ts;
+#endif
+ }if(accepted){pending=true;request_time=ts;++submitted;source.assign(now,now+size_t(w)*h);moved.assign(cols*rows,0);captured=current;bridges.clear();for(auto&t:current)bridges[t.id]={};}}}
   previous=std::move(curr);last=ts;control_ms+=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-begin).count();
  }
  void finish(){if(!on||finished)return;finished=true;detector->Shutdown();if(events.is_open())events.flush();if(blocks.is_open())blocks.flush();if(boxes_log.is_open())boxes_log.flush();if(protection_log.is_open())protection_log.flush();std::ofstream f("person_bg_summary.json");f<<"{\"width\":"<<w<<",\"height\":"<<h<<",\"grid_cols\":"<<cols<<",\"grid_rows\":"<<rows<<",\"submitted\":"<<submitted<<",\"successful_applied\":"<<success<<",\"failed\":"<<failed<<",\"stale\":"<<stale<<",\"updates\":"<<updates<<",\"pending_at_end\":"<<pending<<",\"inference_ms\":"<<infer_ms<<",\"controller_ms_includes_sync_inference\":"<<control_ms<<",\"interval_ms\":"<<interval<<",\"delay_ms\":"<<delay<<",\"offline\":"<<offline<<"}";if(!f||!events||(trace&&(!blocks||!boxes_log)))throw std::runtime_error("Person BG log write failed");}
