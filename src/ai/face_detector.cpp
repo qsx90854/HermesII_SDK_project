@@ -1,3 +1,4 @@
+#include "../file_output_policy.h"
 #include "face_detector.h"
 #ifdef HERMES_ENABLE_NPU_PERSON
 #include "npu_runtime.h"
@@ -42,6 +43,7 @@ static constexpr bool kFaceVFlip = true;
 // =========================================================
 static void save_debug_gray_bmp(const char* filename, const unsigned char* data, int w, int h) {
     if (!data) return;
+    if(!hermes_io::enabled()) return;
     FILE* f = fopen(filename, "wb");
     if (!f) {
         printf("[FaceDetector] Failed to open %s for writing\n", filename);

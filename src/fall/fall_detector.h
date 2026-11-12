@@ -130,6 +130,8 @@ public:
 
     // Configure algorithm parameters
     void SetConfig(const InternalConfig& config);
+    StatusCode ConfigureBackground(const BackgroundControl_v1* config);
+    void GetBackgroundStatus(BackgroundStatus_v1& status) const;
 
     // Set Bed Region directly with 4 points
     void SetBedRegion(const std::vector<std::pair<int, int>>& points);

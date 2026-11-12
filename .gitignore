@@ -63,3 +63,23 @@
 !/experiments/yolo_bg/tests/run_host_tests.sh
 
 !/.gitignore
+
+!/experiments/yolo_bg/summarize_stage_timing.py
+!/experiments/yolo_bg/tests/stage_timing_test.cpp
+
+!/experiments/yolo_bg/tests/bg_pixel_update_test.cpp
+
+!/experiments/yolo_bg/tests/identity_blocks_test.cpp
+!/experiments/yolo_bg/tests/identity_geometry_test.cpp
+!/experiments/yolo_bg/tests/identity_spans_test.cpp
+
+!/experiments/yolo_bg/tests/background_api_test.cpp
+!/experiments/yolo_bg/tests/run_background_api_test.sh
+!/experiments/yolo_bg/run_release_batch.sh
+!/experiments/yolo_bg/summarize_release_batch.py
+!/experiments/yolo_bg/package_release_v210.sh
+!/experiments/yolo_bg/tests/release_scoring_test.py
+!/experiments/yolo_bg/run_eligibility_batch.sh
+!/experiments/yolo_bg/tests/eligibility_diagnostics_test.cpp
+!/experiments/yolo_bg/tests/trigger_edge_policy_test.cpp
+!/experiments/yolo_bg/RELEASE_USAGE_v210.md

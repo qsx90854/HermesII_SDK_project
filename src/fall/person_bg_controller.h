@@ -11,6 +11,7 @@ namespace hermes_person {
 class PersonBgController {
 public:
  PersonBgController();~PersonBgController();
+ void Configure(const VisionSDK::BackgroundControl_v1* config);
  bool enabled() const;
  // Invalid background is represented by current image, never by a synthetic dark floor.
  void MaskUnknown(uint8_t* bg,const uint8_t* now,int w,int h);

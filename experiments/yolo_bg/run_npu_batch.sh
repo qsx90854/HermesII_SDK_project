@@ -42,6 +42,7 @@ umask 022
 OUT=$(mktemp -d "$ROOT/build/npu_people/batch_data${FIRST}_${LAST}_face${FACE}_XXXXXX")
 # mktemp uses 0700; allow the PC user to read NFS root-squashed results.
 chmod 755 "$OUT"
+export HERMES_FILE_OUTPUT=1
 export HERMES_PERSON_BG=1 HERMES_PERSON_MODE=async
 export HERMES_PERSON_INTERVAL_MS=1600 HERMES_PERSON_DELAY_MS=800
 export HERMES_PERSON_MODEL="$MODEL"
@@ -67,7 +68,7 @@ while [ "$N" -le "$LAST" ]; do
             --width=800 --height=450 --interval=1 \
             --frame-period-ms=133.3333333333333 --realtime \
             --max-frames=0 --face="$FACE" --face-model="$FACE_MODEL" \
-            --ini="$RUN/parameters.ini" --output-prefix="$RUN/data$N" \
+            --ini="$RUN/parameters.ini" --write-files --output-prefix="$RUN/data$N" \
             > "$RUN/runner.log" 2>&1
     ); then
         printf 'data%s,completed\n' "$N" >> "$OUT/status.csv"

@@ -1,3 +1,4 @@
+#include "../file_output_policy.h"
 #include "image_process.h"
 #ifndef DISABLE_NPU
 #include <fhhcp/cv.h>
@@ -106,6 +107,7 @@ static int flush_mmz_memory(T_TY_Mem *mem) {
 }
 
 static void save_bmp_gray(const char* filename, const uint8_t* data, int width, int height) {
+    if(!hermes_io::enabled()) return;
     FILE* f = fopen(filename, "wb");
     if (!f) return;
 

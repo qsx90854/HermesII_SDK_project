@@ -1,5 +1,6 @@
 #pragma once
 #include "../ai/person_detector.h"
+#include "../file_output_policy.h"
 #include <algorithm>
 #include <cmath>
 #include <cstdlib>
@@ -25,7 +26,7 @@ struct TrackState {
 class Guard {
 public:
  bool history_two=flag("HERMES_PERSON_HISTORY_TWO");
- bool coast=flag("HERMES_COAST_VALIDITY"),confirm=flag("HERMES_FALL_PERSON_CONFIRM"),exclude=flag("HERMES_EXCLUDE_TOP_ROW"),trace=flag("HERMES_TRACK_REPLAY");
+ bool coast=flag("HERMES_COAST_VALIDITY"),confirm=flag("HERMES_FALL_PERSON_CONFIRM"),exclude=flag("HERMES_EXCLUDE_TOP_ROW"),trace=hermes_io::enabled()&&flag("HERMES_TRACK_REPLAY");
  std::map<int,TrackState> tracks;std::set<int> ghosts;std::map<int,int> associations;std::ofstream objects,fg_log,events,checks;
  std::vector<uint8_t> previous;uint64_t last=0,stamp=0;int width=0,height=0,top=0;
  void finish(){for(auto*f:{&objects,&fg_log,&events,&checks})if(f->is_open()){f->flush();if(!*f)throw std::runtime_error("Safety trace write failed");f->close();}}

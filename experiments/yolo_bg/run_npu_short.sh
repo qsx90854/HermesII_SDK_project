@@ -15,6 +15,7 @@ OUT=$(mktemp -d "$ROOT/build/npu_people/short_${VIDEO}_face${FACE}_XXXXXX")
 chmod 755 "$OUT"
 # Capture the concrete settings used for this short run.
 cp "$ROOT/Parameter/sdk_gray_count_falls.ini" "$OUT/parameters.ini"
+export HERMES_FILE_OUTPUT=1
 export HERMES_PERSON_BG=1 HERMES_PERSON_MODE=async HERMES_PERSON_INTERVAL_MS=1600 HERMES_PERSON_DELAY_MS=800
 export HERMES_PERSON_MODEL="$ROOT/handoff_yolov7t_people/yolov7t_people_320x320_v2.ty"
 export HERMES_PERSON_CONF=0.25 HERMES_PERSON_NMS=0.7 HERMES_PERSON_PROTECTION_V2=1
@@ -28,4 +29,4 @@ exec "$ROOT/build/npu_people/sdk_gray_npu" "$ROOT/Bug_Video/Fall_17/$VIDEO.gray"
  --width=800 --height=450 --interval=1 --frame-period-ms=133.3333333333333 \
  --realtime --max-frames="$FRAMES" --face="$FACE" \
  --face-model="$ROOT/models/blaze_face_detect_nnp310_128x128.ty" \
- --ini="$OUT/parameters.ini" --output-prefix="$OUT/$VIDEO" > "$OUT/runner.log" 2>&1
+ --ini="$OUT/parameters.ini" --write-files --output-prefix="$OUT/$VIDEO" > "$OUT/runner.log" 2>&1

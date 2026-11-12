@@ -1,3 +1,4 @@
+#include "file_output_policy.h"
 #include "HermesII_sdk.h"
 #include "ai/model_runner.h"
 #include "fusion/image_fusion.h"
@@ -38,6 +39,8 @@ namespace VisionSDK {
         FallDetector fall_detector;
 
         InternalConfig config;
+        bool initialized=false, background_configured=false;
+        BackgroundControl_v1 background_config;
         
         // Shared Memory Input
         unsigned char* input_buffer = nullptr;
@@ -45,6 +48,7 @@ namespace VisionSDK {
         int input_height = 0;
         int input_channels = 0;
         uint64_t input_timestamp = 0;
+        uint32_t last_detect_time_us = 0;
 
         // Internal Deep Copy Buffer
         std::vector<unsigned char> internal_input_copy;
@@ -90,7 +94,7 @@ namespace VisionSDK {
             if (impl->internal_callback_registered) return;
             impl->internal_callback_registered = true;
             impl->fall_detector.RegisterCallback([impl](const VisionSDKEvent& e) {
-                if (e.is_fall_detected || e.is_bed_exit) {
+                if (hermes_io::enabled() && (e.is_fall_detected || e.is_bed_exit)) {
                     std::vector<uint8_t> bg;
                     if (!impl->event_recorder.IsCapturing()) {
                         // Only the first trigger of a capture needs the background.
@@ -110,13 +114,15 @@ using namespace VisionSDK;
 VisionSDK::VisionSDK::VisionSDK() : pImpl(std::unique_ptr<Impl>(new Impl())) {}
 VisionSDK::VisionSDK::~VisionSDK() = default;
 
-#define VISION_SDK_VERSION_INTERNAL "2.0.7_20260908"
+#define VISION_SDK_VERSION_INTERNAL "2.1.0"
 
 const char* VisionSDK::VisionSDK::GetVersion() {
     return VISION_SDK_VERSION_INTERNAL;
 }
 
 StatusCode VisionSDK::VisionSDK::Init(const std::string& model_path, int num_threads) {
+    try {
+    if(pImpl->initialized) return StatusCode::ERROR_INVALID_INPUT;
     // ---- [sdk.ini] Read debug logging config ----
     {
         bool save_txt = false;
@@ -153,7 +159,7 @@ StatusCode VisionSDK::VisionSDK::Init(const std::string& model_path, int num_thr
             std::cout << "[SDK] sdk.ini not found, debug logging disabled." << std::endl;
         }
 
-        if (save_txt) {
+        if (hermes_io::enabled() && save_txt) {
             // Build timestamped filename: sdk_fall_debug_YYYYMMDD_HHMMSS.txt
             std::time_t now = std::time(nullptr);
             char timebuf[32];
@@ -171,6 +177,15 @@ StatusCode VisionSDK::VisionSDK::Init(const std::string& model_path, int num_thr
        // Warning
     }
     
+    if(!hermes_io::enabled()) {
+        pImpl->config.only_save_raw=false;
+        pImpl->config.enable_save_images=false;
+        pImpl->config.enable_save_bg_mask=false;
+        pImpl->event_record_self_test=false;
+    }
+    const auto background_result=pImpl->fall_detector.ConfigureBackground(
+        pImpl->background_configured?&pImpl->background_config:nullptr);
+    if(background_result!=StatusCode::OK) return background_result;
     // Pass merged config to FallDetector
     pImpl->fall_detector.SetConfig(pImpl->config);
 
@@ -186,13 +201,22 @@ StatusCode VisionSDK::VisionSDK::Init(const std::string& model_path, int num_thr
                   << "Normal fall/bed-exit recording continues afterwards." << std::endl;
     }
 
+    pImpl->initialized=true;
     std::cout << "VisionSDK Initialized." << std::endl;
     return StatusCode::OK;
+    } catch(const std::exception& error) {
+        std::cerr << "SDK initialization failed: " << error.what() << std::endl;
+        try { pImpl->fall_detector.Release(); } catch(...) {}
+        pImpl->initialized=false;
+        return StatusCode::ERROR_INIT_FAILED;
+    }
 }
 
 StatusCode VisionSDK::VisionSDK::Release() {
     pImpl->event_recorder.Shutdown(); // flush pending event recording first
     pImpl->fall_detector.Release();
+    pImpl->initialized=false;
+    pImpl->input_buffer=nullptr;
     std::cout << "VisionSDK Released." << std::endl;
     return StatusCode::OK;
 }
@@ -212,6 +236,18 @@ StatusCode VisionSDK::VisionSDK::SetConfig(const void* config) {
     }
 
     switch (header->type) {
+        case ConfigType::BackgroundControl_v1: {
+            const auto* c=static_cast<const BackgroundControl_v1*>(config);
+            if(pImpl->initialized || header->version!=1 || c->struct_size!=sizeof(*c) ||
+               c->enable_bg_stability>1 || c->enable_yolo>1 ||
+               c->bg_stability_window_ms<100 || c->bg_stability_window_ms>600000 ||
+               !std::memchr(c->yolo_model_path,0,sizeof(c->yolo_model_path)) ||
+               (c->enable_yolo && !c->yolo_model_path[0])) return StatusCode::ERROR_INVALID_INPUT;
+            pImpl->background_config=*c;
+            pImpl->background_configured=true;
+            return StatusCode::OK;
+        }
+
         case ConfigType::MotionEstimation_v1: {
             const auto* c = static_cast<const MotionEstimation_v1*>(config);
             pImpl->config.grid_cols = c->grid_cols;
@@ -368,7 +404,7 @@ StatusCode VisionSDK::VisionSDK::SetConfig(const void* config) {
         case ConfigType::EventRecording_v1: {
             const auto* c = static_cast<const EventRecording_v1*>(config);
             if (c->header.version >= 2)   // pc_output_base is appended; only read from new callers
-                pImpl->event_recorder.SetPcOutputBase(c->pc_output_base);
+                if(hermes_io::enabled()) pImpl->event_recorder.SetPcOutputBase(c->pc_output_base);
             pImpl->event_recorder.Configure(false, c->pre_frames, c->post_frames, c->store_raw);
             if (c->enable) Impl::EnsureInternalCallback(pImpl.get()); //20260915 => c->enable改成false
             // Recorder is independent of InternalConfig; nothing to merge.
@@ -379,7 +415,7 @@ StatusCode VisionSDK::VisionSDK::SetConfig(const void* config) {
     }
 
     // Update FallDetector with new merged config
-    pImpl->fall_detector.SetConfig(pImpl->config);
+    if(pImpl->initialized) pImpl->fall_detector.SetConfig(pImpl->config);
 
     // ---- [PARAM-DUMP] Print all config after each SetConfig call ----
     const InternalConfig& cfg = pImpl->config;
@@ -538,7 +574,7 @@ void VisionSDK::VisionSDK::GetBackgroundImage(std::vector<uint8_t>& out_bg) cons
 }
 
 StatusCode VisionSDK::VisionSDK::ProcessNextFrame() {
-    if (!pImpl->input_buffer) return StatusCode::ERROR_INVALID_INPUT;
+    if (!pImpl->initialized || !pImpl->input_buffer) return StatusCode::ERROR_INVALID_INPUT;
 
     // Use VisionSDK::Image wrapper (struct)
     Image internal_img; 
@@ -550,6 +586,7 @@ StatusCode VisionSDK::VisionSDK::ProcessNextFrame() {
 
     // Spool the frame into the SD-card ring before Detect(): when the event
     // callback fires inside Detect(), the ring's newest frame is this frame.
+    if(hermes_io::enabled()) {
     pImpl->event_recorder.PushFrame(internal_img);
 
     pImpl->recorder_frame_count++;
@@ -581,6 +618,7 @@ StatusCode VisionSDK::VisionSDK::ProcessNextFrame() {
         pImpl->event_recorder.TriggerSelfTest(std::move(bg));
     }
 
+    }
     bool is_fall = false;
     
     // Performance Profiling
@@ -589,14 +627,16 @@ StatusCode VisionSDK::VisionSDK::ProcessNextFrame() {
     auto t1 = std::chrono::high_resolution_clock::now();
     auto duration = std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count();
 
+    pImpl->last_detect_time_us = (duration > 0 && duration <= UINT32_MAX) ? uint32_t(duration) : 0;
+
     // Back-fill this frame's processing time into its ring slot so event
     // recordings can report per-frame Detect() duration in the meta json.
-    pImpl->event_recorder.RecordProcessTime((uint64_t)duration);
+    if(hermes_io::enabled()) pImpl->event_recorder.RecordProcessTime((uint64_t)duration);
 
     // Snapshot the decision-relevant state (objects, blocks, momentum, ...)
     // for this frame so event recordings can explain WHY a fall / bed-exit
     // was decided (dumped to <event>.analysis.jsonl at finalize).
-    if (pImpl->event_recorder.IsActive()) {
+    if (hermes_io::enabled() && pImpl->event_recorder.IsActive()) {
         const int kMaxAnalysisObjects = 8;
         EventRecorder::FrameAnalysis fa;
         fa.timestamp_ms = pImpl->input_timestamp;
@@ -725,6 +765,13 @@ StatusCode VisionSDK::VisionSDK::MapROI(
 //     return pImpl->fall_detector.GetMotionObjects();
 // }
 
+uint32_t VisionSDK::VisionSDK::GetLastDetectTimeUs() const {
+    return pImpl->initialized ? pImpl->last_detect_time_us : 0;
+}
+bool VisionSDK::VisionSDK::IsObjectBedExit(int object_id) const {
+    return pImpl->initialized && pImpl->fall_detector.IsObjectBedExit(object_id);
+}
+
 void VisionSDK::VisionSDK::GetMotionObjects(std::vector<MotionObject>& out_objects) {
     out_objects.clear();
     const auto& objs = pImpl->fall_detector.GetMotionObjects();
@@ -760,4 +807,10 @@ std::vector<MotionVector> VisionSDK::VisionSDK::GetMotionVectors() {
 
 std::vector<ObjectFeatures> VisionSDK::VisionSDK::GetFullFrameObjects() {
     return pImpl->fall_detector.GetFullFrameObjects();
+}
+
+StatusCode VisionSDK::VisionSDK::GetBackgroundStatus(BackgroundStatus_v1& status) const {
+    if(status.struct_size!=sizeof(status)||status.version!=1) return StatusCode::ERROR_INVALID_INPUT;
+    pImpl->fall_detector.GetBackgroundStatus(status);
+    return StatusCode::OK;
 }

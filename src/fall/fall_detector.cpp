@@ -1,3 +1,4 @@
+#include "../file_output_policy.h"
 // Legacy ONNX builds keep their existing shared-feature behavior.
 #if defined(HERMES_ENABLE_ONNX_PERSON) || defined(HERMES_ENABLE_NPU_PERSON)
 #ifndef HERMES_ENABLE_PERSON
@@ -8,6 +9,9 @@
 #include "../ai/npu_runtime.h"
 #endif
 #include "fall_detector.h"
+#include "stage_timing.h"
+#include "eligibility_diagnostics.h"
+#include "trigger_edge_policy.h"
 #include "fall_safety.h"
 #include "identity_a.h"
 #ifdef HERMES_ENABLE_PERSON
@@ -53,7 +57,7 @@ int ggap = 1;
 
 #if ENABLE_DEBUG_PRINT
 #define DEBUG_PRINT(...) do { \
-    FILE* dbg_file = fopen("fall_debugp.log", "a"); \
+    FILE* dbg_file = hermes_io::enabled() ? fopen("fall_debugp.log", "a") : nullptr; \
     if (dbg_file) { \
         fprintf(dbg_file, __VA_ARGS__); \
         fclose(dbg_file); \
@@ -194,6 +198,7 @@ static void drawRectangleGray(uint8_t* data, int w, int h, int x1, int y1, int x
 
 static void save_debug_gray_bmp(const char* filename, const unsigned char* data, int w, int h) {
     if (!data) return;
+    if(!hermes_io::enabled()) return;
     FILE* f = fopen(filename, "wb");
     if (!f) return;
 
@@ -2703,14 +2708,14 @@ public:
         if(end==value||*end||n<1||n>10000)throw std::runtime_error("Invalid HERMES_OBSERVATION_FRAMES");
         return int(n);
     }();
-    hermes_identity_a::Model<MotionObject, ::VisionSDK::ObjectFeatures> identity_a;
+    hermes_identity_a::Model<MotionObject, ::VisionSDK::ObjectFeatures> identity_a{true};
     std::vector<uint8_t> safety_input;
 #ifdef HERMES_ENABLE_PERSON
     hermes_person::PersonBgController person_bg;
     hermes_person::FgReplayWriter fg_replay;
 #endif
 #ifdef HERMES_BG_STABILITY
-    hermes_bg_stability::Model bg_stability;
+    hermes_bg_stability::Model bg_stability{true};
 #endif
 public:
     std::unique_ptr<OptimizedBlockMotionEstimator> estimator;
@@ -2771,10 +2776,15 @@ public:
 
     // ---- [DEBUG LOG] Per-frame CSV logging ----
     bool debug_log_enabled = false;
+    BackgroundStatus_v1 background_status;
     std::ofstream debug_log_file;
     // ---- [DEBUG LOG] end ----
     
     uint64_t last_timestamp = 0; // Timestamp of previous frame
+    hermes_timing::Recorder stage_timing{"input", "face_prepare_poll", "gray_geometry", "bg_mask_unknown", "foreground", "motion", "tracking", "pixel_stats", "bg_stability", "safety_history", "fall_logic", "post_logic", "bg_controller", "confirmation", "trace_output", "face_submit", "callback", "tail", "fg_mask", "fg_components", "fg_sort", "debug_csv"};
+    hermes_timing::Recorder tracking_timing{
+        {"setup", "extract", "merge", "identity_begin", "associate", "reconstruct", "copy_results", "metadata", "expired_cleanup", "stale_cleanup", "coasting", "safe_area", "bed_history", "workload", "legacy_associate"},
+        {"identity_enabled", "active_blocks", "fg_count", "fg_pixels", "fg_max_pixels", "extracted_objects", "association_objects", "tracks_before", "mature_tracks", "footprint_pixels", "footprint_max_pixels", "cost_pairs", "cost_matrix_cells", "tracks_after", "objects_after", "assisted_count", "assisted_pixels", "expired_tracks", "stale_tracks", "persistent_ids", "observation_ids", "object_history_frames", "bed_history_ids", "bed_history_samples"}};
     std::vector<MotionObject> previous_objects; // Added for tracking
     int frame_idx = 0; // Added frame_idx definition
     
@@ -2914,8 +2924,41 @@ public:
     }
 #endif
 
+    hermes_diagnostics::EligibilityRecorder eligibility_diagnostics;
+    std::map<int, hermes_fall_policy::Evidence> retained_triggers;
+    hermes_diagnostics::EligibilityRow EligibilitySnapshot(const MotionObject& object,uint64_t stamp,bool bg_ready) {
+        hermes_diagnostics::EligibilityRow row;
+        row.frame=absolute_frame_count-1;row.stamp=stamp;row.id=object.id;row.bg_ready=bg_ready;
+        row.identity_enabled=identity_a.enabled();
+        row.identity_eligible=!row.identity_enabled||identity_a.eligible(object.id);
+        auto track=identity_a.tracks.find(object.id);
+        if(track!=identity_a.tracks.end()){
+            row.mature=track->second.mature;
+            row.confirmation_samples=track->second.confirmation_samples;
+        }
+        auto link=identity_a.links.find(object.id);
+        if(link!=identity_a.links.end())row.ambiguous=link->second.ambiguous;
+        row.history=hermes_diagnostics::examine_history(object_history,object.id);
+        auto observation=observation_states.find(object.id);
+        if(observation!=observation_states.end()){
+            row.active=observation->second.is_active;
+            row.waiting=observation->second.waiting_for_deceleration;
+            row.post_fall=observation->second.post_fall_counter;
+            if(config.enable_post_bed_exit_threshold&&observation->second.post_bed_exit_counter>0)
+                row.threshold=20.0f*config.post_bed_exit_threshold_multiplier;
+        }
+        row.pixels=object.pixel_count;row.fg_area=object.fg_area;
+        row.area_metric=config.use_fg_area_trigger?object.fg_area:object.pixel_count;
+        row.area_threshold=config.use_fg_area_trigger?config.min_trigger_fg_area:3000;
+        row.measured=safety.measured(object.id);
+        // Bounds use the same block mapping as the confirmation path.
+        const auto box=hermes_safety::Guard::bounds(object,wrapper_buf.width(),wrapper_buf.height(),config.grid_cols,config.grid_rows);
+        row.x1=box.x1;row.y1=box.y1;row.x2=box.x2;row.y2=box.y2;
+        return row;
+    }
     std::ofstream diagnostic_trace;
     void LogTrace(int id, int frame, const char* type, float val, const std::string& msg) {
+        if(!hermes_io::enabled())return;
         static const bool enabled=[](){const char* s=std::getenv("HERMES_FALL_REASON_TRACE");return s&&std::string(s)=="1";}();
         if(!enabled)return;
         if(!diagnostic_trace.is_open()) {
@@ -3250,6 +3293,9 @@ public:
     }
 
     void Release() {
+        eligibility_diagnostics.finish();
+        stage_timing.finish("algorithm_timing.csv");
+        tracking_timing.finish("tracking_timing.csv");
         if(diagnostic_trace.is_open()){diagnostic_trace.flush();diagnostic_trace.close();}
 #ifdef HERMES_ENABLE_PERSON
         fg_replay.Finish();
@@ -3287,6 +3333,7 @@ public:
         safety.reset();
         identity_a.reset();
         observation_states.clear();
+        retained_triggers.clear();
         
         lastMaskData.clear();
         lastMaskData.shrink_to_fit();
@@ -3316,6 +3363,12 @@ public:
         fall_confirmation_counter = 0;
         in_fall_state = false;
         absolute_frame_count = 0;
+        background_status=BackgroundStatus_v1{};
+        backgroundFrame=::Image();
+        bg_update_counter=bg_accumulated_count=0;
+        bg_accumulator.clear();background_initialized_externally=false;
+        block_fg_scores_.clear();block_protect_ttl_.clear();
+        global_pixel_history.clear();estimator.reset();
         frame_idx = 0;
         fall_consecutive_frames = 0;
         face_model_inited = false;
@@ -3351,9 +3404,14 @@ void FallDetector::SetConfig(const InternalConfig& config) {
         pImpl->faceDetector.ResetAsync();pImpl->last_has_face=false;pImpl->last_face_roi={};
     }
 #endif
-    pImpl->config = config; // Update internal config
+    pImpl->config = config;
+    if(!hermes_io::enabled()) {
+        pImpl->config.only_save_raw=false;
+        pImpl->config.enable_save_images=false;
+        pImpl->config.enable_save_bg_mask=false;
+    } // Update internal config
 
-    if (gridChanged) {
+    if (gridChanged || !pImpl->estimator) {
         pImpl->estimator.reset(new OptimizedBlockMotionEstimator(
             config.grid_cols, config.grid_rows, config.block_size, config.search_range));
     }
@@ -3394,6 +3452,11 @@ void FallDetector::SetConfig(const InternalConfig& config) {
 }
 
 void FallDetector::SetBedRegion(const std::vector<std::pair<int, int>>& points) {
+#ifdef HERMES_BG_STABILITY
+    pImpl->bg_stability.reset();
+    pImpl->background_status=BackgroundStatus_v1{};
+    if(pImpl->bg_stability.enabled)pImpl->background_status.state=BackgroundState::WaitingInitialBackground;
+#endif
 #ifdef HERMES_ENABLE_NPU_PERSON
     pImpl->faceDetector.ResetAsync();pImpl->last_has_face=false;pImpl->last_face_roi={};
 #endif
@@ -3431,6 +3494,7 @@ void FallDetector::SetHistorySize(int n) {
 
 // ---- [DEBUG LOG] EnableDebugLog ----
 void FallDetector::EnableDebugLog(const std::string& filepath) {
+    if(!hermes_io::enabled())return;
     pImpl->debug_log_file.open(filepath, std::ios::out | std::ios::trunc);
     if (pImpl->debug_log_file.is_open()) {
         pImpl->debug_log_enabled = true;
@@ -4279,6 +4343,7 @@ void detectFallMomentumTrend(
 StatusCode FallDetector::Detect(const Image& input_frame, bool& is_fall) 
 {
     
+    hermes_timing::Frame timing(pImpl->stage_timing,pImpl->absolute_frame_count,input_frame.timestamp);
     Image frame=input_frame;
     if(pImpl->safety.exclude && frame.data && frame.height>0 && frame.width>0) {
         int rows=pImpl->config.grid_rows>0?pImpl->config.grid_rows:16;
@@ -4345,6 +4410,7 @@ StatusCode FallDetector::Detect(const Image& input_frame, bool& is_fall)
     int H = frame.height;
     int bSize = (pImpl->config.block_size > 0) ? pImpl->config.block_size : 16;
     
+    timing.next(1);
     // --- 0. Face Detection Integration ---
     // Face variables declared in outer scope
     #if ENABLE_PERF_PROFILING
@@ -4604,6 +4670,7 @@ StatusCode FallDetector::Detect(const Image& input_frame, bool& is_fall)
 #ifdef HERMES_ENABLE_NPU_PERSON
     if(should_run_face_detect&&!face_prepared)pImpl->faceDetector.CancelDemand();
 #endif
+    timing.next(2);
     // End Face logic
     
     #if ENABLE_PERF_PROFILING
@@ -4657,7 +4724,7 @@ StatusCode FallDetector::Detect(const Image& input_frame, bool& is_fall)
         
         char filename[256];
         snprintf(filename, sizeof(filename), "nfs/test1/fall_debug_ID%d_F%lld_%s.jpg", obj.id, pImpl->absolute_frame_count, event_name);
-        stbi_write_jpg(filename, W, H, channels, out_img.data(), 70);
+        if(hermes_io::enabled()) stbi_write_jpg(filename, W, H, channels, out_img.data(), 70);
         DEBUG_PRINT("[Debug] Saved event JPG: %s\n", filename);
     };
 #endif
@@ -4718,6 +4785,7 @@ StatusCode FallDetector::Detect(const Image& input_frame, bool& is_fall)
     // AFTER object detection and tracking.
     // See end of function.
 
+    timing.next(3);
     // --- raw_frame_history Management ---
     //pImpl->raw_frame_history.push_back(wrapper.clone());
     //int max_history = pImpl->config.opt_flow_frame_distance + 1;
@@ -4732,6 +4800,7 @@ StatusCode FallDetector::Detect(const Image& input_frame, bool& is_fall)
         pImpl->person_bg.MaskUnknown(pImpl->backgroundFrame.getData(),wrapper.getData(),W,H);
     }
 #endif
+    timing.next(4);
     // Generate and Save BG Mask
     int global_fg_count = 0;
     if (pImpl->backgroundFrame.width() > 0) 
@@ -4762,6 +4831,7 @@ StatusCode FallDetector::Detect(const Image& input_frame, bool& is_fall)
 
         {
             TimerGuard t_mask_gen(g_perf_timer, "1_1a_BGMaskGen");
+            hermes_timing::Scope stage_scope(timing,18);
             // NEON-accelerated BG diff → mask generation
 #if defined(__ARM_NEON) || defined(__ARM_NEON__)
             const uint8x16_t vthr = vdupq_n_u8((uint8_t)diff_thr);
@@ -4810,11 +4880,13 @@ StatusCode FallDetector::Detect(const Image& input_frame, bool& is_fall)
 #endif
         {
             TimerGuard t_find_obj(g_perf_timer, "1_1b_FindObjects");
+            hermes_timing::Scope stage_scope(timing,19);
             // Identify and store full-frame foreground objects
             pImpl->full_frame_objects = find_objects_optimized(maskData.data(), w, h, 20, pImpl->config.foreground_merge_radius); 
         }
         {
             TimerGuard t_sort_obj(g_perf_timer, "1_1b_SortObjects");
+            hermes_timing::Scope stage_scope(timing,20);
             //先保留
             // if (pImpl->full_frame_objects.size() > 5) {
             //     std::sort(pImpl->full_frame_objects.begin(), pImpl->full_frame_objects.end(),
@@ -4887,7 +4959,8 @@ StatusCode FallDetector::Detect(const Image& input_frame, bool& is_fall)
     // Run    // 2. Motion Estimation Execute
     // DEBUG_PRINT("[Debug] Estimator->blockBasedMotionEstimation Start\n");
     {
-        TimerGuard t_me(g_perf_timer, "2_MotionEstimation");
+        timing.next(5);
+    TimerGuard t_me(g_perf_timer, "2_MotionEstimation");
         pImpl->estimator->blockBasedMotionEstimation(wrapper, 
                                                    pImpl->motion_vectors, 
                                                    pImpl->positions, 
@@ -4963,7 +5036,7 @@ StatusCode FallDetector::Detect(const Image& input_frame, bool& is_fall)
                 }
             }
             
-            stbi_write_jpg(filename, W, H, 3, dst,90);
+            if(hermes_io::enabled()) stbi_write_jpg(filename, W, H, 3, dst,90);
         } else if (frame.channels == 1) {
             // std::vector<uint8_t> gray_buffer(W * H);
             // memcpy(gray_buffer.data(), frame.data, W * H);
@@ -4991,12 +5064,26 @@ StatusCode FallDetector::Detect(const Image& input_frame, bool& is_fall)
     long long t_logic_start = pImpl->get_now_us();
     #endif
 
+    timing.next(6);
+    { // Tracking sub-stages are included in the main tracking timer.
+    hermes_timing::Frame track_timing(pImpl->tracking_timing,pImpl->absolute_frame_count-1,frame.timestamp);
+    if(track_timing.active()) {
+        hermes_timing::Scope measure(track_timing,13);
+        track_timing.count(0,pImpl->identity_a.enabled());
+        track_timing.count(1,pImpl->active_blocks.size());
+        track_timing.count(2,pImpl->full_frame_objects.size());
+        uint64_t pixels=0,largest=0;
+        for(const auto& fg:pImpl->full_frame_objects){pixels+=fg.pixels.size();largest=std::max(largest,uint64_t(fg.pixels.size()));}
+        track_timing.count(3,pixels);track_timing.count(4,largest);
+    }
+
     // 2. Extract Objects
     // Only the legacy tracker reads this deep copy.
     if (!pImpl->identity_a.enabled()) pImpl->previous_objects = pImpl->current_objects;
     
     {
         TimerGuard t_track(g_perf_timer, "3_TrackingAndExtraction");
+        track_timing.next(1);
         pImpl->current_objects = extractMotionObjects(pImpl->motion_vectors, 
                                                       pImpl->changed_mask,
                                                       pImpl->config.grid_rows, 
@@ -5005,6 +5092,8 @@ StatusCode FallDetector::Detect(const Image& input_frame, bool& is_fall)
                                                       pImpl->config.object_merge_radius,
                                                       pImpl->config.momentum_calc_type);
 
+        track_timing.count(5,pImpl->current_objects.size());
+        track_timing.next(2);
         // 方案1: fuse same-frame overlapping detections before tracking (ini-gated).
         if (pImpl->config.merge_overlapping_enable) {
             size_t before = pImpl->current_objects.size();
@@ -5022,18 +5111,39 @@ StatusCode FallDetector::Detect(const Image& input_frame, bool& is_fall)
         // TRACKING
         if (pImpl->identity_a.enabled()) {
             auto& a = pImpl->identity_a;
+            track_timing.next(3);
             a.begin(frame.timestamp, W, H, pImpl->config.grid_cols, pImpl->config.grid_rows);
-            a.associate(pImpl->current_objects, pImpl->full_frame_objects, pImpl->motion_vectors, pImpl->changed_mask, pImpl->global_id_counter);
-            a.reconstruct(pImpl->current_objects, pImpl->full_frame_objects);
+            if(track_timing.active()) {
+                hermes_timing::Scope measure(track_timing,13);
+                const uint64_t nt=a.tracks.size(),nd=pImpl->current_objects.size();
+                track_timing.count(6,nd);track_timing.count(7,nt);
+                uint64_t pixels=0,largest=0,mature=0;
+                for(const auto& kv:a.tracks){pixels+=kv.second.footprint.size();largest=std::max(largest,uint64_t(kv.second.footprint.size()));mature+=kv.second.mature;}
+                track_timing.count(8,mature);track_timing.count(9,pixels);track_timing.count(10,largest);
+                track_timing.count(11,nt*nd);track_timing.count(12,nt*(nd+nt));
+            }
+            track_timing.next(4);
+            a.associate(pImpl->current_objects, pImpl->full_frame_objects, pImpl->motion_vectors, pImpl->changed_mask, pImpl->global_id_counter, pImpl->absolute_frame_count-1);
+            track_timing.next(5);
+            a.reconstruct(pImpl->current_objects, pImpl->full_frame_objects, pImpl->absolute_frame_count-1);
+            track_timing.next(6);
             pImpl->full_frame_objects = a.assisted;
             expired_ids = a.expired;
+            if(track_timing.active()) {
+                hermes_timing::Scope measure(track_timing,13);
+                track_timing.count(13,a.tracks.size());track_timing.count(15,a.assisted.size());
+                uint64_t pixels=0;for(const auto& fg:a.assisted)pixels+=fg.pixels.size();track_timing.count(16,pixels);
+            }
+            track_timing.next(7);
             for (const auto& obj : pImpl->current_objects) {
                 pImpl->object_first_seen_frame.emplace(obj.id, pImpl->frame_idx);
                 bool edge = false;
                 for(int b : obj.blocks) edge |= b / pImpl->config.grid_cols == 0 || b / pImpl->config.grid_cols >= pImpl->config.grid_rows-1 || b % pImpl->config.grid_cols == 0 || b % pImpl->config.grid_cols == pImpl->config.grid_cols-1;
                 pImpl->object_is_new_entry.emplace(obj.id, edge);
             }
-        } else TrackObjects(pImpl->current_objects, 
+        } else {
+            track_timing.next(14);
+            TrackObjects(pImpl->current_objects,
                      pImpl->previous_objects, 
                      pImpl->config, 
                      pImpl->kalmanFilters, 
@@ -5045,6 +5155,9 @@ StatusCode FallDetector::Detect(const Image& input_frame, bool& is_fall)
                      (int)pImpl->frame_idx,
                      expired_ids,
                      pImpl->observation_states);
+        }
+        track_timing.count(17,expired_ids.size());
+        track_timing.next(8);
                      
         // GARBAGE COLLECTION: Prevent Memory Leaks / Edge Device OOM
         for (int id : expired_ids) 
@@ -5076,6 +5189,7 @@ StatusCode FallDetector::Detect(const Image& input_frame, bool& is_fall)
     }
 
     // ---------------------------------------------------------------
+    track_timing.next(9);
     // STALE OBJECT CLEANUP
     // Update last-active timestamp for objects with real motion this frame.
     // Then purge any ID that hasn't moved for > STALE_THRESHOLD frames.
@@ -5105,6 +5219,7 @@ StatusCode FallDetector::Detect(const Image& input_frame, bool& is_fall)
             }
         }
 
+        track_timing.count(18,stale_ids.size());
         // Step C: purge stale IDs from ALL per-ID maps
         for (int id : stale_ids) {
             // NEW: Warn if object was in Case 5 state when purged
@@ -5149,6 +5264,7 @@ StatusCode FallDetector::Detect(const Image& input_frame, bool& is_fall)
         }
     }
 
+    track_timing.next(10);
     // INJECT LOST TRACKS (Coasting)
     // Ensures trend analysis sees valid data even if motion stops (High -> Low)
     std::set<int> current_ids;
@@ -5249,6 +5365,7 @@ StatusCode FallDetector::Detect(const Image& input_frame, bool& is_fall)
         }
     }
     
+    track_timing.next(11);
     // 2.1 Update Safe Area Ratio
     if (pImpl->hasBedMask) {
         int cols = pImpl->config.grid_cols; 
@@ -5272,6 +5389,7 @@ StatusCode FallDetector::Detect(const Image& input_frame, bool& is_fall)
         }
     }
 
+    track_timing.next(12);
     // 2.5 Check Bed Exit (Temporal Analysis) - PER OBJECT
     if (pImpl->hasBedMask) {
         int cols = pImpl->config.grid_cols;
@@ -5395,6 +5513,15 @@ StatusCode FallDetector::Detect(const Image& input_frame, bool& is_fall)
         // But `Detect` might track objects across frames. If tracking is lost, ID changes.
     }
 
+    if(track_timing.active()) {
+        hermes_timing::Scope measure(track_timing,13);
+        track_timing.count(14,pImpl->current_objects.size());
+        track_timing.count(19,pImpl->persistent_object_blocks.size());track_timing.count(20,pImpl->observation_states.size());
+        track_timing.count(21,pImpl->object_history.size());track_timing.count(22,pImpl->object_bed_stats_history.size());
+        uint64_t samples=0;for(const auto& kv:pImpl->object_bed_stats_history)samples+=kv.second.size();track_timing.count(23,samples);
+    }
+    } // tracking sub-stages
+    timing.next(7);
     // 3. Fall Logic
     std::string warning = "";
     float max_strength = 0.0f;
@@ -6016,11 +6143,28 @@ StatusCode FallDetector::Detect(const Image& input_frame, bool& is_fall)
     }
     // DEBUG_PRINT("[Detect] Pixel Stats Done.\n");
 
+    timing.next(8);
     bool bg_detection_allowed=true;
+    pImpl->background_status.has_processed_frame=1;
+    pImpl->background_status.last_timestamp_ms=frame.timestamp;
 #ifdef HERMES_BG_STABILITY
     bg_detection_allowed=pImpl->bg_stability.update(frame.timestamp,wrapper.getData(),pImpl->hasBedMask?pImpl->bedMask.getData():nullptr,W,H,!pImpl->backgroundFrame.empty(),pImpl->safety.exclude?H/pImpl->config.grid_rows:0);
-    if(!bg_detection_allowed){pImpl->observation_states.clear();pImpl->pending_falls.clear();pImpl->object_history.clear();pImpl->in_fall_state=false;}
+    auto& status=pImpl->background_status;
+    const auto& bg=pImpl->bg_stability;
+    if(bg.enabled && bg.ready) {
+        if(status.state!=BackgroundState::Stable || status.stable_timestamp_ms!=bg.activation) {
+            status.stable_timestamp_ms=bg.activation;
+            status.stable_frame_index=pImpl->absolute_frame_count-1;
+        }
+        status.state=BackgroundState::Stable;
+    } else {
+        status.state=!bg.enabled?BackgroundState::Disabled:bg.started?BackgroundState::Observing:BackgroundState::WaitingInitialBackground;
+        status.stable_timestamp_ms=0;status.stable_frame_index=UINT64_MAX;
+    }
+
+    if(!bg_detection_allowed){pImpl->retained_triggers.clear();pImpl->observation_states.clear();pImpl->pending_falls.clear();pImpl->object_history.clear();pImpl->in_fall_state=false;}
 #endif
+    timing.next(9);
     pImpl->safety.prepare(frame.timestamp,wrapper.getData(),pImpl->mask_buf,W,H,pImpl->config.grid_cols,pImpl->config.grid_rows,pImpl->current_objects,pImpl->full_frame_objects);
     if(pImpl->identity_a.enabled()) {
         for(auto& obj : pImpl->current_objects) {
@@ -6052,6 +6196,7 @@ StatusCode FallDetector::Detect(const Image& input_frame, bool& is_fall)
 
     // --- NEW LOGIC: Direction-Based Detection (User Request) ---
     {
+    timing.next(10);
     TimerGuard t_logic(g_perf_timer, "4_FallLogic");
     // 1. Global Motion Safety Guard: Reject if > 1/4 screen is moving
     int total_grid_blocks = pImpl->config.grid_cols * pImpl->config.grid_rows;
@@ -6084,10 +6229,27 @@ StatusCode FallDetector::Detect(const Image& input_frame, bool& is_fall)
     //     pImpl->current_objects.resize(4);
     // }
 
+    // Evidence belongs to one continuously present ID and expires by capture timestamp.
+    for(auto it=pImpl->retained_triggers.begin();it!=pImpl->retained_triggers.end();) {
+        if(!alive_ids.count(it->first) || !it->second.valid(frame.timestamp)) {
+            pImpl->LogTrace(it->first,pImpl->frame_idx,"TRIGGER_EXPIRE",0,"Absent ID or expired evidence");
+            it=pImpl->retained_triggers.erase(it);
+        } else ++it;
+    }
     for (auto& curr : pImpl->current_objects) 
     {
+        const bool identity_ready = !pImpl->identity_a.enabled() || pImpl->identity_a.eligible(curr.id);
+        if(pImpl->eligibility_diagnostics.enabled() || (bg_detection_allowed && !identity_ready)) {
+            const auto row=pImpl->EligibilitySnapshot(curr,frame.timestamp,bg_detection_allowed);
+            pImpl->eligibility_diagnostics.record(row);
+            if(bg_detection_allowed && !identity_ready && row.candidate_without_gates()) {
+                pImpl->retained_triggers[curr.id] = {frame.timestamp,row.history.recent_momentum,row.pixels,row.area_metric};
+                pImpl->LogTrace(curr.id,pImpl->frame_idx,"TRIGGER_RETAIN",row.history.recent_momentum,
+                    "area="+std::to_string(row.area_metric)+" ttl_ms=4000");
+            }
+        }
         if(!bg_detection_allowed)continue;
-        if(pImpl->identity_a.enabled() && !pImpl->identity_a.eligible(curr.id))continue;
+        if(!identity_ready)continue;
         // Reconstruct History for this object
         // User requirement: "Recently n frames... m frames momentum trend"
         // Let's use n=20, m=10 for trends.
@@ -6434,8 +6596,20 @@ StatusCode FallDetector::Detect(const Image& input_frame, bool& is_fall)
                 }
 
 
-                // Step 2: Trigger on high momentum peak
-                if (recent_mom_avg >= threshold1 && pImpl->safety.measured(curr.id)) {
+                // Consume once, only after identity confirmation. Keep current momentum for
+                // deceleration/observation; retained evidence only opens a fresh trigger.
+                hermes_fall_policy::Evidence evidence;
+                bool replay_trigger=false;
+                auto retained=pImpl->retained_triggers.find(curr.id);
+                if(retained!=pImpl->retained_triggers.end()) {
+                    evidence=retained->second;
+                    replay_trigger=evidence.valid(frame.timestamp) && !state.is_active &&
+                        !state.waiting_for_deceleration && state.post_fall_counter==0 && pImpl->safety.measured(curr.id);
+                    pImpl->retained_triggers.erase(retained);
+                }
+                const float trigger_momentum=replay_trigger?evidence.momentum:recent_mom_avg;
+                // Step 2: Trigger on high momentum peak (or previously qualified evidence).
+                if ((replay_trigger || recent_mom_avg >= threshold1) && pImpl->safety.measured(curr.id)) {
                     bool start_new_trigger = false;
                     // Reject peaks sourced from a too-small moving region -- see
                     // min_trigger_pixel_area comment above. Applied only to a FRESH trigger
@@ -6446,7 +6620,7 @@ StatusCode FallDetector::Detect(const Image& input_frame, bool& is_fall)
                     // the trigger keeps rejecting tiny motion blips / inflated-fg_area remnants.
                     int trig_area_metric = pImpl->config.use_fg_area_trigger ? curr.fg_area : curr.pixel_count;
                     int trig_area_thresh = pImpl->config.use_fg_area_trigger ? pImpl->config.min_trigger_fg_area : min_trigger_pixel_area;
-                    bool suppress_trigger = (trig_area_metric < trig_area_thresh);
+                    bool suppress_trigger = !replay_trigger && (trig_area_metric < trig_area_thresh);
                     if (suppress_trigger) {
                         DEBUG_PRINT("[Case5-AREA-REJECT] ID:%d peak_mom=%.2f but %s:%d < min %d, ignoring peak\n",
                                curr.id, recent_mom_avg,
@@ -6493,6 +6667,8 @@ StatusCode FallDetector::Detect(const Image& input_frame, bool& is_fall)
                     }
 
                     if (start_new_trigger) {
+                        if(replay_trigger) pImpl->LogTrace(curr.id,pImpl->frame_idx,"TRIGGER_REPLAY",trigger_momentum,
+                            "age_ms="+std::to_string(frame.timestamp-evidence.stamp)+" area="+std::to_string(evidence.area));
                         if(pImpl->safety.coast||pImpl->safety.confirm){auto&q=pImpl->safety.tracks[curr.id];q.born=frame.timestamp;q.observation_since=0;q.quiet_count=q.valid_count=0;q.pending_since=0;q.accepted=q.rejected=false;q.confirmation="none";}
                         // Enter waiting phase - wait for momentum to drop
                         state.waiting_for_deceleration = true;
@@ -6518,13 +6694,13 @@ StatusCode FallDetector::Detect(const Image& input_frame, bool& is_fall)
                         state.last_fg_cy = -1.0f;
                         state.flat_posture_frames = 0;
                         state.peak_momentum = threshold1;//recent_mom_avg; // NEW: Init peak
-                        state.trigger_pixel_count = curr.pixel_count; // NEW: Store Trigger Area
+                        state.trigger_pixel_count = replay_trigger ? evidence.pixels : curr.pixel_count; // Qualified trigger area
                         state.accumulated_pixel_count = 0;
                         
                         DEBUG_PRINT("[Case5] ID:%d PEAK detected at frame %d (peak_mom=%.2f >= %.2f Area:%d) - waiting for deceleration\n", 
                                curr.id, pImpl->frame_idx, recent_mom_avg, threshold1, curr.pixel_count);
-                        pImpl->LogTrace(curr.id, pImpl->frame_idx, "WAIT_START", recent_mom_avg, "Peak Detected");
-                        pImpl->LogTrace(curr.id, pImpl->frame_idx, "TRIGGER", recent_mom_avg, "Peak Momentum > 5.5");
+                        pImpl->LogTrace(curr.id, pImpl->frame_idx, "WAIT_START", trigger_momentum, "Peak Detected");
+                        pImpl->LogTrace(curr.id, pImpl->frame_idx, "TRIGGER", trigger_momentum, "Qualified momentum peak");
                         #if ENABLE_DEBUG_FRAME_SAVE
                         save_debug_jpg("WaitPhase", curr);
                         #endif
@@ -6968,10 +7144,15 @@ StatusCode FallDetector::Detect(const Image& input_frame, bool& is_fall)
 
                                 // NEW: Edge Drop Filter Check
                                 // If the Foreground Bounding Box touches the frame edge (0 or w-1/h-1), count it.
-                                if (fmin_x <= edge_threshold || fmax_x >= frame.width - 1 - edge_threshold || 
-                                    fmin_y <= edge_threshold || fmax_y >= frame.height - 1 - edge_threshold) {
-                                    state.edge_touch_frames_obs++;
-                                }
+                                const auto bottom=hermes_fall_policy::bottomOccupancy(fg_obj.pixels,
+                                    frame.width,frame.height,edge_threshold);
+                                const bool other_edge=fmin_x <= edge_threshold ||
+                                    fmax_x >= frame.width-1-edge_threshold || fmin_y <= edge_threshold;
+                                if(other_edge || bottom.majority()) ++state.edge_touch_frames_obs;
+                                if(pImpl->diagnostic_trace.is_open())
+                                    pImpl->LogTrace(curr.id,pImpl->frame_idx,"EDGE_BOTTOM_SAMPLE",bottom.ratio(),
+                                        "bottom_pixels="+std::to_string(bottom.bottom)+" total_pixels="+std::to_string(bottom.total)+
+                                        " other_edge="+std::to_string(other_edge)+" history="+std::to_string(state.edge_touch_frames_obs));
 
                                 // Store in Observation State for average/median calculation at the end
                                 state.proj_heights.push_back(p_height);
@@ -7271,7 +7452,7 @@ StatusCode FallDetector::Detect(const Image& input_frame, bool& is_fall)
                                 }
                                 
                                 bool current_edge = (obs_cx_grid < 1.0f || obs_cx_grid >= (g_cols - 1.0f) || 
-                                                     obs_cy_grid < 1.0f || obs_cy_grid >= (g_rows - 1.0f));
+                                                     obs_cy_grid < 1.0f); // Bottom is decided by FG occupancy history.
                                 DEBUG_PRINT("[Case5 EDGE_TEST] ID:%d Suppressed: Edge Filter (Hist:%s Curr:%s Area:%d Pos:%.1f,%.1f)\n", 
                                             curr.id, (history_edge?"YES":"NO"), (current_edge?"YES":"NO"), curr.pixel_count, obs_cx_grid, obs_cy_grid);
                                 if (history_edge || current_edge) {
@@ -7518,6 +7699,7 @@ StatusCode FallDetector::Detect(const Image& input_frame, bool& is_fall)
 
         // ---- [DEBUG LOG] Write per-object row ----
             if (pImpl->debug_log_enabled && pImpl->debug_log_file.is_open()) {
+                hermes_timing::Scope debug_csv_scope(timing,21);
                 auto& state = pImpl->observation_states[curr.id];
 
                 // 1. Detection phase string
@@ -7625,6 +7807,7 @@ StatusCode FallDetector::Detect(const Image& input_frame, bool& is_fall)
             
             // ---- [DEBUG LOG] Per-Frame Summary & Reliable Flush ----
             if (pImpl->debug_log_enabled && pImpl->debug_log_file.is_open()) {
+                hermes_timing::Scope debug_csv_scope(timing,21);
                 long long detect_duration_us = pImpl->get_now_us() - detect_start_time;
                 
                 if (pImpl->current_objects.empty()) {
@@ -7679,6 +7862,7 @@ StatusCode FallDetector::Detect(const Image& input_frame, bool& is_fall)
                 }
     } // END OF TimerGuard LOGIC BLOCK
 
+    timing.next(11);
     TimerGuard t_post(g_perf_timer, "6_PostLogic_Callback");
 
     
@@ -7841,6 +8025,7 @@ StatusCode FallDetector::Detect(const Image& input_frame, bool& is_fall)
     }
     
     if(!bg_detection_allowed){is_fall=false;for(auto& obj:pImpl->current_objects)obj.is_fall_this_frame=false;}
+    timing.next(12);
     // 8. Background Update (Selective)
     // Runs here to use the latest pImpl->current_objects found in this frame
 #ifdef HERMES_ENABLE_PERSON
@@ -7878,22 +8063,26 @@ StatusCode FallDetector::Detect(const Image& input_frame, bool& is_fall)
     }
 
 #ifdef HERMES_ENABLE_PERSON
+    timing.next(13);
     if(pImpl->safety.confirm){
         if(!pImpl->person_bg.enabled())throw std::runtime_error("Person confirmation requires YOLO BG backend");
         pImpl->safety.filter(frame.timestamp,pImpl->current_objects,is_fall,pImpl->person_bg.History());
         for(auto&[id,q]:pImpl->safety.tracks)if(q.rejected){auto it=pImpl->observation_states.find(id);if(it!=pImpl->observation_states.end()){auto&v=it->second;v.is_active=v.waiting_for_deceleration=false;v.post_fall_counter=0;v.frames_observed=0;v.momentum_samples.clear();}}
     }
 #endif
+    timing.next(14);
     pImpl->safety.write(pImpl->frame_idx,pImpl->current_objects,pImpl->full_frame_objects,pImpl->observation_states,pImpl->config.grid_cols,pImpl->config.grid_rows,pImpl->observation_frame_limit);
     if(pImpl->identity_a.enabled())pImpl->identity_a.write(pImpl->frame_idx);
 #ifdef HERMES_ENABLE_NPU_PERSON
     // Person Step has now announced its deadline. Oldest due client wins;
     // both submits occur after the CPU detection work, never wait for NPU here.
+    timing.next(15);
     if(face_prepared && pImpl->faceDetector.TrySubmit(faceInput,frame.timestamp)) {
         pImpl->face_crop_x=prepared_x;pImpl->face_crop_y=prepared_y;
         pImpl->face_crop_w=prepared_w;pImpl->face_crop_h=prepared_h;
     }
 #endif
+    timing.next(16);
     // 7. Invoke Callback
     if (pImpl->callback) 
     {
@@ -7931,6 +8120,7 @@ StatusCode FallDetector::Detect(const Image& input_frame, bool& is_fall)
         pImpl->callback(event);
     }
     
+    timing.next(17);
     #if ENABLE_PERF_PROFILING
     long long t_logic_end = pImpl->get_now_us();
     pImpl->prof.fall_logic_time += (t_logic_end - t_logic_start);
@@ -8033,7 +8223,7 @@ StatusCode FallDetector::Detect(const Image& input_frame, bool& is_fall)
         DEBUG_PRINT("[Debug] Start Saving mask for frame %lld (Objects > 30pt detected)\n", (long long)pImpl->absolute_frame_count);
         char mask_filename[256];
         snprintf(mask_filename, sizeof(mask_filename), "nfs/test1_mask/mask_%06lld.jpg", (long long)pImpl->absolute_frame_count);
-        stbi_write_jpg(mask_filename, pImpl->lastMaskW, pImpl->lastMaskH, 1, pImpl->lastMaskData.data(), 80);
+        if(hermes_io::enabled()) stbi_write_jpg(mask_filename, pImpl->lastMaskW, pImpl->lastMaskH, 1, pImpl->lastMaskData.data(), 80);
         DEBUG_PRINT("[Debug] End Saving mask for frame %lld\n", (long long)pImpl->absolute_frame_count);
     }
 #endif
@@ -8082,6 +8272,11 @@ std::vector<std::pair<int, int>> FallDetector::GetBedRegion() const {
     return pImpl->bed_region;
 }
 void FallDetector::SetBackground(const Image& frame) {
+#ifdef HERMES_BG_STABILITY
+    pImpl->bg_stability.reset();
+    pImpl->background_status=BackgroundStatus_v1{};
+    if(pImpl->bg_stability.enabled)pImpl->background_status.state=BackgroundState::WaitingInitialBackground;
+#endif
     if (!pImpl) return;
     const uint8_t* p_frame_data = frame.data; 
     if (!p_frame_data) return;
@@ -8148,3 +8343,42 @@ std::vector<::VisionSDK::MotionVector> FallDetector::GetMotionVectors() const {
 }
 
 } // VisionSDK
+
+namespace VisionSDK {
+StatusCode FallDetector::ConfigureBackground(const BackgroundControl_v1* config) {
+    try {
+#ifndef HERMES_BG_STABILITY
+        if(config && config->enable_bg_stability) return StatusCode::ERROR_INIT_FAILED;
+#else
+        auto& bg=pImpl->bg_stability;
+        bg.reset();
+        if(config){bg.enabled=config->enable_bg_stability!=0;bg.window=config->bg_stability_window_ms;bg.delta=12;}
+        else bg.configure_environment();
+#endif
+#ifndef HERMES_ENABLE_PERSON
+        if(config && config->enable_yolo) return StatusCode::ERROR_INIT_FAILED;
+#else
+        pImpl->safety.reset();pImpl->identity_a.reset();
+        if(config) {
+            pImpl->safety.confirm=pImpl->safety.history_two=pImpl->safety.exclude=config->enable_yolo!=0;
+            pImpl->safety.coast=false;
+            pImpl->identity_a.selected=config->enable_yolo?hermes_identity_a::Mode::long_track:hermes_identity_a::Mode::off;
+            pImpl->identity_a.params=hermes_identity_a::Params{};
+        } else pImpl->identity_a.configure_environment();
+        pImpl->person_bg.Configure(config);
+#endif
+        pImpl->background_status=BackgroundStatus_v1{};
+#ifdef HERMES_BG_STABILITY
+        if(pImpl->bg_stability.enabled)pImpl->background_status.state=BackgroundState::WaitingInitialBackground;
+#endif
+        return StatusCode::OK;
+    } catch(const std::exception& error) {
+        std::cerr << "Background initialization failed: " << error.what() << std::endl;
+        return StatusCode::ERROR_INIT_FAILED;
+    }
+}
+void FallDetector::GetBackgroundStatus(BackgroundStatus_v1& status) const {
+    status=pImpl->background_status;
+}
+
+} // namespace VisionSDK

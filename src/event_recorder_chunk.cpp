@@ -1,3 +1,4 @@
+#include "file_output_policy.h"
 // EventRecorderChunk: chunk-storage backend for event recording.
 // See event_recorder_chunk.h and 事件錄影_chunk儲存架構設計.md.
 //
@@ -185,7 +186,7 @@ EventRecorderChunk::~EventRecorderChunk() { Shutdown(); }
 void EventRecorderChunk::Configure(bool enable, int pre_frames, int post_frames, bool store_raw) {
     std::lock_guard<std::mutex> api_lk(api_mtx_);
     if (enable) shutdown_ = false;
-    enabled_ = enable;
+    enabled_ = enable && hermes_io::enabled();
     if (pre_frames >= 0) pre_frames_ = pre_frames;
     if (post_frames >= 0) post_frames_ = post_frames;
     store_raw_ = store_raw;
@@ -356,6 +357,7 @@ bool EventRecorderChunk::InitStorage(int width, int height, int channels) {
 }
 
 void EventRecorderChunk::PushFrame(const Image& img) {
+    if(!hermes_io::enabled())return;
     std::lock_guard<std::mutex> api_lk(api_mtx_);
     if (shutdown_ || !enabled_ || failed_) return;
     if (!ready_) {
@@ -482,6 +484,7 @@ void EventRecorderChunk::SpoolerLoop() {
 }
 
 void EventRecorderChunk::OnEvent(const VisionSDKEvent& event, std::vector<uint8_t>&& bg_image) {
+    if(!hermes_io::enabled())return;
     std::lock_guard<std::mutex> api_lk(api_mtx_);
     if (shutdown_ || !enabled_ || failed_ || !ready_ || write_seq_ == 0) return;
 
@@ -508,6 +511,7 @@ void EventRecorderChunk::OnEvent(const VisionSDKEvent& event, std::vector<uint8_
 }
 
 void EventRecorderChunk::TriggerSelfTest(std::vector<uint8_t>&& bg_image) {
+    if(!hermes_io::enabled())return;
     std::lock_guard<std::mutex> api_lk(api_mtx_);
     if (shutdown_ || !enabled_ || failed_ || !ready_ || write_seq_ == 0) return;
     if (capturing_) return;

@@ -2,6 +2,7 @@
 #define HERMESII_SDK_H
 
 #include <string>
+#include <cstdint>
 #include <vector>
 #include <memory>
 #include <functional>
@@ -20,12 +21,37 @@ enum class ConfigType {
     FallDetection_v3,
     BedExitDetection_v1,
     ImageRelated_v1,
-    EventRecording_v1
+    EventRecording_v1,
+    BackgroundControl_v1 // Appended: existing ConfigType values stay unchanged.
 };
 
 struct ConfigHeader {
     ConfigType type;
     int version;
+};
+
+// Set before Init; copied by the SDK. No pointers/STL strings cross this boundary.
+// Explicit API settings override the corresponding legacy environment settings.
+struct BackgroundControl_v1 {
+    ConfigHeader header{ConfigType::BackgroundControl_v1, 1};
+    uint32_t struct_size = sizeof(BackgroundControl_v1);
+    uint32_t enable_bg_stability = 0;
+    uint32_t bg_stability_window_ms = 6000;
+    uint32_t enable_yolo = 0;
+    char yolo_model_path[512] = {}; // NUL terminated; no silent truncation
+};
+
+enum class BackgroundState : uint32_t {
+    Disabled = 0, WaitingInitialBackground = 1, Observing = 2, Stable = 3
+};
+struct BackgroundStatus_v1 {
+    uint32_t struct_size = sizeof(BackgroundStatus_v1);
+    uint32_t version = 1;
+    BackgroundState state = BackgroundState::Disabled;
+    uint32_t has_processed_frame = 0;
+    uint64_t last_timestamp_ms = 0;
+    uint64_t stable_timestamp_ms = 0;
+    uint64_t stable_frame_index = UINT64_MAX; // zero-based SDK input index; invalid until Stable
 };
 
 // Versioned Structs
@@ -375,6 +401,10 @@ public:
     // Set Configuration
     StatusCode SetConfig(const void* config);
 
+    // Read after ProcessNextFrame on the same SDK thread. No file IO. Stable is
+    // latched until reset/discontinuity; it is not continuous scene monitoring.
+    StatusCode GetBackgroundStatus(BackgroundStatus_v1& status) const;
+
     // AI Inference
     StatusCode RunInference(const Image& img, std::vector<DetectionResult>& results);
 
@@ -475,6 +505,9 @@ public:
     // Get internal state for visualization
     // std::vector<MotionObject> GetMotionObjects(); // Deprecated: Return by value causes ABI issues
     void GetMotionObjects(std::vector<MotionObject>& out_objects); // NEW: Pass by ref
+    // Read-only analysis queries after a successful ProcessNextFrame (no file I/O).
+    uint32_t GetLastDetectTimeUs() const;
+    bool IsObjectBedExit(int object_id) const;
     std::vector<uint8_t> GetChangedBlocks(); // Returns mask data same size as grid (cols*rows)
     std::vector<MotionVector> GetMotionVectors(); // Returns vector map same size as grid
 

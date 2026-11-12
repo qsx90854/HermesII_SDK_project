@@ -1,5 +1,6 @@
 #pragma once
 #include <cstdlib>
+#include "../file_output_policy.h"
 #include <string>
 #include <fstream>
 #include <filesystem>
@@ -9,7 +10,7 @@ namespace hermes_person {
 class FgReplayWriter {
  bool enabled_=false;std::ofstream index_;
 public:
- FgReplayWriter(){auto s=std::getenv("HERMES_PERSON_FG_REPLAY");enabled_=s&&std::string(s)=="1";}
+ FgReplayWriter(){auto s=std::getenv("HERMES_PERSON_FG_REPLAY");enabled_=hermes_io::enabled()&&s&&std::string(s)=="1";}
  void Write(int frame,uint64_t stamp,const uint8_t* bg,const uint8_t* mask,int w,int h){
   if(!enabled_)return;
   if(!index_.is_open()){std::filesystem::create_directory("fg_replay");index_.open("fg_replay/index.csv");if(!index_)throw std::runtime_error("Cannot open FG replay index");index_<<"sdk_frame,timestamp_ms,bg,fg,width,height\n";}

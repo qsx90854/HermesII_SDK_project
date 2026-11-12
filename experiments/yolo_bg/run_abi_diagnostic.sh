@@ -1,6 +1,7 @@
 #!/bin/sh
 # Run on the board; no NPU initialization, no video playback.
 set -eu
+export HERMES_FILE_OUTPUT=1
 ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/../.." && pwd)
 BIN="$ROOT/build/npu_people/abi_diagnostic"
 [ -x "$BIN" ] || { echo 'Build on PC: make -f experiments/yolo_bg/Makefile.npu diagnostic' >&2; exit 2; }

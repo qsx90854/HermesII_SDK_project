@@ -4,7 +4,9 @@ CROSS ?= /home/mark/arm-fhva12c-linux-uclibcgnueabihf-b5.3/arm-fhva12c-linux-ucl
 CXX := $(CROSS)g++
 MPP ?= /home/mark/nn_release/npu_inference/mpp
 OUT ?= $(SDK)/build/npu_people
-CPPFLAGS := -I$(SDK)/include -I$(SDK)/src -I$(MPP)/include -I$(MPP)/drv_include -DHERMES_ENABLE_NPU_PERSON=1 -DHERMES_ENABLE_PERSON=1 -DHERMES_BG_STABILITY=1
+FILE_OUTPUT ?= 1
+RUNNER_NAME ?= sdk_gray_npu
+CPPFLAGS := -DHERMES_ENABLE_FILE_OUTPUT=$(FILE_OUTPUT) -I$(SDK)/include -I$(SDK)/src -I$(MPP)/include -I$(MPP)/drv_include -DHERMES_ENABLE_NPU_PERSON=1 -DHERMES_ENABLE_PERSON=1 -DHERMES_BG_STABILITY=1
 CXXFLAGS := -std=c++17 -O3 -g -Wall -fPIC -mcpu=cortex-a7 -mfloat-abi=hard -mfpu=neon-vfpv4 -MMD -MP
 SOURCES := src/HermesII_sdk.cpp src/fall/fall_detector.cpp src/fall/person_bg_controller.cpp src/ai/person_detector_npu.cpp src/ai/npu_runtime.cpp src/ai/face_detector.cpp src/ai/model_runner.cpp src/ai/blaze_face_detect_parser.cpp src/image_process/image_process.cpp src/fusion/image_fusion.cpp src/event_recorder.cpp
 SOURCES += src/ai/abi_diagnostic.cpp
@@ -18,7 +20,7 @@ VENDOR_API := FH_SYS_VmmAllocEx64 FH_SYS_VmmAllocEx_Cached64 FH_SYS_VmmFlushCach
 VENDOR_ROOTS := $(foreach sym,$(VENDOR_API),-Wl,--undefined=$(sym))
 RUNTIME_LIBS := -lpthread -lm -ldl
 SDK_LINK := -L$(OUT) -lHermesII_sdk -Wl,-rpath,'$$ORIGIN' -Wl,-rpath-link,$(OUT) $(RUNTIME_LIBS)
-all: $(OUT)/libHermesII_sdk.so $(OUT)/sdk_gray_npu
+all: $(OUT)/libHermesII_sdk.so $(OUT)/$(RUNNER_NAME)
 diagnostic: $(OUT)/abi_diagnostic
 $(OUT)/abi_diagnostic: $(OUT)/experiments/yolo_bg/abi_diagnostic.o $(OUT)/libHermesII_sdk.so
 	$(CXX) -o $@ $< $(SDK_LINK)
@@ -27,10 +29,21 @@ $(VENDOR_SO): $(VENDOR_ARCHIVES) $(VENDOR_EXPORTS) $(SDK)/experiments/yolo_bg/Ma
 	$(CXX) -shared -Wl,-z,defs -Wl,-soname,libHermesII_npu_vendor.so -Wl,--version-script=$(VENDOR_EXPORTS) -o $@ $(VENDOR_ROOTS) -Wl,--start-group $(VENDOR_ARCHIVES) -Wl,--end-group $(RUNTIME_LIBS)
 $(OUT)/libHermesII_sdk.so: $(OBJECTS) $(VENDOR_SO) $(SDK)/experiments/yolo_bg/Makefile.npu
 	$(CXX) -shared -Wl,-z,defs -o $@ $(OBJECTS) -L$(OUT) -lHermesII_npu_vendor -Wl,-rpath,'$$ORIGIN' $(RUNTIME_LIBS)
-$(OUT)/sdk_gray_npu: $(OUT)/examples/sdk_gray_count_falls.o $(OUT)/libHermesII_sdk.so
+$(OUT)/$(RUNNER_NAME): $(OUT)/examples/sdk_gray_count_falls.o $(OUT)/libHermesII_sdk.so
 	$(CXX) -o $@ $< $(SDK_LINK)
-$(OUT)/%.o: $(SDK)/%.cpp
+$(OUT)/%.o: $(SDK)/%.cpp $(SDK)/experiments/yolo_bg/Makefile.npu
 	@mkdir -p $(dir $@)
 	$(CXX) $(CPPFLAGS) $(CXXFLAGS) -c $< -o $@
 -include $(OBJECTS:.o=.d) $(OUT)/examples/sdk_gray_count_falls.d $(OUT)/experiments/yolo_bg/abi_diagnostic.d
 .PHONY: all diagnostic
+
+# Fast, standalone exactness check; execute this binary on the board (no NPU).
+diagnostic: $(OUT)/identity_geometry_test
+$(OUT)/identity_geometry_test: $(OUT)/experiments/yolo_bg/tests/identity_geometry_test.o
+	$(CXX) $(CXXFLAGS) -o $@ $<
+-include $(OUT)/experiments/yolo_bg/tests/identity_geometry_test.d
+
+# Production uses a separate object directory and cannot enable file output.
+.PHONY: release
+release:
+	$(MAKE) -f $(SDK)/experiments/yolo_bg/Makefile.npu OUT=$(SDK)/build/release_npu FILE_OUTPUT=0 RUNNER_NAME=sdk_gray_count_falls_edge all

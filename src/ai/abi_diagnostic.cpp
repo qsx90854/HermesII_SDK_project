@@ -1,6 +1,8 @@
+#include "../file_output_policy.h"
 #include "abi_diagnostic_impl.h"
 extern "C" void hermes_abi_snapshot(HermesAbiSnapshot* out) { *out=abi_local_snapshot(); }
 extern "C" int hermes_abi_io_probe(const char* path,int kind,HermesIoProbe* out) {
+    if(!hermes_io::enabled()) return -1;
     return abi_local_io_probe(path,kind,out);
 }
 extern "C" int hermes_abi_string_probe(void* text,void* config) {

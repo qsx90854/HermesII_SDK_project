@@ -1,3 +1,4 @@
+#include "file_output_policy.h"
 // EventRecorder: event-triggered raw frame recording, self-contained.
 //
 // Data path (all sizes for gray8 800x450):
@@ -328,7 +329,7 @@ EventRecorder::~EventRecorder() {
 void EventRecorder::Configure(bool enable, int pre_frames, int post_frames, bool store_raw) {
     std::lock_guard<std::mutex> api_lk(api_mtx_);
     if (enable) shutdown_ = false;   // allow re-enable after a Shutdown
-    enabled_ = enable;
+    enabled_ = enable && hermes_io::enabled();
     if (pre_frames >= 0) pre_frames_ = pre_frames;
     if (post_frames >= 0) post_frames_ = post_frames;
     store_raw_ = store_raw;
@@ -346,6 +347,7 @@ void EventRecorder::Configure(bool enable, int pre_frames, int post_frames, bool
 }
 
 void EventRecorder::SetPcOutputBase(const char* base) {
+    if(!hermes_io::enabled())return;
 #if EVENT_RECORDER_PC_ANALYSIS
     std::lock_guard<std::mutex> api_lk(api_mtx_);
     if (base) pc_output_base_ = base;
@@ -578,6 +580,7 @@ void EventRecorder::CloseRing() {
 }
 
 void EventRecorder::PushFrame(const Image& img) {
+    if(!hermes_io::enabled())return;
     std::lock_guard<std::mutex> api_lk(api_mtx_);
     if (shutdown_ || !enabled_ || failed_) return;
     if (!img.data || img.width <= 0 || img.height <= 0 || img.channels <= 0) return;
@@ -682,6 +685,7 @@ void EventRecorder::PushFrame(const Image& img) {
 }
 
 void EventRecorder::OnEvent(const VisionSDKEvent& event, std::vector<uint8_t>&& bg_image) {
+    if(!hermes_io::enabled())return;
     std::lock_guard<std::mutex> api_lk(api_mtx_);
     if (shutdown_ || !enabled_ || failed_) return;
 #if EVENT_RECORDER_PC_ANALYSIS
@@ -737,6 +741,7 @@ void EventRecorder::OnEvent(const VisionSDKEvent& event, std::vector<uint8_t>&& 
 }
 
 void EventRecorder::TriggerSelfTest(std::vector<uint8_t>&& bg_image) {
+    if(!hermes_io::enabled())return;
     std::lock_guard<std::mutex> api_lk(api_mtx_);
     if (shutdown_ || !enabled_ || failed_ || !ring_ready_ || write_seq_ == 0) return;
     if (capturing_) return;
@@ -1522,7 +1527,7 @@ void EventRecorder::Shutdown() {
 #if EVENT_RECORDER_PC_ANALYSIS
     if (shutdown_) return;   // idempotent
     shutdown_ = true;
-    WritePcAnalysis();
+    if(hermes_io::enabled()) WritePcAnalysis();
     enabled_ = false;
     return;
 #endif

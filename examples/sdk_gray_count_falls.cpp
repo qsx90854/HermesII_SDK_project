@@ -1,3 +1,6 @@
+#ifndef HERMES_ENABLE_FILE_OUTPUT
+#define HERMES_ENABLE_FILE_OUTPUT 0
+#endif
 // sdk_gray_count_falls.cpp
 //
 // Minimal standalone tool: feed a single raw grayscale (.gray) video into the
@@ -15,7 +18,8 @@
 //               default here is 1, i.e. every frame, since a bare .gray file
 //               has no known original frame rate).
 //
-// Output: alongside the printed summary, writes <input>.events.json -- one
+// Output: console by default; diagnostic builds with --write-files can write
+// <input>.events.json -- one
 // pretty-printed JSON document listing every fall/bed-exit detection, each
 // with the frame index and the bounding region (grid coords) of every
 // currently-tracked object at that moment. Load it together with the .gray
@@ -230,6 +234,79 @@ std::vector<std::pair<int, int>> ParseBedPoints(const std::string& s) {
     return pts;
 }
 
+
+// Runner-owned streaming analysis: bounded per-frame memory; SDK never opens files.
+// Final JSON retains the old field names/precision and eight-object limit.
+class AnalysisWriter {
+    FILE* file_=nullptr;
+    std::string base_;
+    unsigned long long count_=0;
+    static void quoted(FILE* f,const std::string& value) {
+        fputc('"',f);
+        for(unsigned char c:value) {
+            if(c=='"'||c=='\\') {fputc('\\',f);fputc(c,f);}
+            else if(c<32) fprintf(f,"\\u%04x",unsigned(c));
+            else fputc(c,f);
+        }
+        fputc('"',f);
+    }
+    static void commit(FILE*& f,const std::string& path) {
+        bool bad=ferror(f)!=0;
+        if(fclose(f)!=0)bad=true;
+        f=nullptr;
+        if(bad || rename((path+".tmp").c_str(),path.c_str())!=0)
+            throw std::runtime_error("Cannot finalize "+path);
+    }
+public:
+    ~AnalysisWriter(){if(file_)fclose(file_);}
+    void open(const std::string& base) {
+        base_=base;
+        file_=fopen((base+".analysis.json.tmp").c_str(),"w");
+        if(!file_)throw std::runtime_error("Cannot create analysis file: "+base);
+        fputs("{\n  \"frames\": [\n",file_);
+    }
+    void frame(VisionSDK::VisionSDK& sdk,uint64_t ts) {
+        if(!file_)return;
+        std::vector<VisionSDK::MotionObject> objects;
+        sdk.GetMotionObjects(objects);
+        int total_fg=0;
+        const size_t n=std::min(size_t(8),objects.size());
+        for(size_t i=0;i<n;++i)if(total_fg==0)total_fg=objects[i].total_frame_pixel_count;
+        fprintf(file_,"%s    {\"seq\":%llu,\"ts\":%llu,\"proc_us\":%u,\"total_fg\":%d,\"objects\":[",
+            count_?",\n":"",count_,(unsigned long long)ts,sdk.GetLastDetectTimeUs(),total_fg);
+        for(size_t i=0;i<n;++i) {
+            const auto& o=objects[i];
+            fprintf(file_,"%s{\"id\":%d,\"cx\":%.2f,\"cy\":%.2f,\"dx\":%.2f,\"dy\":%.2f,\"strength\":%.2f,\"accel\":%.2f,\"pixels\":%d,\"safe_ratio\":%.3f,\"dir_var\":%.3f,\"obs\":%d,\"is_fall\":%d,\"is_bed_exit\":%d,\"fg_area\":%d,\"coasting\":%d,\"blocks\":[",
+                i?",":"",o.id,double(o.centerX),double(o.centerY),double(o.avgDx),double(o.avgDy),
+                double(o.strength),double(o.acceleration),o.pixel_count,double(o.safe_area_ratio),double(o.direction_variance),
+                int(o.is_in_observation_mode),int(o.is_fall_this_frame),int(sdk.IsObjectBedExit(o.id)),o.fg_area,int(o.is_coasting));
+            bool first=true;
+            for(int b:o.blocks)if(b>=0&&b<=65535){fprintf(file_,"%s%d",first?"":",",b);first=false;}
+            fputs("]}",file_);
+        }
+        fputs("]}",file_);++count_;
+        if(ferror(file_))throw std::runtime_error("Cannot write analysis frame");
+    }
+    void finish(int w,int h,int ch,int gc,int gr,int bs,
+                const std::vector<std::pair<int,int>>& bed,const std::vector<DetectedEventFull>& events) {
+        if(!file_)return;
+        auto metadata=[&](FILE* f){
+            fprintf(f,"  \"width\":%d,\"height\":%d,\"channels\":%d,\"grid_cols\":%d,\"grid_rows\":%d,\"block_size\":%d,\n  \"total_frames\":%llu,\n  \"bed_points\":[",w,h,ch,gc,gr,bs,count_);
+            for(size_t i=0;i<bed.size();++i)fprintf(f,"%s[%d,%d]",i?",":"",bed[i].first,bed[i].second);
+            fputs("],\n  \"events\":[",f);
+            for(size_t i=0;i<events.size();++i)fprintf(f,"%s{\"frame_index\":%d,\"type\":\"%s\",\"confidence\":%.4f}",i?",":"",events[i].frame_index,events[i].type,double(events[i].confidence));
+            fputs("]",f);
+        };
+        fputs("\n  ],\n",file_);metadata(file_);fputs("\n}\n",file_);
+        commit(file_,base_+".analysis.json");
+        FILE* meta=fopen((base_+".meta.json.tmp").c_str(),"w");
+        if(!meta)throw std::runtime_error("Cannot create meta file");
+        fputs("{\n",meta);metadata(meta);fputs(",\n  \"analysis_file\":",meta);
+        quoted(meta,base_+".analysis.json");fputs("\n}\n",meta);
+        commit(meta,base_+".meta.json");
+    }
+};
+
 int run_counter(int argc, char** argv) {
     if (argc < 2) {
         std::cerr << "Usage: " << argv[0]
@@ -238,6 +315,8 @@ int run_counter(int argc, char** argv) {
                      "                    [--bed=x1,y1,x2,y2,x3,y3,x4,y4]\n"
                      "                    [--frame-period-ms=133.3333333333333] [--realtime]\n"
                      "                    [--max-frames=120] [--face=0|1] [--face-model=path]\n"
+                     "                    [--bg-stability=0|1] [--bg-stability-ms=6000]\n"
+                     "                    [--yolo=0|1] [--yolo-model=path] [--write-events] [--write-analysis] [--write-files]\n"
                      "                    [--output-prefix=path]\n";
         return 1;
     }
@@ -248,6 +327,9 @@ int run_counter(int argc, char** argv) {
     std::string bed_arg,output_prefix,face_model="models/blaze_face_detect_nnp310_128x128.ty";
     double frame_period_ms=33.0;bool explicit_period=false,realtime=false;
     long max_frames=0;int face_override=-1;
+    bool write_files=false, write_events=false, write_analysis=false, background_explicit=false;
+    VisionSDK::BackgroundControl_v1 backgroundCfg;
+    std::string yolo_model;
     std::signal(SIGINT,stop_counter);std::signal(SIGTERM,stop_counter);
     for (int i = 2; i < argc; ++i) {
         std::string a = argv[i];
@@ -259,6 +341,13 @@ int run_counter(int argc, char** argv) {
         else if (a.rfind("--bed=", 0) == 0) bed_arg = a.substr(6);
         else if(a.rfind("--frame-period-ms=",0)==0){frame_period_ms=std::stod(a.substr(18));explicit_period=true;}
         else if(a.rfind("--max-frames=",0)==0)max_frames=std::stol(a.substr(13));
+        else if(a=="--write-files")write_files=true;
+        else if(a=="--write-events")write_events=true;
+        else if(a=="--write-analysis")write_analysis=true;
+        else if(a.rfind("--bg-stability=",0)==0){background_explicit=true;backgroundCfg.enable_bg_stability=std::stoul(a.substr(15));}
+        else if(a.rfind("--bg-stability-ms=",0)==0){background_explicit=true;backgroundCfg.bg_stability_window_ms=std::stoul(a.substr(18));}
+        else if(a.rfind("--yolo=",0)==0){background_explicit=true;backgroundCfg.enable_yolo=std::stoul(a.substr(7));}
+        else if(a.rfind("--yolo-model=",0)==0){background_explicit=true;yolo_model=a.substr(13);}
         else if(a=="--realtime")realtime=true;
         else if(a.rfind("--output-prefix=",0)==0)output_prefix=a.substr(16);
         else if(a.rfind("--face=",0)==0)face_override=std::stoi(a.substr(7));
@@ -266,6 +355,9 @@ int run_counter(int argc, char** argv) {
         else std::cerr << "Warning: unknown argument \"" << a << "\", ignored.\n";
     }
 
+    write_events = write_events || write_files || write_analysis; // Runner-only JSON is allowed in production.
+    if(write_files && (!HERMES_ENABLE_FILE_OUTPUT || !std::getenv("HERMES_FILE_OUTPUT") || std::string(std::getenv("HERMES_FILE_OUTPUT"))!="1"))
+        throw std::runtime_error("File output requires a diagnostic build and HERMES_FILE_OUTPUT=1");
     if(!std::isfinite(frame_period_ms)||frame_period_ms<=0||frame_period_ms>60000||max_frames<0||face_override < -1||face_override>1||width<=0||height<=0||channels!=1)
         throw std::runtime_error("Invalid gray runner options (packed grayscale required)");
     // Earliest possible checkpoint: right after the argv-parsing loop, before
@@ -394,7 +486,7 @@ int run_counter(int argc, char** argv) {
     fallCfg.post_fall_distance_threshold = cfg.getFloat("FallDetect.Fall_Detect_Post_Fall_Distance_Threshold", 4.0f);
     fallCfg.post_fall_check_frames = cfg.getInt("FallDetect.Fall_Detect_Post_Fall_Check_Frames", 5);
     fallCfg.momentum_calc_type = cfg.getInt("FallDetect.Fall_Detect_Momentum_Calc_Type", 1);
-    fallCfg.enable_face_detection = false; // Disable to avoid NPU crash or other issues
+    fallCfg.enable_face_detection = cfg.getInt("FallDetect.Enable_Face_Detection", 0)!=0;
     fallCfg.face_detect_interval_frames = cfg.getInt("FallDetect.Face_Detect_Interval_Frames", 8);
     fallCfg.enable_edge_drop_filter = (cfg.getInt("FallDetect.Enable_Edge_Drop_Filter", 1) != 0);
     fallCfg.enable_bed_exit_verification = true;
@@ -428,8 +520,12 @@ int run_counter(int argc, char** argv) {
     if(explicit_period)imgCfg.expected_frame_interval_ms=int(std::lround(frame_period_ms*interval));
     if(face_override>=0)fallCfg.enable_face_detection=face_override!=0;
     VisionSDK::VisionSDK sdk;
-    // Honor face-off before Init, which otherwise uses its default face-on config.
-    if(!fallCfg.enable_face_detection)sdk.SetConfig(&fallCfg);
+    if(background_explicit) {
+        if(yolo_model.size()>=sizeof(backgroundCfg.yolo_model_path))throw std::runtime_error("YOLO model path too long");
+        std::copy(yolo_model.begin(),yolo_model.end(),backgroundCfg.yolo_model_path);
+        if(sdk.SetConfig(&backgroundCfg)!=VisionSDK::StatusCode::OK)throw std::runtime_error("Invalid background configuration");
+    }
+    sdk.SetConfig(&fallCfg);
     if (sdk.Init(face_model, 4) != VisionSDK::StatusCode::OK) {
         std::cerr << "Error: SDK Init failed.\n";
         fclose(fp);
@@ -452,7 +548,7 @@ int run_counter(int argc, char** argv) {
         pc_analysis_base.compare(pc_analysis_base.size() - 5, 5, ".gray") == 0) {
         pc_analysis_base.erase(pc_analysis_base.size() - 5);
     }
-    recCfg.enable = true;
+    recCfg.enable = write_files;
     recCfg.pc_output_base = pc_analysis_base.c_str();
 #endif
     sdk.SetConfig(&recCfg);
@@ -492,9 +588,11 @@ int run_counter(int argc, char** argv) {
     if (events_json_path.size() >= 5 && events_json_path.compare(events_json_path.size() - 5, 5, ".gray") == 0) {
         events_json_path.erase(events_json_path.size() - 5);
     }
+    AnalysisWriter analysis_writer;
+    if(write_analysis)analysis_writer.open(events_json_path);
     events_json_path += ".events.json";
     std::vector<DetectedEventFull> event_blocks;
-    std::cout << "Events JSON: " << events_json_path << "\n";
+    if(write_events) std::cout << "Events JSON: " << events_json_path << "\n";
 
     std::vector<DetectedEvent> events;
     bool frame_fall=false;
@@ -522,6 +620,7 @@ int run_counter(int argc, char** argv) {
         }
 
         auto write_event = [&](const char* type) {
+            if(!write_events)return;
             DetectedEventFull ev{};
             ev.frame_index = e.frame_index;
             snprintf(ev.type, sizeof(ev.type), "%s", type);
@@ -529,7 +628,7 @@ int run_counter(int argc, char** argv) {
             ev.obj_count = obj_count;
             for (int j = 0; j < obj_count; ++j) ev.objs[j] = bboxes[j];
             event_blocks.push_back(ev);
-            RewriteEventsFile(events_json_path, gray_path, width, height, channels,
+            if(write_events) RewriteEventsFile(events_json_path, gray_path, width, height, channels,
                               motionCfg.grid_cols, motionCfg.grid_rows, bed_pts, event_blocks);
         };
 
@@ -552,8 +651,9 @@ int run_counter(int argc, char** argv) {
     long total_read = 0, total_fed = 0;
     std::cout << "\nReading frames...\n";
     std::ofstream frames;
-    if(!output_prefix.empty()){frames.open(output_prefix+".frames.csv");if(!frames)throw std::runtime_error("Cannot write frames CSV");frames<<"gray_index,timestamp_ms,process_ms,wall_lag_ms,is_fall\n";}
+    if(write_files&&!output_prefix.empty()){frames.open(output_prefix+".frames.csv");if(!frames)throw std::runtime_error("Cannot write frames CSV");frames<<"gray_index,timestamp_ms,process_ms,wall_lag_ms,is_fall\n";}
     auto wall_start=std::chrono::steady_clock::now();
+    bool reported_stable=false;
     while (!stop_requested && (!max_frames || total_read<max_frames)) {
         size_t count=fread(buf.data(),1,frame_size,fp);
         if(!count){if(ferror(fp))throw std::runtime_error("Gray read failed");break;}
@@ -568,13 +668,21 @@ int run_counter(int argc, char** argv) {
                 throw std::runtime_error("SDK rejected gray frame "+std::to_string(total_read));
             double process_ms=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-start).count();
             double lag=std::chrono::duration<double,std::milli>(start-deadline).count();
+            VisionSDK::BackgroundStatus_v1 bg_status;
+            if(sdk.GetBackgroundStatus(bg_status)!=VisionSDK::StatusCode::OK)throw std::runtime_error("Cannot query BG status");
+            if(bg_status.state==VisionSDK::BackgroundState::Stable && !reported_stable)
+                std::cout << "BG_STABLE sdk_frame_index=" << bg_status.stable_frame_index
+                          << " gray_index=" << total_read << " timestamp_ms=" << bg_status.stable_timestamp_ms << '\n';
+            reported_stable=bg_status.state==VisionSDK::BackgroundState::Stable;
             if(frames.is_open())frames<<total_read<<','<<ts<<','<<process_ms<<','<<lag<<','<<frame_fall<<'\n';
+            analysis_writer.frame(sdk,ts);
             total_fed++;
         }
         total_read++;
         if (total_read % 1000 == 0) std::cout << "  read " << total_read << " frames...\n";
     }
     fclose(fp);
+    analysis_writer.finish(width,height,channels,motionCfg.grid_cols,motionCfg.grid_rows,motionCfg.block_size,bed_pts,event_blocks);
     sdk.Release();
 
     // Always rewrite the events JSON once at the end, even when no fall/bed-exit
@@ -584,7 +692,7 @@ int run_counter(int argc, char** argv) {
     // masquerading as this run's result. Writing here (idempotent -- same output
     // as the last in-callback write when events did fire, an empty "events": []
     // document when they did not) guarantees the file always reflects this run.
-    RewriteEventsFile(events_json_path, gray_path, width, height, channels,
+    if(write_events) RewriteEventsFile(events_json_path, gray_path, width, height, channels,
                       motionCfg.grid_cols, motionCfg.grid_rows, bed_pts, event_blocks);
 
     int fall_count = 0, bedexit_count = 0;
